@@ -1,4 +1,4 @@
-# A little faith in impossible things
+# tenfold
 
 One phrase, ten art styles, all of it code. Each style is a single self-contained HTML page that draws `a little faith in impossible things` on a Canvas 2D context, with no images, fonts or libraries.
 
@@ -23,7 +23,7 @@ Open any `index.html` in a browser to see the finished piece. Each page builds i
 
 ## Credits
 
-Written and rendered in code by Claude Opus 5.5. The seeded random helpers `xmur3` and `mulberry32` in the Flip-dot page come from [bryc/code](https://github.com/bryc/code).
+Written and rendered in code by Claude Opus 5.5. The phrase is the title of [an essay](https://www.linkedin.com/pulse/little-faith-impossible-things-sanju-sunny-ed83c/). The seeded random helpers `xmur3` and `mulberry32` in the Flip-dot page come from [bryc/code](https://github.com/bryc/code).
 
 ## License
 
