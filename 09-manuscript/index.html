@@ -1,0 +1,1000 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>09 illuminated manuscript</title>
+<style>html,body{margin:0;background:#3a3832}canvas{display:block;width:720px;height:900px}</style>
+</head><body><canvas id="c" width="1080" height="1350"></canvas>
+<script>
+"use strict";
+// A little faith in impossible things, written on a choir-book leaf: raised burnished gold on gesso, lapis and
+// vermilion, iron-gall textura built from a broad nib held at a fixed angle.
+const PHRASE_TO_RENDER = 'a little faith in impossible things';
+const W = 1080, H = 1350, N = W * H;
+const cv = document.getElementById('c'), cx = cv.getContext('2d');
+
+// ---------- seeded randomness ----------
+function hash(s) { let h = 2166136261 >>> 0; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+function rngFor(key) {
+  let a = hash(key);
+  return () => { a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+function noiseFor(key) {
+  const r = rngFor(key), P = new Uint8Array(512), G = new Float32Array(256);
+  for (let i = 0; i < 256; i++) { P[i] = i; G[i] = r() * 2 - 1; }
+  for (let i = 255; i > 0; i--) { const j = (r() * (i + 1)) | 0, t = P[i]; P[i] = P[j]; P[j] = t; }
+  for (let i = 0; i < 256; i++) P[i + 256] = P[i];
+  return (x, y) => {
+    const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi, X = xi & 255, Y = yi & 255;
+    const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+    const a = G[P[P[X] + Y]], b = G[P[P[X + 1] + Y]], c = G[P[P[X] + Y + 1]], d = G[P[P[X + 1] + Y + 1]];
+    return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+  };
+}
+function fbm(n, x, y, oct) { let s = 0, a = .5, f = 1; for (let i = 0; i < oct; i++) { s += a * n(x * f + i * 17.3, y * f - i * 9.1); f *= 2.03; a *= .5; } return s; }
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const sstep = (a, b, v) => { const t = clamp((v - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const mix = (a, b, t) => a + (b - a) * t;
+
+// ---------- raster helpers ----------
+function layer() { const c = document.createElement('canvas'); c.width = W; c.height = H; return { c, g: c.getContext('2d') }; }
+function alphaOf(L) { const d = L.g.getImageData(0, 0, W, H).data, a = new Float32Array(N); for (let i = 0; i < N; i++) a[i] = d[i * 4 + 3] / 255; return a; }
+function chanOf(L) { const d = L.g.getImageData(0, 0, W, H).data, a = new Float32Array(N), r = new Float32Array(N); for (let i = 0; i < N; i++) { a[i] = d[i * 4 + 3] / 255; r[i] = d[i * 4] / 255; } return { a, r }; }
+// separable box blur, run twice ~ gaussian
+function blur(src, rad) {
+  if (rad < 1) return src.slice();
+  let a = src.slice(), b = new Float32Array(N);
+  for (let pass = 0; pass < 2; pass++) {
+    for (let y = 0; y < H; y++) { const o = y * W; let s = 0, n = 0;
+      for (let x = -rad; x < W; x++) { if (x + rad < W) { s += a[o + x + rad]; n++; } if (x - rad - 1 >= 0) { s -= a[o + x - rad - 1]; n--; } if (x >= 0) b[o + x] = s / n; } }
+    for (let x = 0; x < W; x++) { let s = 0, n = 0;
+      for (let y = -rad; y < H; y++) { if (y + rad < H) { s += b[(y + rad) * W + x]; n++; } if (y - rad - 1 >= 0) { s -= b[(y - rad - 1) * W + x]; n--; } if (y >= 0) a[y * W + x] = s / n; } }
+  }
+  return a;
+}
+// exact euclidean distance transform (Felzenszwalb), distance to nearest pixel where inside==0
+function edt(inside) {
+  const INF = 1e12, f = new Float64Array(Math.max(W, H)), d = new Float64Array(Math.max(W, H)), v = new Int32Array(Math.max(W, H)), z = new Float64Array(Math.max(W, H) + 1);
+  const g = new Float64Array(N);
+  for (let i = 0; i < N; i++) g[i] = inside[i] ? INF : 0;
+  const pass = (len, get, set) => {
+    for (let q = 0; q < len; q++) f[q] = get(q);
+    let k = 0; v[0] = 0; z[0] = -INF; z[1] = INF;
+    for (let q = 1; q < len; q++) {
+      let s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+      while (s <= z[k]) { k--; s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]); }
+      k++; v[k] = q; z[k] = s; z[k + 1] = INF;
+    }
+    k = 0; for (let q = 0; q < len; q++) { while (z[k + 1] < q) k++; d[q] = (q - v[k]) * (q - v[k]) + f[v[k]]; set(q, d[q]); }
+  };
+  for (let x = 0; x < W; x++) pass(H, q => g[q * W + x], (q, val) => { g[q * W + x] = val; });
+  for (let y = 0; y < H; y++) pass(W, q => g[y * W + q], (q, val) => { g[y * W + q] = val; });
+  const out = new Float32Array(N); for (let i = 0; i < N; i++) out[i] = Math.sqrt(g[i]); return out;
+}
+</script>
+<script>
+"use strict";
+// ---------- the broad nib ----------
+// A stroke is the union of the nib's footprint swept along the path: a thin rectangle held at a
+// fixed angle. Thick and thin fall out of the direction of travel, as with a real quill.
+function densify(pts, smooth, step) {
+  const out = [];
+  if (pts.length === 1) return [pts[0]];
+  const P = smooth ? catmull(pts, 10) : pts;
+  for (let i = 0; i < P.length - 1; i++) {
+    const [x0, y0] = P[i], [x1, y1] = P[i + 1], L = Math.hypot(x1 - x0, y1 - y0), n = Math.max(1, Math.ceil(L / step));
+    for (let k = 0; k < n; k++) out.push([x0 + (x1 - x0) * k / n, y0 + (y1 - y0) * k / n]);
+  }
+  out.push(P[P.length - 1]);
+  return out;
+}
+function catmull(p, seg) {
+  const out = [];
+  for (let i = 0; i < p.length - 1; i++) {
+    const a = p[Math.max(0, i - 1)], b = p[i], c = p[i + 1], d = p[Math.min(p.length - 1, i + 2)];
+    for (let k = 0; k < seg; k++) { const t = k / seg, t2 = t * t, t3 = t2 * t;
+      out.push([.5 * (2 * b[0] + (-a[0] + c[0]) * t + (2 * a[0] - 5 * b[0] + 4 * c[0] - d[0]) * t2 + (-a[0] + 3 * b[0] - 3 * c[0] + d[0]) * t3),
+                .5 * (2 * b[1] + (-a[1] + c[1]) * t + (2 * a[1] - 5 * b[1] + 4 * c[1] - d[1]) * t2 + (-a[1] + 3 * b[1] - 3 * c[1] + d[1]) * t3)]); }
+  }
+  out.push(p[p.length - 1]); return out;
+}
+// pen: { nib px, ang rad, thin px, key }  draws into ctx g (one fill = one wet stroke)
+function nibStroke(g, pts, pen, upto) {
+  const d = densify(pts, pen.smooth, 0.55), r = noiseFor(pen.key || 'nib');
+  let n = d.length; if (upto !== undefined) n = Math.max(0, Math.min(n, Math.floor(d.length * upto)));
+  if (n < 1) return null;
+  g.beginPath();
+  for (let i = 0; i < n; i++) {
+    const [x, y] = d[i], s = i * 0.55;
+    const w = pen.nib * (1 + .05 * r(s * .02, 3.1)) * .5, t = pen.thin * .5;
+    const a = pen.ang + .035 * r(s * .013, 7.7);
+    const ux = Math.cos(a), uy = -Math.sin(a), px = -uy, py = ux;
+    const tx = (pen.tremor || .25) * r(s * .05, 11.3), ty = (pen.tremor || .25) * r(s * .05, 19.9);
+    const X = x + tx, Y = y + ty;
+    g.moveTo(X - ux * w - px * t, Y - uy * w - py * t); g.lineTo(X + ux * w - px * t, Y + uy * w - py * t);
+    g.lineTo(X + ux * w + px * t, Y + uy * w + py * t); g.lineTo(X - ux * w + px * t, Y - uy * w + py * t); g.closePath();
+  }
+  g.fill('nonzero');
+  return { end: d[n - 1], start: d[0] };
+}
+// iron gall pools where the quill lifts: a little extra ink at the end of each stroke
+function pool(g, p, rad, k) {
+  if (!p) return;
+  const gr = g.createRadialGradient(p[0], p[1], 0, p[0], p[1], rad);
+  gr.addColorStop(0, `rgba(${k},${k},${k},1)`); gr.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = gr; g.beginPath(); g.arc(p[0], p[1], rad, 0, 7); g.fill();
+}
+
+// ---------- textura quadrata, built from minims ----------
+// Units are nib widths, y up from the baseline. A minim is a diamond head, a stem, a diamond foot.
+const X = 4.6, A = 7.1, D = -2.4, P = 1.75, s0 = .55, s1 = s0 + P, s2 = s0 + 2 * P, M = (s0 + s1) / 2;
+const minim = s => [[s - .42, X - .38], [s, X - .8], [s, .8], [s + .42, .38]];
+const oL = (m, a, b) => [[m + .1, X - .3], [a, X - .9], [a, .9], [m + .05, .3]];
+const oR = (m, b) => [[m - .35, X - .35], [b, X - .9], [b, .9], [m, .25]];
+const arch = (a, b) => [[a + .05, X - 1.15], [b - .42, X - .38], [b, X - .8], [b, .8], [b + .42, .38]];
+const GL = {
+  i: { adv: P, st: [minim(s0)], dot: [[s0 - .2, X + .55], [s0 + .35, X + 1.3]] },
+  u: { adv: s1 + P - .55, st: [[...minim(s0), [s1 - .05, 1.2]], minim(s1)] },
+  n: { adv: s1 + P - .55, st: [minim(s0), arch(s0, s1)] },
+  m: { adv: s2 + P - .55, st: [minim(s0), arch(s0, s1), arch(s1, s2)] },
+  o: { adv: s1 + .15 + P - .55, st: [oL(M + .07, s0), oR(M + .08, s1 + .15)] },
+  c: { adv: s1 + P - .75, st: [[...oL(M + .07, s0), [s1 + .1, .78]], [[M - .3, X - .35], [s1 + .1, X - .9], [s1 + .1, X - 1.5]]] },
+  e: { adv: s1 + P - .7, st: [[...oL(M + .07, s0), [s1 + .1, .78]], [[M - .3, X - .35], [s1 + .1, X - .9], [s1 + .1, X - 1.7], [s0 + .1, X * .5]]] },
+  b: { adv: s1 + P - .5, st: [[[s0 - .42, A - .38], [s0, A - .8], [s0, .8], [M + .1, .3]], [[s0 + .05, X - 1.1], [M - .2, X - .4], [s1, X - .9], [s1, .9], [M + .05, .28]]] },
+  d: { adv: s1 + P - .55, st: [oL(M + .07, s0), [[s1 - .42, A - .38], [s1, A - .8], [s1, .8], [s1 + .42, .38]], [[M - .3, X - .32], [s1, X - .85]]] },
+  p: { adv: s1 + P - .55, st: [[[s0 - .42, X - .38], [s0, X - .8], [s0, D + .55], [s0 + .42, D + .13]], [[s0 + .05, X - 1.1], [M - .2, X - .4], [s1, X - .9], [s1, .9], [M + .05, .28]], [[s0 + .05, 1.05], [M + .1, .32]]] },
+  h: { adv: s1 + P - .55, st: [[[s0 - .42, A - .38], [s0, A - .8], [s0, .8], [s0 + .42, .38]], arch(s0, s1)] },
+  a: { adv: s1 + P - .55, st: [[[s0 - .3, X - .6], [s0 + .1, X - 1.0], [s1 - .42, X - .38], [s1, X - .8], [s1, .8], [s1 + .42, .38]], [[s1 - .05, X * .62], [s0, X * .4], [s0, .8], [M, .3], [s1 - .05, .95]]] },
+  r: { adv: s0 + P + .2 - .55, st: [minim(s0), [[s0 + .05, X - 1.15], [s0 + .55, X - .42], [s0 + 1.35, X - .9]]] },
+  t: { adv: s0 + P + .15 - .55, st: [[[s0, X + .95], [s0, .8], [s0 + .42, .38]], [[s0 - .6, X - .28], [s0 + 1.05, X - .28]]] },
+  f: { adv: s0 + P + .3 - .55, st: [[[s0, A - 1.1], [s0, .8], [s0 + .42, .38]], [[s0 - .1, A - 1.2], [s0 + .4, A - .45], [s0 + 1.35, A - .8]], [[s0 - .6, X - .28], [s0 + 1.0, X - .28]]] },
+  s: { adv: s1 + P - .6, st: [[[s1 + .15, X - 1.35], [s1 + .1, X - .9], [M - .1, X - .3], [s0 + .1, X - .95], [s0 + .1, X * .64], [s1, X * .38], [s1, .95], [M + .1, .3], [s0 - .05, .78]]] },
+  g: { adv: s1 + P - .55, st: [oL(M + .07, s0), [[M - .3, X - .35], [s1, X - .9], [s1, -1.0], [s1 - .55, -1.8], [s0 - .2, -1.75]], [[s1, X - .9], [s1 + .55, X - .4]]] },
+  y: { adv: s1 + P - .55, st: [[...minim(s0), [s1 - .05, 1.2]], [[s1 - .42, X - .38], [s1, X - .8], [s1, -.9], [s1 - .55, -1.85], [s0 - .35, -1.9]]] },
+  ' ': { adv: 2.0, st: [] },
+};
+</script>
+<script>
+"use strict";
+GL.l = { adv: P, st: [[[s0 - .42, A - .38], [s0, A - .8], [s0, .8], [s0 + .42, .38]]] };
+GL.w = { adv: s2 + P - .55, st: [[...minim(s0), [s1 - .05, 1.2]], [...minim(s1), [s2 - .05, 1.2]], [[s2 - .42, X - .38], [s2, X - .8], [s2, 1.4]]] };
+const NIB_ANG = 40 * Math.PI / 180;
+// write a run of textura. ink = { g, k } (k: density of one wet stroke, 'lighter' canvas)
+// returns { w, strokes } where strokes are px polylines in writing order (kept for the quill motion)
+function textura(str, x0, base, xh, key, o = {}) {
+  const u = xh / X, r = rngFor('tx:' + key), out = [];
+  let x = x0;
+  for (const ch of str) {
+    const gl = GL[ch]; if (!gl) continue;
+    const jx = (r() - .5) * .12, jy = (r() - .5) * .07, sc = 1 + (r() - .5) * .025;
+    const T = ([gx, gy]) => [x + (gx + jx) * u * sc, base - (gy + jy) * u * sc];
+    for (const s of gl.st) out.push({ pts: s.map(T), u });
+    if (gl.dot) out.push({ pts: gl.dot.map(T), u, hair: true });
+    x += (gl.adv + (r() - .5) * .08) * u;
+  }
+  return { w: x - x0, strokes: out, u, dip: (hash(key) % 13) };
+}
+function inkRun(g, run, k, key, upto) {
+  g.save(); g.globalCompositeOperation = 'lighter'; g.fillStyle = `rgb(${k},${k},${k})`;
+  const total = run.strokes.length;
+  let i = 0;
+  for (const s of run.strokes) {
+    let part; if (upto !== undefined) { part = clamp(upto * total - i, 0, 1); if (part <= 0) break; }
+    const pen = { nib: s.u * (s.hair ? .55 : 1), ang: NIB_ANG, thin: Math.max(1.3, s.u * .075), key: key + ':' + i, smooth: s.smooth, tremor: .22 + s.u * .012 };
+    // the quill runs dry over a dozen strokes, then the scribe dips again
+    const kk = Math.round(k * (1 - .3 * (((i + (run.dip || 0)) % 13) / 13)));
+    g.fillStyle = `rgb(${kk},${kk},${kk})`;
+    const e = nibStroke(g, s.pts, pen, part === undefined || part >= 1 ? undefined : part);
+    if (e && (part === undefined || part >= 1)) { g.save(); g.clip(); pool(g, e.end, s.u * .5, Math.round(k * .5)); g.restore(); }
+    i++;
+  }
+  g.restore();
+}
+// pen line for drawings (marginalia): same nib physics, a narrower quill, smooth curves
+function penLine(g, pts, nib, key, k = 120, o = {}) {
+  g.save(); g.globalCompositeOperation = 'lighter'; g.fillStyle = `rgb(${k},${k},${k})`;
+  const e = nibStroke(g, pts, { nib, ang: o.ang ?? NIB_ANG, thin: o.thin ?? Math.max(1.8, nib * .22), key, smooth: o.smooth !== false, tremor: o.tremor ?? .35 });
+  if (e && o.pool !== false) { g.save(); g.clip(); pool(g, e.end, nib * .7, Math.round(k * .5)); g.restore(); }
+  g.restore();
+}
+
+// ---------- page plan (all positions in backing-store px) ----------
+// A choir-book leaf: four lines of large textura, each ruled at its baseline and its x-height,
+// and a hanging initial A two lines deep. The caption band at the top left is reached last.
+const XH = 98, BASE = [370, 592, 814, 1036];
+const RULES = BASE.flatMap(b => [b - XH, b]);
+const TB = { l: 160, r: 985 };                        // text block bounds
+const INIT = { x: 112, y: 146, w: 478, h: 446 };      // the gilded initial's panel
+const LB = { x: 160, y: 182, w: 386, h: 376 };        // the letter's box inside it
+const CAP_Y = 330;                                     // above this line the caption waits until ~4 s
+// the phrase's first letter becomes the initial; its other words fill the four lines
+const WORDS = PHRASE_TO_RENDER.split(' '), INITIAL = WORDS[0][0].toUpperCase();
+const PLAN = [
+  { words: WORDS.slice(1, 2), x: 646, k: 0 },
+  { words: WORDS.slice(2, 3), x: 646, k: 1 },
+  { words: WORDS.slice(3, 5), x: TB.l, k: 2 },
+  { words: WORDS.slice(5), x: TB.l, k: 3 },
+];
+const DUR = 6, BUILD_END = 4.65, HERO = 5.25;
+// when the work reaches each pixel, one map per material (seconds; NEVER = untouched)
+const NEVER = 1e9, tmap = () => new Float32Array(N).fill(NEVER);
+const PT = tmap(), WT = tmap(), GT = tmap(), LT = tmap(), BT = tmap(), ET = tmap();
+function trace(TM, pts, t0, t1, rad) {
+  const d = pts.length > 1 ? densify(pts, false, 1.5) : pts, n = d.length;
+  for (let k = 0; k < n; k++) {
+    const tk = n > 1 ? mix(t0, t1, k / (n - 1)) : t0, [px, py] = d[k];
+    for (let y = Math.max(0, Math.floor(py - rad)); y <= Math.min(H - 1, py + rad); y++)
+      for (let x = Math.max(0, Math.floor(px - rad)); x <= Math.min(W - 1, px + rad); x++) {
+        if ((x - px) * (x - px) + (y - py) * (y - py) > rad * rad) continue;
+        const i = y * W + x; if (tk < TM[i]) TM[i] = tk;
+      }
+  }
+}
+const polyLen = p => { let L = 0; for (let k = 1; k < p.length; k++) L += Math.hypot(p[k][0] - p[k - 1][0], p[k][1] - p[k - 1][1]); return L; };
+// the inverse of smoothstep: a front that eases in and out along a stroke
+const invS = x => .5 - Math.sin(Math.asin(clamp(1 - 2 * x, -1, 1)) / 3);
+// ---------- ink jobs: every pen stroke on the page, with the moments it starts and ends ----------
+const JOBS = [];
+function penJob(pts, nib, key, k, o, t0, t1) { JOBS.push({ pts, k, t0, t1, pen: { nib, ang: o.ang ?? NIB_ANG, thin: o.thin ?? Math.max(1.8, nib * .22), key: 'mg:' + key, smooth: o.smooth !== false, tremor: o.tremor ?? .35 }, pool: o.pool === false ? 0 : nib * .7 }); }
+// the scribe writes the text in order: about four frames a stroke through the first word, then the
+// hand loosens to under a frame a stroke; a word ends with the pen lifted, a line with a longer pause
+let TEXT_END = 0; const PEN = [];   // the strokes the nib tip rides, in time order
+function scheduleText() {
+  const u = XH / X; let t = .45, gi = 0;
+  for (const ln of PLAN) {
+    let x = ln.x;
+    for (const wd of ln.words) {
+      const run = textura(wd, x, BASE[ln.k], XH, 'w:' + wd); x += run.w + 2.0 * u;
+      run.strokes.forEach((s, si) => {
+        const q = sstep(9.5, 13.5, gi), dur = mix(.115, .022, q) * clamp(.7 + .3 * polyLen(s.pts) / (u * 4), .7, 1.4);
+        const kk = Math.round(112 * (1 - .3 * (((gi + 5) % 13) / 13)));   // the quill runs dry, then is dipped
+        JOBS.push({ pts: s.pts, k: kk, t0: t, t1: t + dur, pen: { nib: s.u * (s.hair ? .55 : 1), ang: NIB_ANG, thin: Math.max(1.3, s.u * .075), key: wd + ':' + si, smooth: s.smooth, tremor: .22 + s.u * .012 }, pool: s.u * .5 });
+        PEN.push({ t0: t, t1: t + dur, d: densify(s.pts, s.smooth, .55) });
+        t += dur + mix(.025, .006, q); gi++;
+      });
+      t += mix(.12, .05, sstep(9.5, 13.5, gi));
+    }
+    t += mix(.14, .08, sstep(9.5, 13.5, gi));
+  }
+  TEXT_END = PEN[PEN.length - 1].t1;
+}
+</script>
+<script>
+"use strict";
+// ---------- vellum ----------
+// Calfskin: a yellower hair side with follicle clusters, a whiter flesh side, scraping streaks,
+// veins, a darker translucent spine band, cockling that the single window light rakes across.
+const VR = new Float32Array(N), VG = new Float32Array(N), VB = new Float32Array(N);
+const SHADE = new Float32Array(N), PNX = new Float32Array(N), PNY = new Float32Array(N);
+const EDGE = new Float32Array(H);
+const LIGHT = (() => { const v = [-.55, -.62, .56], l = Math.hypot(...v); return v.map(c => c / l); })();
+function bakeVellum() {
+  const nA = noiseFor('vel:patch'), nB = noiseFor('vel:mid'), nC = noiseFor('vel:grain'), nS = noiseFor('vel:scrape');
+  const nK = noiseFor('vel:cockle'), nE = noiseFor('vel:edge'), nO = noiseFor('vel:soil');
+  for (let y = 0; y < H; y++) EDGE[y] = 1050 + 2.2 * nE(y / 260, .5) + .6 * nE(y / 23, 4.2);
+  // cockle: low hills in the skin, the page dropping into the gutter at the left
+  const hp = new Float32Array(N);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    let h = 5.2 * fbm(nK, x / 240 + y / 900, y / 640, 2) + 1.4 * nK(x / 70 + y / 300 + 7, y / 260 - 3)
+      + 1.1 * Math.sin((x * .9 + y * .35) / 44 + 2.6 * nK(x / 210, y / 210 + 11)) * (.5 + .5 * nK(x / 300 + 5, y / 300));
+    hp[y * W + x] = h;
+  }
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x, xm = x > 0 ? i - 1 : i, xp = x < W - 1 ? i + 1 : i, ym = y > 0 ? i - W : i, yp = y < H - 1 ? i + W : i;
+    const gx = (hp[xp] - hp[xm]) * .5, gy = (hp[yp] - hp[ym]) * .5, l = Math.hypot(gx, gy, 1);
+    const nx = -gx / l, ny = -gy / l, nz = 1 / l;
+    PNX[i] = nx; PNY[i] = ny;
+    const lam = (nx * LIGHT[0] + ny * LIGHT[1] + nz * LIGHT[2]) / LIGHT[2];
+    const fall = 1.035 - .075 * (x / W * .55 + y / H * .45);
+    // the facing leaf rises at the gutter and shades the inner margin from the window
+    const gut = 1 - .3 * Math.pow(sstep(150, 0, x), 1.8) - .2 * Math.pow(sstep(40, 0, x), 2);
+    SHADE[i] = clamp(mix(1, lam, .5), .6, 1.15) * fall * gut;
+  }
+  const sp = { x0: 1080, y0: 120, x1: 260, y1: 1350 }; // spine line of the animal, crossing the folio
+  const sl = Math.hypot(sp.x1 - sp.x0, sp.y1 - sp.y0);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x;
+    const hs = sstep(-.1, .35, fbm(nA, x / 380 + y / 1400, y / 700, 3) + .3 * fbm(nB, x / 90, y / 160, 2));
+    let r = mix(242, 236, hs), g = mix(234, 222, hs), b = mix(212, 188, hs);
+    const grain = .5 * nC(x / 2.1, y / 2.1) + .5 * nC(x / 5.3 + 40, y / 5.3);
+    const scrape = nS(x / 170 + y / 420, y / 3.2) * nS(x / 60, y / 90 + 5);
+    const mott = fbm(nB, x / 55 + 30, y / 55, 2);
+    const d = Math.abs((sp.y1 - sp.y0) * x - (sp.x1 - sp.x0) * y + sp.x1 * sp.y0 - sp.y1 * sp.x0) / sl;
+    const band = Math.exp(-(d / 70) * (d / 70)) * (.6 + .4 * nB(x / 200, y / 200));
+    const soil = sstep(820, 1350, y) * sstep(640, 1050, x) * (.55 + .45 * fbm(nO, x / 70, y / 70, 3));
+    const f = 1 + .017 * grain + .014 * scrape + .012 * mott - .03 * band - .11 * soil;
+    r *= f; g *= f - .01 * band - .015 * soil; b *= f - .03 * band - .04 * soil;
+    VR[i] = r; VG[i] = g; VB[i] = b;
+  }
+  // follicles: hair came out of the skin in little groups, so the pores do too
+  const fr = rngFor('vel:follicles');
+  for (let c = 0; c < 9000; c++) {
+    const x = fr() * W, y = fr() * H, i0 = (y | 0) * W + (x | 0);
+    const hs = sstep(-.06, .3, fbm(nA, x / 420, y / 520, 3) + .35 * fbm(nB, x / 120, y / 120, 2));
+    if (fr() > .18 + .82 * hs) continue;
+    const ang = 1.05 + (fr() - .5) * 1.6, n = 2 + (fr() * 3 | 0), sp2 = 2.2 + fr() * 1.6, dark = .03 + fr() * .08;
+    for (let k = 0; k < n; k++) {
+      const px = x + Math.cos(ang) * sp2 * k + (fr() - .5) * .8, py = y + Math.sin(ang) * sp2 * k + (fr() - .5) * .8, rad = .55 + fr() * .75;
+      for (let yy = Math.floor(py - 2); yy <= py + 2; yy++) for (let xx = Math.floor(px - 2); xx <= px + 2; xx++) {
+        if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+        const ff = clamp(rad + .5 - Math.hypot(xx - px, yy - py), 0, 1) * dark, j = yy * W + xx;
+        VR[j] *= 1 - ff * .9; VG[j] *= 1 - ff; VB[j] *= 1 - ff * 1.15;
+      }
+    }
+    if (i0 < 0) continue;
+  }
+}
+</script>
+<script>
+"use strict";
+// ---------- ruling, prickings, veins, the verso showing through ----------
+function bakeMarks() {
+  // plummet ruling: a soft lead point that skips and wavers
+  const R = layer(), rr = rngFor('rule'), g = R.g;
+  const lead = (x0, y0, x1, y1) => {
+    const L = Math.hypot(x1 - x0, y1 - y0), n = Math.ceil(L / 34);
+    for (let k = 0; k < n; k++) {
+      if (rr() < .06) continue;
+      const a = k / n, b = Math.min(1, (k + 1) / n + .004);
+      g.strokeStyle = `rgba(0,0,0,${.35 + rr() * .5})`; g.lineWidth = 1.3 + rr() * .7;
+      g.beginPath(); g.moveTo(mix(x0, x1, a) + (rr() - .5) * .5, mix(y0, y1, a) + (rr() - .5) * .5);
+      g.lineTo(mix(x0, x1, b) + (rr() - .5) * .5, mix(y0, y1, b) + (rr() - .5) * .5); g.stroke();
+    }
+  };
+  // each line of the large hand is ruled twice, at its baseline and its x-height
+  RULES.forEach((ry, k) => {
+    const y = ry + (rr() - .5) * 1.2, full = k === 0 || k === RULES.length - 1;
+    lead(full ? 40 : TB.l - 9, y, full ? 1040 : TB.r + 9, y + (rr() - .5) * 1.5);
+  });
+  for (const x of [TB.l - 9, TB.l, TB.r, TB.r + 9]) lead(x, 0, x + (rr() - .5) * 2, H);
+  const ra = blur(alphaOf(R), 1);
+  // prickings in the outer margin, one per ruled line: the awl's slit with a raised burr
+  const Pk = layer(), pr = rngFor('prick');
+  for (const ry of RULES) {
+    const x = 1020 + (pr() - .5) * 3, y = ry + (pr() - .5) * 2;
+    Pk.g.save(); Pk.g.translate(x, y); Pk.g.rotate(.5 + (pr() - .5) * .5);
+    Pk.g.fillStyle = 'rgba(0,0,0,1)'; Pk.g.beginPath(); Pk.g.ellipse(0, 0, 2.6, 1.1, 0, 0, 7); Pk.g.fill(); Pk.g.restore();
+  }
+  const pa = alphaOf(Pk), pb = blur(pa, 2);
+  // veins: faint branching vessels in the skin
+  const V = layer(), vr = rngFor('veins');
+  for (let v = 0; v < 4; v++) {
+    let x = vr() * W, y = vr() * H, a = vr() * 6.28;
+    V.g.strokeStyle = 'rgba(0,0,0,.5)'; V.g.lineCap = 'round';
+    for (let s = 0; s < 70; s++) {
+      const nx = x + Math.cos(a) * 9, ny = y + Math.sin(a) * 9;
+      V.g.lineWidth = 3.2 * (1 - s / 80); V.g.beginPath(); V.g.moveTo(x, y); V.g.lineTo(nx, ny); V.g.stroke();
+      x = nx; y = ny; a += (vr() - .5) * .5;
+      if (vr() < .05) { let bx = x, by = y, ba = a + (vr() < .5 ? -1 : 1) * .9; V.g.lineWidth = 1.6;
+        for (let q = 0; q < 14; q++) { const qx = bx + Math.cos(ba) * 8, qy = by + Math.sin(ba) * 8; V.g.beginPath(); V.g.moveTo(bx, by); V.g.lineTo(qx, qy); V.g.stroke(); bx = qx; by = qy; ba += (vr() - .5) * .6; } }
+    }
+  }
+  const va = blur(alphaOf(V), 3);
+  // the verso: the text on the back shows through the thin skin, mirrored and too faint to read
+  const G0 = layer(), vw = rngFor('verso:words');
+  BASE.forEach((by, k) => {
+    let x = TB.l + 4, n = 0;
+    while (x < TB.r - 160) { let w = ''; const L = 3 + (vw() * 5 | 0); for (let c = 0; c < L; c++) w += 'minuoceat'[vw() * 9 | 0];
+      const run = textura(w, x, by, XH, 'verso' + k + ':' + n); inkRun(G0.g, run, 160, 'verso' + k); x += run.w + 2 * XH / X; n++; }
+  });
+  const G1 = layer(); G1.g.setTransform(-1, 0, 0, 1, TB.l + TB.r, 0); G1.g.drawImage(G0.c, 0, 0);
+  const ga = blur(alphaOf(G1), 5), nT = noiseFor('vel:thin');
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x;
+    const thin = .45 + .55 * sstep(-.25, .3, fbm(nT, x / 260, y / 260, 2));
+    const gh = ga[i] * .013 * thin, rl = ra[i] * .2, vn = va[i] * .045, pk = pa[i] * .62 + pb[i] * .1;
+    VR[i] = VR[i] * (1 - gh * .9 - vn * .7 - pk) * (1 - rl) + 142 * rl * .25;
+    VG[i] = VG[i] * (1 - gh - vn * 1.1 - pk) * (1 - rl) + 138 * rl * .25;
+    VB[i] = VB[i] * (1 - gh * 1.1 - vn * 1.2 - pk * 1.1) * (1 - rl) + 134 * rl * .25;
+  }
+}
+</script>
+<script>
+"use strict";
+// ---------- the initial: a raised gold Lombardic A on lapis, a vermilion counter, lead-white penwork ----------
+const LP = ([u, v]) => [LB.x + u * LB.w, LB.y + v * LB.h];
+function poly(g, pts) { g.beginPath(); g.moveTo(...pts[0]); for (const p of pts.slice(1)) g.lineTo(...p); g.closePath(); g.fill(); }
+const FS = 16, FR = { l: INIT.x, t: INIT.y, r: INIT.x + INIT.w, b: INIT.y + INIT.h };
+// The gilder lays each part as one gesso stroke along its centreline cl. A and B are the stroke's
+// windows (s) below and above CAP_Y: the lower half goes on while the scribe writes, the top last.
+const A_PARTS = [
+  { shape: [[.73, .94], [.99, .925], [1.03, .965], [.99, 1], [.75, 1], [.71, .97]], cl: [[1.0, .965], [.73, .965]], A: [2.0, 2.12] },
+  { shape: [[.6, .055], [.715, .055], [.95, .95], [.835, .95]], cl: [[.89, .95], [.66, .06]], A: [2.09, 2.35], B: [4.0, 4.05] },
+  { shape: [[.26, .592], [.79, .592], [.805, .652], [.26, .652]], cl: [[.79, .622], [.27, .622]], A: [2.32, 2.48] },
+  { shape: [[0, .955], [.33, .935], [.37, .975], [.33, 1], [.04, 1], [-.01, .985]], cl: [[.35, .97], [0, .97]], A: [2.41, 2.54] },
+  { outer: [[.47, .055], [.3, .22], [.14, .44], [.06, .66], [.065, .86], [.12, .96]], inner: [[.28, .96], [.265, .84], [.28, .66], [.335, .47], [.445, .26], [.6, .055]],
+    cl: [[.2, .96], [.165, .86], [.17, .66], [.235, .455], [.37, .24], [.535, .06]], A: [2.51, 2.8], B: [4.02, 4.1] },
+  { shape: [[.25, -.005], [.83, -.01], [.865, .03], [.82, .075], [.56, .08], [.4, .082], [.31, .125], [.235, .07]], cl: [[.85, .035], [.25, .06]], B: [4.08, 4.14] },
+].map(p => Object.assign(p, { cl: p.cl.map(LP) }));
+const LOMBARDIC = { A: A_PARTS };
+const F_PARTS = [
+  { cl: [[FR.r - 8, FR.b - 8], [FR.l + 8, FR.b - 8]], A: [1.9, 2.16] },
+  { cl: [[FR.r - 8, FR.b - 8], [FR.r - 8, FR.t + 8]], A: [2.16, 2.32], B: [4.0, 4.04] },
+  { cl: [[FR.l + 8, FR.b - 8], [FR.l + 8, FR.t + 8]], A: [2.67, 2.9], B: [4.08, 4.15] },
+  { cl: [[FR.r - 8, FR.t + 8], [FR.l + 8, FR.t + 8]], B: [4.06, 4.14] },
+];
+// the counter above the crossbar, drawn a little under the gold so the paint runs up to the gesso
+const COUNTER = [[.588, .045], [.43, .255], [.32, .47], [.283, .61], [.758, .61], [.612, .045]];
+function partShape(p) { return p.shape ? p.shape.map(LP) : catmull(p.outer.map(LP), 8).concat(catmull(p.inner.map(LP), 8)); }
+// gesso time per gold pixel: the nearest centreline sample says which stroke laid it, and when
+function partsTime(parts, ga) {
+  const S = [];
+  for (const p of parts) {
+    const d = densify(p.cl, false, 3), s = [0];
+    for (let k = 1; k < d.length; k++) s.push(s[k - 1] + Math.hypot(d[k][0] - d[k - 1][0], d[k][1] - d[k - 1][1]));
+    const L = s[s.length - 1]; let sc = 1;
+    for (let k = 0; k < d.length; k++) if (d[k][1] < CAP_Y) { sc = s[k] / L; break; }
+    p.sc = sc; d.forEach((q, k) => S.push([q[0], q[1], p, s[k] / L]));
+  }
+  for (let y = FR.t - 2; y < FR.b + 2; y++) for (let x = FR.l - 2; x < FR.r + 2; x++) {
+    const i = y * W + x; if (ga[i] <= 0) continue;
+    let best = 1e12, bp = null, bs = 0;
+    for (const q of S) { const dd = (q[0] - x) * (q[0] - x) + (q[1] - y) * (q[1] - y); if (dd < best) { best = dd; bp = q[2]; bs = q[3]; } }
+    let w, f;
+    if (y >= CAP_Y && bp.A) { w = bp.A; f = bp.sc > 0 ? bs / bp.sc : 0; }
+    else if (y < CAP_Y && bp.B) { w = bp.B; f = bp.sc < 1 ? (bs - bp.sc) / (1 - bp.sc) : 1; }
+    else { w = bp.A || bp.B; f = bs; }
+    GT[i] = mix(w[0], w[1], invS(clamp(f, 0, 1)));
+  }
+}
+// a hand-cut edge: the outline wanders a little, as gesso laid with a pen does
+function wobble(pts, key, amp) {
+  const n = noiseFor(key), d = densify(pts.concat([pts[0]]), false, 4);
+  return d.map(([x, y], k) => [x + amp * n(k * .07, 1.3), y + amp * n(k * .07, 8.1)]);
+}
+function bakeInitial() {
+  const gold = layer(), g = gold.g; g.fillStyle = '#fff';
+  // the frame: a raised gold border round the panel
+  const fr = noiseFor('frame');
+  const ring = (o, dir) => { const pts = [[FR.l + o, FR.t + o], [FR.r - o, FR.t + o], [FR.r - o, FR.b - o], [FR.l + o, FR.b - o]];
+    const seq = dir ? pts : pts.slice().reverse(), dense = [];
+    for (let k = 0; k < 4; k++) { const a = seq[k], b = seq[(k + 1) % 4]; for (let s = 0; s < 48; s++) { const t = s / 48, j = .9 * fr((k * 48 + s) * .11, o); dense.push([mix(a[0], b[0], t) + j, mix(a[1], b[1], t) - j]); } }
+    g.moveTo(...dense[0]); for (const p of dense) g.lineTo(...p); g.closePath(); };
+  g.beginPath(); ring(0, true); ring(FS, false); g.fill('nonzero');
+  const frameA = alphaOf(gold);
+  // the letter
+  const lt = layer(); lt.g.fillStyle = '#fff';
+  LOMBARDIC[INITIAL].forEach((p, k) => poly(lt.g, wobble(partShape(p), 'A:' + k, 1.1)));
+  const letA = alphaOf(lt); g.drawImage(lt.c, 0, 0);
+  // lapis ground and vermilion counter (painted after gilding, up to the gesso)
+  const cpts = catmull(COUNTER.slice(0, 4).map(LP), 8).concat(COUNTER.slice(4).map(LP));
+  const lap = layer(); lap.g.fillStyle = '#fff'; lap.g.fillRect(FR.l + FS - 2, FR.t + FS - 2, INIT.w - 2 * FS + 4, INIT.h - 2 * FS + 4);
+  const ver = layer(); ver.g.fillStyle = '#fff'; poly(ver.g, wobble(cpts, 'A:ver', 1.2));
+  lap.g.globalCompositeOperation = 'destination-out'; lap.g.drawImage(ver.c, 0, 0);
+  // lead-white penwork: a border with trefoils and corner spirals, a contour round the letter, a diaper in the counter
+  const wh = layer(), w = wh.g, wr = rngFor('white'), wn = noiseFor('white:hand');
+  w.strokeStyle = '#fff'; w.fillStyle = '#fff'; w.lineCap = 'round'; w.lineJoin = 'round';
+  const wline = (pts, lw) => { const dp = densify(pts, false, 6); w.lineWidth = lw; w.beginPath(); dp.forEach((p, k) => w.lineTo(p[0] + .9 * wn(k * .08, 1), p[1] + .9 * wn(k * .08, 5))); w.stroke(); };
+  const bi = FS + 9, L0 = FR.l + bi, T0 = FR.t + bi, R0 = FR.r - bi, B0 = FR.b - bi;
+  wline([[L0, T0], [R0, T0], [R0, B0], [L0, B0], [L0, T0]], 2.1);
+  const tre = (x, y, s) => { x += (wr() - .5) * 3; y += (wr() - .5) * 2; for (const [dx, dy] of [[0, -s], [-s * .9, s * .55], [s * .9, s * .55]]) { w.beginPath(); w.arc(x + dx + (wr() - .5), y + dy + (wr() - .5), 1.7 + wr() * .7, 0, 7); w.fill(); } };
+  const nx = Math.round((R0 - L0) / 38), ny = Math.round((B0 - T0) / 38);
+  for (let k = 0; k < nx; k++) { const x = mix(L0, R0, (k + .5) / nx); tre(x, T0 + 12, 3.5); tre(x, B0 - 12, 3.5); }
+  for (let k = 0; k < ny; k++) { const y = mix(T0, B0, (k + .5) / ny); tre(L0 + 12, y, 3.5); tre(R0 - 12, y, 3.5); }
+  for (const [x, y, sx, sy] of [[L0, T0, 1, 1], [R0, T0, -1, 1], [R0, B0, -1, -1], [L0, B0, 1, -1]]) {
+    const pts = []; for (let a = 0; a < 9.5; a += .25) { const r = 3 + a * 2.6; pts.push([x + sx * (22 + Math.cos(a) * r * .6), y + sy * (22 + Math.sin(a) * r * .6)]); } wline(pts.slice(0, 26), 2.3);
+  }
+  // diaper: a hand-ruled lozenge lattice in the counter, a trefoil of dots in every lozenge
+  const dc = layer(), d = dc.g, vr = rngFor('vine'); d.strokeStyle = '#fff'; d.fillStyle = '#fff'; d.lineCap = 'round';
+  const [cX, cY] = LP([.52, .4]), cs = 15;
+  d.lineWidth = 1.4; d.globalAlpha = .78;
+  const dl = (ax, ay, bx, by, k) => { const dp = densify([[ax, ay], [bx, by]], false, 5); d.beginPath(); dp.forEach((p, j) => d.lineTo(p[0] + .7 * wn(j * .1, k), p[1] + .7 * wn(j * .1, k + 3))); d.stroke(); };
+  for (let k = -12; k < 12; k++) { const o = k * cs * 2 + (vr() - .5) * 2;
+    dl(cX + o - 200, cY - 200, cX + o + 200, cY + 200, k * 7); dl(cX + o + 200, cY - 200, cX + o - 200, cY + 200, k * 7 + 50); }
+  d.globalAlpha = 1;
+  for (let a = -9; a <= 9; a++) for (let b = -9; b <= 9; b++) { const x = cX + (a + b) * cs + (vr() - .5) * 1.5, y = cY + (b - a) * cs + cs + (vr() - .5) * 1.5;
+    for (const [dx, dy] of [[0, -2.6], [-2.3, 1.6], [2.3, 1.6]]) { d.beginPath(); d.arc(x + dx, y + dy, 1.5, 0, 7); d.fill(); } }
+  dc.g.globalCompositeOperation = 'destination-in'; dc.g.drawImage(ver.c, 0, 0);
+  w.globalAlpha = .9; w.drawImage(dc.c, 0, 0); w.globalAlpha = 1;
+  const white = alphaOf(wh), lapis = alphaOf(lap), verm = alphaOf(ver);
+  // the contour: a white line drawn about 11 px off the letter, on the lapis only
+  const out = new Uint8Array(N); for (let i = 0; i < N; i++) out[i] = letA[i] > .5 ? 0 : 1;
+  const dO = edt(out), nc = noiseFor('white:contour');
+  for (let y = T0 + 6; y < B0 - 6; y++) for (let x = L0 + 6; x < R0 - 6; x++) {
+    const i = y * W + x; if (lapis[i] < .5) { if (verm[i] > .5) white[i] *= sstep(4, 7, dO[i]); continue; }
+    const q = Math.abs(dO[i] - 11 - .8 * nc(x / 40, y / 40)); white[i] = Math.max(white[i], clamp(1.25 - q, 0, 1));
+  }
+  return { gold: alphaOf(gold), letter: letA, frame: frameA, lapis, verm, white, dO };
+}
+// ---------- when each part of the initial is made ----------
+const SEAM = new Float32Array(N), SEAMT = tmap();
+function timeInitial(ini) {
+  partsTime(LOMBARDIC[INITIAL], ini.letter); partsTime(F_PARTS, ini.frame);
+  // gold leaf, cut in small squares and laid one by one once the gesso under each has set; each
+  // piece overlaps the last, and the leaf past the gesso is brushed off before the paint goes on
+  const r = rngFor('leaf'), pieces = [], cols = 7, cw = (INIT.w + 8) / cols;
+  const lo = k => mix(CAP_Y, FR.b + 5, k / 4), hi = k => mix(CAP_Y, FR.t - 5, k / 3), bands = [];
+  for (let k = 0; k < 4; k++) bands.push([lo(k), lo(k + 1)]);
+  for (let k = 0; k < 3; k++) bands.push([hi(k + 1), hi(k) + 6]);
+  for (const [ya, yb] of bands) for (let c = 0; c < cols; c++) pieces.push({ lower: ya >= CAP_Y,
+    cx: FR.l - 4 + (c + .5) * cw + (r() - .5) * 5, cy: (ya + yb) / 2 + (r() - .5) * 3, hw: cw / 2 + 3 + r() * 3, hh: (yb - ya) / 2 + 2 + r() * 2, a: (r() - .5) * .07 });
+  for (const pc of pieces) {
+    const ca = Math.cos(pc.a), sa = Math.sin(pc.a), R = Math.hypot(pc.hw, pc.hh) + 1; let tm = -1; pc.px = [];
+    for (let y = Math.floor(pc.cy - R); y <= pc.cy + R; y++) for (let x = Math.floor(pc.cx - R); x <= pc.cx + R; x++) {
+      if (pc.lower && y < CAP_Y) continue;
+      const lx = (x - pc.cx) * ca + (y - pc.cy) * sa, ly = -(x - pc.cx) * sa + (y - pc.cy) * ca, ex = pc.hw - Math.abs(lx), ey = pc.hh - Math.abs(ly);
+      if (ex < 0 || ey < 0) continue;
+      const i = y * W + x; pc.px.push(i, Math.min(ex, ey)); if (ini.gold[i] > .5) tm = Math.max(tm, GT[i]);
+    }
+    pc.t = tm + (pc.lower ? .3 : .06);
+  }
+  // the leaf hangs a few px past the gesso, torn unevenly, until it is brushed off
+  const off = new Uint8Array(N); for (let i = 0; i < N; i++) off[i] = ini.gold[i] > .02 ? 0 : 1;
+  const dG = edt(off), nO = noiseFor('leaf:overhang');
+  for (const pc of pieces.filter(p => p.t > 0).sort((a, b) => a.t - b.t)) for (let k = 0; k < pc.px.length; k += 2) {
+    const i = pc.px[k], e = pc.px[k + 1];
+    if (ini.gold[i] <= .02 && dG[i] > 5.5 + 4 * nO((i % W) / 9, (i / W | 0) / 9)) continue;
+    if (ini.gold[i] > .02) { if (LT[i] === NEVER) LT[i] = pc.t; else if (e < 1.5 && SEAMT[i] === NEVER) { SEAM[i] = 1 - e / 1.5; SEAMT[i] = pc.t; } }
+    else if (ET[i] === NEVER) ET[i] = pc.t;
+  }
+  // one agate pass down the whole letter and its frame, matte to mirror in a single stroke
+  for (let y = FR.t - 3; y < FR.b + 3; y++) for (let x = FR.l - 3; x < FR.r + 3; x++) { const i = y * W + x;
+    if (GT[i] < NEVER) { if (LT[i] === NEVER) LT[i] = GT[i] + .06;
+      BT[i] = Math.max(LT[i] + .03, 4.3 + .31 * clamp((y - FR.t + .3 * (x - FR.l)) / (INIT.h + .3 * INIT.w), 0, 1)); } }
+  // lapis in short brush strokes laid along the letter's contour, working out from the letter to
+  // the frame; the counter is filled from its edges in; then the white
+  const i0 = [FR.l + FS - 2, FR.t + FS - 2, FR.r - FS + 2, FR.b - FS + 2], dO = ini.dO, sr = rngFor('lapis:strokes'), nb = noiseFor('lapis:brush');
+  const when = (x, y, verm) => { const q = dO[(y | 0) * W + (x | 0)];
+    if (verm) return 4.12 + .24 * clamp(q / 34, 0, 1);
+    return y >= CAP_Y ? 3.02 + .78 * clamp(q / 66, 0, 1) : 4.18 + .26 * clamp(q / 66, 0, 1); };
+  const ST = tmap();
+  for (let y = i0[1]; y < i0[3]; y += 11) for (let x = i0[0]; x < i0[2]; x += 11) {
+    const cx = x + sr() * 11, cy = y + sr() * 11, c = (cy | 0) * W + (cx | 0), verm = ini.verm[c] > .5;
+    if (!verm && ini.lapis[c] <= .5) continue;
+    let gx = dO[c + 1] - dO[c - 1], gy = dO[c + W] - dO[c - W], gl = Math.hypot(gx, gy);
+    if (gl < .2) { const a = sr() * 6.28; gx = Math.cos(a); gy = Math.sin(a); gl = 1; }
+    const tx = -gy / gl, ty = gx / gl, hl = 13 + sr() * 9, hw = 5.5 + sr() * 3, dir = sr() < .5 ? 1 : -1;
+    const t0 = when(cx, cy, verm) + (sr() - .5) * (cy >= CAP_Y ? .08 : .03), R = hl + 2, lo = cy >= CAP_Y;
+    for (let yy = Math.floor(cy - R); yy <= cy + R; yy++) for (let xx = Math.floor(cx - R); xx <= cx + R; xx++) {
+      if (lo && yy < CAP_Y) continue;
+      const al = (xx - cx) * tx + (yy - cy) * ty, ac = -(xx - cx) * ty + (yy - cy) * tx;
+      if ((al / hl) ** 2 + (ac / hw) ** 2 > 1 + .3 * nb(xx / 5, yy / 5)) continue;
+      const i = yy * W + xx, tt = t0 + .03 * (dir * al / hl + 1) / 2; if (tt < ST[i]) ST[i] = tt;
+    }
+  }
+  for (let y = i0[1]; y < i0[3]; y++) for (let x = i0[0]; x < i0[2]; x++) {
+    const i = y * W + x, verm = ini.verm[i] > 0; if (!verm && ini.lapis[i] <= 0) continue;
+    let t = ST[i] < NEVER ? ST[i] : when(x, y, verm) + .05;
+    if (ET[i] < NEVER) t = Math.max(t, ET[i] + .11);
+    if (GT[i] < NEVER) t = Math.max(t, GT[i] + .02);
+    PT[i] = t;
+  }
+  for (let y = FR.t; y < FR.b; y++) for (let x = FR.l; x < FR.r; x++) { const i = y * W + x; if (ini.white[i] <= 0) continue;
+    const base = y >= CAP_Y ? 3.82 + .14 * (FR.b - y) / (FR.b - CAP_Y) : 4.46 + .14 * (CAP_Y - y) / (CAP_Y - FR.t);
+    WT[i] = Math.max(PT[i] + .06, base + .03 * (FR.r - x) / INIT.w); }
+}
+</script>
+<script>
+"use strict";
+// ---------- the bar border, its ivy, and a line-filler after the last word ----------
+// A thin bar in alternating lapis and vermilion drops from the initial's frame down the left
+// margin, turns along the foot of the page and ends in ivy sprays; a few leaves are gilded. The
+// painter works from the sprays back up toward the initial, all the lapis first, then the red.
+const BAR = { x: 119.5, y0: FR.b - 2, yc: 1166, r: 60, y: 1226, x1: 790, w: 12 };
+function barPath() { // centreline of the bar border, densely sampled
+  const pts = [];
+  for (let y = BAR.y0; y < BAR.yc; y += 3) pts.push([BAR.x, y]);
+  for (let a = 0; a <= 1; a += .02) { const t = Math.PI - a * Math.PI / 2; pts.push([BAR.x + BAR.r + Math.cos(t) * BAR.r, BAR.yc + Math.sin(t) * BAR.r]); }
+  for (let x = BAR.x + BAR.r; x <= BAR.x1; x += 3) pts.push([x, BAR.y]);
+  return pts;
+}
+function ivyLeaf(x, y, a, s) {
+  const pts = [[0, 0], [.12, -.42], [.42, -.62], [.56, -.3], [1, 0], [.56, .3], [.42, .62], [.12, .42]];
+  return catmull(pts.concat([[0, 0]]), 6).map(([u, v]) => [x + (u * Math.cos(a) - v * Math.sin(a)) * s, y + (u * Math.sin(a) + v * Math.cos(a)) * s]);
+}
+// paint a banded bar along a path; tAt(k) is when the brush reaches sample k (lapis), red follows
+function bandedBar(P0, L, tAt, key, redLag) {
+  const seg = 92, nb = noiseFor(key); let s = 0;
+  for (let i = 0; i < P0.length - 1; i++) {
+    const [x0, y0] = P0[i], [x1, y1] = P0[i + 1], red = Math.floor(s / seg) % 2, g = (red ? L.ver : L.lap).g;
+    g.lineWidth = BAR.w + .8 * nb(s * .05, 2); g.lineCap = 'butt'; g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1 + (x1 - x0) * .3, y1 + (y1 - y0) * .3); g.stroke();
+    const tp = tAt(i) + (red ? redLag : 0); trace(PT, [P0[i]], tp, tp, BAR.w / 2 + 2.5);
+    s += Math.hypot(x1 - x0, y1 - y0);
+  }
+  // lead-white trefoil mid-segment, brown-ink edges and joints once the paint is down
+  s = 0; let last = -1;
+  for (let i = 0; i < P0.length - 1; i++) { const [x, y] = P0[i], [x1, y1] = P0[i + 1], l = Math.hypot(x1 - x, y1 - y), k = Math.floor((s + seg / 2) / seg), dx = (x1 - x) / l, dy = (y1 - y) / l;
+    if (k !== last && (s + seg / 2) % seg < l + .01) { last = k; const tw = tAt(i) + redLag + .12;
+      for (const [u, v] of [[-3, 0], [3, -2.6], [3, 2.6]]) { L.wh.g.beginPath(); L.wh.g.arc(x + dx * u - dy * v, y + dy * u + dx * v, 1.5, 0, 7); L.wh.g.fill(); }
+      trace(WT, [[x, y]], tw, tw, 7); }
+    if (Math.floor((s + l) / seg) > Math.floor(s / seg)) { const t0 = tAt(i) + redLag + .1; penJob([[x - dy * 6.5, y + dx * 6.5], [x + dy * 6.5, y - dx * 6.5]], 2.8, key + 'joint' + i, 120, { thin: 1.1, pool: false, smooth: false }, t0, t0 + .04); }
+    s += l; }
+  for (const side of [-1, 1]) {
+    const pts = P0.map((p, i) => { const q = P0[Math.min(P0.length - 1, i + 1)], r = P0[Math.max(0, i - 1)], dx = q[0] - r[0], dy = q[1] - r[1], l = Math.hypot(dx, dy) || 1; return [p[0] - dy / l * side * (BAR.w / 2 + .6), p[1] + dx / l * side * (BAR.w / 2 + .6)]; });
+    for (let i = 0; i < pts.length - 1; i += 40) { const j = Math.min(pts.length - 1, i + 40), ta = tAt(i) + redLag + .08, tb = tAt(j) + redLag + .08;
+      const ch = pts.slice(i, j + 1); if (ta > tb) ch.reverse();
+      penJob(ch, 3.2, key + 'edge' + side + ':' + i, 120, { thin: 1.2, pool: false, smooth: false, tremor: .3 }, Math.min(ta, tb), Math.max(ta, tb) + .02); }
+  }
+}
+function bakeBorder() {
+  const L = { lap: layer(), ver: layer(), wh: layer(), gold: layer() };
+  for (const k in L) { L[k].g.fillStyle = '#fff'; L[k].g.strokeStyle = '#fff'; }
+  const P0 = barPath(), cum = [0];
+  for (let i = 1; i < P0.length; i++) cum.push(cum[i - 1] + Math.hypot(P0[i][0] - P0[i - 1][0], P0[i][1] - P0[i - 1][1]));
+  const Lb = cum[cum.length - 1], barT = i => 2.6 + 1.1 * invS(1 - cum[i] / Lb);
+  bandedBar(P0, L, barT, 'bar', .16);
+  const [ex, ey] = P0[P0.length - 1];
+  penJob([[ex + 1, ey - 8], [ex + 1, ey + 8]], 3.4, 'barcap', 120, { thin: 1.2, pool: false, smooth: false }, 2.72, 2.76);
+  // the line-filler after the last word, laid left to right once the word is written
+  const last = PLAN[PLAN.length - 1].words, u = XH / X;
+  let tw = 0; last.forEach((wd, k) => { const w = textura(wd, TB.l, BASE[3], XH, 'w:' + wd).w; tw = k ? tw + 2.0 * u + w : w; });
+  const fy = BASE[3] - XH * .52, fx0 = TB.l + tw + 1.2 * u, fx1 = TB.r - 14, F0 = [];
+  for (let x = fx0; x <= fx1; x += 3) F0.push([x, fy]);
+  const f0 = TEXT_END + .03; bandedBar(F0, L, i => f0 + .22 * invS(i / (F0.length - 1)), 'fill', .06);
+  penJob([[fx0 - 1, fy - 8], [fx0 - 1, fy + 8]], 3.4, 'fillcap0', 120, { thin: 1.2, pool: false, smooth: false }, f0 + .1, f0 + .13);
+  penJob([[fx1 + 1, fy - 8], [fx1 + 1, fy + 8]], 3.4, 'fillcap1', 120, { thin: 1.2, pool: false, smooth: false }, f0 + .3, f0 + .33);
+  // ivy: hairline tendrils that curl into spirals, leaves alternately gold, lapis, vermilion
+  const ir = rngFor('ivy'); let leafN = 0;
+  const leafAt = (x, y, a, sz, tl) => {
+    const kind = ['gold', 'lapis', 'verm', 'lapis', 'gold', 'verm', 'verm', 'lapis'][leafN++ % 8];
+    if (kind === 'gold') sz *= 1.25;
+    const pts = ivyLeaf(x, y, a, sz), g = L[kind === 'gold' ? 'gold' : kind === 'lapis' ? 'lap' : 'ver'].g;
+    g.beginPath(); pts.forEach(p => g.lineTo(...p)); g.closePath(); g.fill();
+    const c = [x + Math.cos(a) * sz * .5, y + Math.sin(a) * sz * .5], rad = sz * .72;
+    if (kind === 'gold') { GOLD_LEAVES.push(c); trace(GT, [c], tl, tl, rad); trace(LT, [c], tl + .07, tl + .07, rad); const tb = Math.max(tl + .1, 4.45 + .15 * clamp((c[1] - 600) / 650, 0, 1)); trace(BT, [c], tb, tb, rad); }
+    else { trace(PT, [c], tl, tl, rad); penJob(pts, 2.6, 'leaf' + leafN, 120, { thin: .9, pool: false, smooth: false, tremor: .2 }, tl + .08, tl + .16); }
+    penJob([[x, y], [x + Math.cos(a) * sz * .45, y + Math.sin(a) * sz * .45]], 2.2, 'vein' + leafN, 100, { thin: .7, pool: false, smooth: false }, tl + .14, tl + .18);
+  };
+  const tendril = (x, y, a, len, curl, leaves, tb) => {
+    const pts = [[x, y]], lv = []; let k = curl;
+    for (let st = 0, n = 0; st < len; st += 3) { a += k; x += Math.cos(a) * 3; y += Math.sin(a) * 3; pts.push([x, y]);
+      if (n < leaves && st > 14 && st % 30 < 3) { lv.push([pts.length - 1, x, y, a + (n % 2 ? 1 : -1) * 1.05, 20 + ir() * 6, ir()]); n++; } }
+    for (let q = 0; q < 26; q++) { k = Math.sign(curl) * Math.min(.36, Math.abs(k) * 1.12 + .01); a += k; x += Math.cos(a) * 2.2; y += Math.sin(a) * 2.2; pts.push([x, y]); }
+    const dur = .1 + pts.length * .0035;
+    penJob(pts, 3.4, 'tendril' + x.toFixed(0) + ':' + y.toFixed(0), 120, { thin: 1.0, pool: false, smooth: false, tremor: .25 }, tb, tb + dur);
+    for (const [pi, px, py, la, sz, rr] of lv) { const tl = tb + dur * pi / pts.length, bx = px + Math.cos(la) * 7, by = py + Math.sin(la) * 7;
+      penJob([[px, py], [bx, by]], 2.6, 'stalk' + pi + ':' + leafN, 120, { thin: .9, pool: false, smooth: false }, tl, tl + .03); leafAt(bx, by, la + (rr - .5) * .3, sz, tl + .04); }
+  };
+  const near = (x, y) => { let b = 1e12, bi = 0; P0.forEach((p, i) => { const d = (p[0] - x) ** 2 + (p[1] - y) ** 2; if (d < b) { b = d; bi = i; } }); return barT(bi) + .04; };
+  tendril(BAR.x - 6, 604, Math.PI + .25, 50, -.025, 1, near(BAR.x, 604));
+  tendril(BAR.x - 6, 812, Math.PI - .5, 64, .03, 2, near(BAR.x, 812)); tendril(BAR.x - 6, 1020, Math.PI + .45, 64, -.03, 2, near(BAR.x, 1020));
+  tendril(BAR.x + 14, BAR.y - 10, 2.3, 90, .02, 3, near(BAR.x + 30, BAR.y)); tendril(BAR.x + 44, BAR.y + 6, 1.75, 70, .035, 2, near(BAR.x + 44, BAR.y));
+  tendril(ex + 2, ey - 2, -.55, 100, .018, 3, 2.5); tendril(ex + 2, ey + 2, .7, 96, -.022, 3, 2.54); tendril(ex - 10, ey + 6, 2.0, 60, .04, 2, 2.6);
+  tendril(fx1 + 3, fy - 2, -.8, 44, .03, 1, f0 + .26);
+  return { lapis: alphaOf(L.lap), verm: alphaOf(L.ver), white: alphaOf(L.wh), gold: alphaOf(L.gold) };
+}
+</script>
+<script>
+"use strict";
+// ---------- materials ----------
+const BR = new Float32Array(N), BG = new Float32Array(N), BB = new Float32Array(N);
+const nGrain = noiseFor('pig:grain'), nBrush = noiseFor('pig:brush'), nInk = noiseFor('ink:tone'), nFlake = noiseFor('ink:flake');
+// iron gall: brown-black where it lies thick, warm brown where thin, darker at the drying edge
+function inkOnto(R, G, B, a, d, ab, x0 = 0, y0 = 0, x1 = W, y1 = H) {
+  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+    const i = y * W + x; let al = a[i]; if (al < .004) continue;
+    const e = clamp((al - ab[i]) * 2.4, 0, 1), dn = d[i];
+    const t = clamp(.72 + .8 * (dn - .43) + .2 * e + .07 * nInk(x / 3.5, y / 3.5) + .07 * nInk(x / 19, y / 19), 0, 1);
+    const fl = nFlake(x / 1.3, y / 1.3) > .68 && ab[i] > .97 ? .35 : 0;
+    al *= .97 - fl;
+    const cr = mix(122, 44, t), cg = mix(84, 29, t), cb = mix(54, 21, t);
+    R[i] *= mix(1, cr / 236, al); G[i] *= mix(1, cg / 228, al); B[i] *= mix(1, cb / 205, al);
+  }
+}
+// body colour: opaque pigment in gum, grainy, pooled darker at the wet edge, raked by the page light
+function paint(R, G, B, a, col, o) {
+  const ab = blur(a, o.pool || 4), rr = rngFor('pig:' + o.key);
+  for (let i = 0; i < N; i++) {
+    const al = a[i]; if (al < .004) continue;
+    const x = i % W, y = (i / W) | 0;
+    const e = clamp((al - ab[i]) * 2.6, 0, 1);
+    const gr = nGrain(x / 1.25 + o.seed, y / 1.25) * .6 + nGrain(x / 3.1, y / 3.1 + o.seed) * .4;
+    const br = nBrush(x / 26 + y / 80 + o.seed, y / 4.5) * nBrush(x / 90, y / 60 + o.seed);
+    let f = 1 + o.grain * gr + o.brush * br - o.edge * e;
+    let r = col[0] * f, g = col[1] * f, b = col[2] * f;
+    if (o.spark && rr() < o.spark) { const s = .5 + rr(); r += 34 * s; g += 44 * s; b += 60 * s; } // coarse lapis particles
+    const sh = SHADE[i], op = al * (o.opacity || 1);
+    R[i] = mix(R[i], r * sh, op); G[i] = mix(G[i], g * sh, op); B[i] = mix(B[i], b * sh, op);
+  }
+}
+// tinted drawing: thin transparent wash, uneven, with the tide-line a drying wash leaves
+function wash(R, G, B, a, col, k, key, flat) {
+  const ab = blur(a, 5), nw = noiseFor('wash:' + key);
+  for (let i = 0; i < N; i++) {
+    const al = a[i]; if (al < .004) continue;
+    const x = i % W, y = (i / W) | 0;
+    const e = clamp((al - ab[i]) * 2.2, 0, 1), u = flat ? .94 + .1 * fbm(nw, x / 22, y / 22, 3) : .7 + .45 * fbm(nw, x / 22, y / 22, 3);
+    const op = clamp(al * k * (u + .8 * e), 0, .95);
+    R[i] *= mix(1, col[0] / 236, op); G[i] *= mix(1, col[1] / 228, op); B[i] *= mix(1, col[2] / 205, op);
+  }
+}
+</script>
+<script>
+"use strict";
+// ---------- raised, burnished gold ----------
+// Gesso is laid thick and dries to a ridge; leaf is burnished to a mirror. A mirror shows the room:
+// most faces see the dark scriptorium and go deep olive, the faces turned to the window carry its
+// image, hard-edged and cut by a mullion, and the crest of each stroke is where the two meet.
+const GOLD = {}, GOLD_LEAVES = [];
+// slope: rise of each face per px in from the edge; swell and lobe: the gesso's slow unevenness in
+// that slope and its scale in px; warp: a few px of hand-laid undulation; cast: how much of the
+// cushion the shadow sees
+const GESSO = { slope: .5, swell: .22, lobe: 70, warp: 2.4, cast: .12 };
+function prepGold(ga) {
+  const inside = new Uint8Array(N); let x0 = W, y0 = H, x1 = 0, y1 = 0;
+  for (let i = 0; i < N; i++) if (ga[i] > .5) { inside[i] = 1; const x = i % W, y = (i / W) | 0; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+  const d = edt(inside);
+  // the roll: where the gesso breaks over the contour; it carries the rim light
+  let h = new Float32Array(N);
+  for (let i = 0; i < N; i++) { if (!inside[i]) continue; const t = Math.min(d[i] / 5, 1); h[i] = 4 * (1 - (1 - t) * (1 - t)); }
+  h = blur(h, 1);
+  // the cushion: gesso laid wet with a pen dries to a ridge along each stroke, its two faces meeting
+  // in a crisp crest; the hand-laid gesso swells and dips, so each face is a gently warped plane
+  // and the window it mirrors breaks across it in hard-edged patches
+  const nu = noiseFor('gold:gesso');
+  let hd = new Float32Array(N);
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) { const i = y * W + x; if (!inside[i]) continue;
+    hd[i] = GESSO.slope * d[i] * (1 + GESSO.swell * fbm(nu, x / GESSO.lobe, y / GESSO.lobe, 2)) + GESSO.warp * fbm(nu, x / 45 + 40, y / 45, 2) * Math.min(d[i] / 8, 1); }
+  hd = blur(hd, 1);
+  const nx = new Float32Array(N), ny = new Float32Array(N), pf = new Float32Array(N), mx = new Float32Array(N), my = new Float32Array(N), pqx = new Float32Array(N), pqy = new Float32Array(N);
+  for (let y = Math.max(1, y0 - 2); y <= Math.min(H - 2, y1 + 2); y++) for (let x = Math.max(1, x0 - 2); x <= Math.min(W - 2, x1 + 2); x++) {
+    const i = y * W + x; nx[i] = -(h[i + 1] - h[i - 1]) * .5; ny[i] = -(h[i + W] - h[i - W]) * .5;
+    mx[i] = -(hd[i + 1] - hd[i - 1]) * .5; my[i] = -(hd[i + W] - hd[i - W]) * .5; }
+  // punched tooling: a ring of dots set in from the letter's contour (a single row down the narrow
+  // strokes), one dot on each gilded leaf; each punch is a small dimple pressed into the burnished face
+  const pr = rngFor('punch'), dots = [], near = new Map();
+  const free = (x, y, r) => { const gx = Math.floor(x / 16), gy = Math.floor(y / 16);
+    for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (const p of near.get((gx + a) * 4099 + gy + b) || []) if (Math.hypot(p[0] - x, p[1] - y) < r) return false; return true; };
+  const add = (x, y) => { dots.push([x, y]); const k = Math.floor(x / 16) * 4099 + Math.floor(y / 16); if (!near.has(k)) near.set(k, []); near.get(k).push([x, y]); };
+  const ring = 10.5, cBox = [FR.l + 15, FR.t + 15, FR.r - 15, FR.b - 15];
+  for (let y = cBox[1]; y < cBox[3]; y++) for (let x = cBox[0]; x < cBox[2]; x++) { const i = y * W + x;
+    if (Math.abs(d[i] - ring) < .5 && free(x, y, 19)) add(x + (pr() - .5) * .6, y + (pr() - .5) * .6); }
+  for (const [x, y] of GOLD_LEAVES) add(x, y);
+  const rp = 2.4, D = 1.5;
+  for (const [cx_, cy_] of dots) for (let y = Math.floor(cy_ - rp - 1); y <= cy_ + rp + 1; y++) for (let x = Math.floor(cx_ - rp - 1); x <= cx_ + rp + 1; x++) {
+    const i = y * W + x, dx = x - cx_, dy = y - cy_, r = Math.hypot(dx, dy); if (r >= rp || !inside[i]) continue;
+    const qx = 2 * D * dx / (rp * rp), qy = 2 * D * dy / (rp * rp);
+    pqx[i] -= qx; pqy[i] -= qy; pf[i] = Math.max(pf[i], 1 - r / rp); }
+  // a few short cracks in the gesso, and one tiny loss down to the red bole
+  const CR = layer(), cg = CR.g, cr = rngFor('cracks'); cg.strokeStyle = '#fff'; cg.lineCap = 'round';
+  const crack = (x, y, a, n) => { cg.lineWidth = .9; cg.beginPath(); cg.moveTo(x, y);
+    for (let k = 0; k < n; k++) { a += (cr() - .5) * .35; x += Math.cos(a) * 2.4; y += Math.sin(a) * 2.4; cg.lineTo(x + (cr() - .5) * .8, y + (cr() - .5) * .8);
+      if (cr() < 0) { const bx = x, by = y; cg.stroke(); crack(bx, by, a + (cr() < .5 ? -1.2 : 1.2), 3 + (cr() * 4 | 0)); cg.beginPath(); cg.moveTo(bx, by); } }
+    cg.stroke(); };
+  const c1 = LP([.13, .6]), c2 = LP([.16, .63]), c3 = LP([.33, .18]), c4 = LP([.84, .82]);
+  crack(c1[0], c1[1], 1.35, 8); crack(c2[0], c2[1], -.5, 4); crack(c3[0], c3[1], .9, 6); crack(c4[0], c4[1], 1.8, 5);
+  const ca = alphaOf(CR), crackA = new Float32Array(N);
+  for (let i = 0; i < N; i++) crackA[i] = ca[i] * sstep(3, 6, d[i]);
+  const loss = new Float32Array(N), [lx, ly] = LP([.1, .77]), nl = noiseFor('gold:loss');
+  for (let y = Math.floor(ly - 8); y < ly + 8; y++) for (let x = Math.floor(lx - 8); x < lx + 8; x++) { const i = y * W + x, a = Math.atan2(y - ly, x - lx);
+    loss[i] = inside[i] ? sstep(1, .4, Math.hypot((x - lx) / 5, (y - ly) / 3.8) * (1 + .3 * nl(a * 1.5, 2))) : 0; }
+  // the shadow sees the real gesso, about a millimetre proud: the roll plus a little of the dome
+  const hs = new Float32Array(N); for (let i = 0; i < N; i++) hs[i] = .8 * h[i] + GESSO.cast * hd[i];
+  Object.assign(GOLD, { a: ga, h: hs, d, nx, ny, mx, my, pqx, pqy, pf, crack: crackA, loss, box: [Math.max(1, Math.min(x0 - 3, FR.l - 8)), Math.max(1, Math.min(y0 - 3, FR.t - 8)), Math.min(W - 2, Math.max(x1 + 3, FR.r + 8)), Math.min(H - 2, Math.max(y1 + 3, FR.b + 8))], ab: blur(ga, 1), gp: new Float32Array(N) });
+}
+// the gesso as it stands at time t (it is laid stroke by stroke, so it rises in a moving front)
+function gessoAt(t) {
+  const { a, gp, box } = GOLD;
+  for (let y = box[1]; y <= box[3]; y++) for (let x = box[0]; x <= box[2]; x++) { const i = y * W + x; gp[i] = a[i] > .004 && GT[i] < t ? sstep(GT[i], GT[i] + .05, t) : 0; }
+}
+// the gesso throws a small shadow down and right onto the paint and vellum
+function goldShadow(R, G, B) {
+  const { h, box, a, gp } = GOLD, ll = Math.hypot(LIGHT[0], LIGHT[1]), tanE = LIGHT[2] / ll;
+  for (let y = box[1]; y < Math.min(H, box[3] + 12); y++) for (let x = box[0]; x < Math.min(W, box[2] + 12); x++) {
+    const i = y * W + x; let s = 0;
+    for (let k = 1; k <= 10; k++) { const qx = Math.round(x + LIGHT[0] / ll * k), qy = Math.round(y + LIGHT[1] / ll * k); if (qx < 0 || qy < 0) break;
+      const q = qy * W + qx; s = Math.max(s, clamp((h[q] * gp[q] - k * tanE - h[i] * gp[i]) / 1.6, 0, 1)); }
+    if (s <= 0) continue;
+    const f = 1 - .4 * s * (1 - a[i] * gp[i]);
+    R[i] *= f; G[i] *= f; B[i] *= f * 1.04;
+  }
+}
+// the folio settles on its cradle: the window's image slides a few degrees across the gold and rests
+const windowAz = t => Math.atan2(-.62, -.55) + .07 * (sstep(4.3, 6, t) - .5);
+// the room the burnished gold mirrors, as a tone 0..1 for GRAMP: a dark scriptorium, one tall
+// window up to the left with a single mullion, the walls beside it lit a little by its light
+const WIN = { el: .6, hw: .46, hh: .52, bar: .05, mx: .06, soft: .014 };
+function roomView(rx, ry, rz, w, e1, e2) {
+  const a = rx * w[0] + ry * w[1] + rz * w[2]; if (a <= 0) return .2;
+  const u = (rx * e1[0] + ry * e1[1] + rz * e1[2]) / a, v = (rx * e2[0] + ry * e2[1] + rz * e2[2]) / a;
+  const pane = sstep(WIN.hw + WIN.soft, WIN.hw - WIN.soft, Math.abs(u)) * sstep(WIN.hh + WIN.soft, WIN.hh - WIN.soft, Math.abs(v));
+  const mull = sstep(WIN.bar + WIN.soft, WIN.bar - WIN.soft, Math.abs(u - WIN.mx));
+  const ou = Math.max(0, Math.abs(u) - WIN.hw), ov = Math.max(0, Math.abs(v) - WIN.hh);
+  const room = .24 + .3 * Math.exp(-(ou * ou + ov * ov) / (2 * .22 * .22));
+  return Math.max(room, pane * (1 - .78 * mull));
+}
+// what the mirror's tone looks like in gold: the dark olive room, the lit wall, the window
+const GRAMP = [[0, [64, 56, 22]], [.3, [118, 94, 34]], [.55, [184, 140, 52]], [.8, [242, 202, 100]], [1, [255, 244, 192]]];
+const nCr = noiseFor('leaf:crinkle'), nEx = noiseFor('leaf:excess'), nFace = noiseFor('gold:face');
+// unburnished leaf is crumpled: thin bright creases where it folded as it was laid
+const crinkle = (x, y) => { const a = 1 - Math.abs(nCr(x / 15, y / 15)), b = 1 - Math.abs(nCr(x / 6 + 31, y / 8 - 7)); return .65 * a ** 7 + .35 * b ** 9 + .06 * nCr(x / 4, y / 4); };
+// Three states of one surface: wet gesso (chalk and glue tinted with bole, matte), leaf laid but
+// not yet burnished (soft, crinkled, lit like the page), and leaf burnished to a mirror.
+function shadeGold(t, R, G, B) {
+  const { a, nx, ny, mx, my, pqx, pqy, pf, crack, loss, box, ab, gp } = GOLD;
+  const az = windowAz(t), ce = Math.cos(WIN.el), w = [Math.cos(az) * ce, Math.sin(az) * ce, Math.sin(WIN.el)];
+  const e1 = [-Math.sin(az), Math.cos(az), 0], e2 = [w[1] * e1[2] - w[2] * e1[1], w[2] * e1[0] - w[0] * e1[2], w[0] * e1[1] - w[1] * e1[0]];
+  const cam = [540, 600, 2300], Ls = [-1 / Math.hypot(1, 1.15), -1.15 / Math.hypot(1, 1.15)];
+  for (let y = box[1]; y <= box[3]; y++) for (let x = box[0]; x <= box[2]; x++) {
+    const i = y * W + x, al = a[i];
+    if (al < .004) { // leaf laid past the gesso, until the gilder brushes it away in flakes
+      const te = ET[i]; if (te >= t) continue;
+      const on = sstep(te, te + .025, t), off = sstep(te + .04, te + .1, t + .03 * nEx(x / 9, y / 9)), ea = on * (1 - off) * .94;
+      if (ea <= 0) continue;
+      const sh = SHADE[i] * (.93 + .2 * crinkle(x, y));
+      R[i] = mix(R[i], 214 * sh, ea); G[i] = mix(G[i], 172 * sh, ea); B[i] = mix(B[i], 88 * sh, ea);
+      continue;
+    }
+    const g0 = gp[i]; if (g0 <= 0) continue;
+    const lp = sstep(LT[i], LT[i] + .035, t), bp = sstep(BT[i], BT[i] + .045, t), pw = pf[i] > 0 ? bp : 0;
+    const sx = nx[i], sy = ny[i], f = sx * Ls[0] + sy * Ls[1], hi = sstep(.14, .42, f), dk = sstep(.18, .5, -f);
+    let ux = mx[i] + .45 * sx, uy = my[i] + .45 * sy;
+    const l0 = Math.hypot(ux, uy, 1), lam = (ux / l0 * LIGHT[0] + uy / l0 * LIGHT[1] + LIGHT[2] / l0) / LIGHT[2]; // 1 where it lies flat
+    const gs = clamp(.93 + .7 * (lam - 1), .62, 1.1) * (1 + .1 * hi - .12 * dk);
+    let r = 236 * gs, g = 212 * gs, b = 196 * gs;
+    if (lp > 0) {
+      const ms = clamp(.9 + .8 * (lam - 1), .6, 1.15) * (.9 + .24 * crinkle(x, y)) * (1 + .12 * hi - .14 * dk);
+      const sm = SEAMT[i] < t ? SEAM[i] * sstep(SEAMT[i], SEAMT[i] + .02, t) * (1 - bp) : 0;
+      r = mix(r, 210 * ms * (1 + .16 * sm), lp); g = mix(g, 166 * ms * (1 + .16 * sm), lp); b = mix(b, 80 * ms * (1 + .1 * sm), lp);
+    }
+    if (bp > 0) {
+      const n0 = ux / l0, n1 = uy / l0, n2 = 1 / l0;
+      let vx = cam[0] - x, vy = cam[1] - y, vz = cam[2]; const vn = Math.hypot(vx, vy, vz); vx /= vn; vy /= vn; vz /= vn;
+      const nv = n0 * vx + n1 * vy + n2 * vz, rx = 2 * nv * n0 - vx, ry = 2 * nv * n1 - vy, rz = 2 * nv * n2 - vz;
+      const v = clamp(roomView(rx, ry, rz, w, e1, e2) * (1 + .03 * nFace(x / 90, y / 90)), 0, 1);
+      let k = 1; while (k < GRAMP.length - 1 && v > GRAMP[k][0]) k++;
+      const [v0, c0] = GRAMP[k - 1], [v1, c1] = GRAMP[k], q = (v - v0) / (v1 - v0);
+      let mr = mix(c0[0], c1[0], q), mg = mix(c0[1], c1[1], q), mb = mix(c0[2], c1[2], q);
+      // each punch is a small dimple whose far wall turns to the window and catches it
+      const pb = .8 * pf[i] * pw; mr = mix(mr, 255, pb); mg = mix(mg, 240, pb); mb = mix(mb, 186, pb);
+      const sd = SEAMT[i] < t ? 1 - .07 * SEAM[i] : 1; mr *= sd; mg *= sd; mb *= sd;
+      const c = crack[i] * .7; mr = mix(mr, 112, c); mg = mix(mg, 76, c); mb = mix(mb, 28, c);
+      const hot = .35 * 4 * bp * (1 - bp); // the agate's pass: the surface flares as it turns to mirror
+      r = mix(mix(r, mr, bp), 255, hot); g = mix(mix(g, mg, bp), 246, hot); b = mix(mix(b, mb, bp), 210, hot);
+    }
+    const lo = loss[i] * lp; if (lo > .01) { r = mix(r, 156, lo); g = mix(g, 68, lo); b = mix(b, 46, lo); }
+    const o = al * g0; R[i] = mix(R[i], r, o); G[i] = mix(G[i], g, o); B[i] = mix(B[i], b, o);
+    // the painter's ink outline round the gilding, drawn once the leaf is down
+    const ow = sstep(LT[i] + .1, LT[i] + .18, t);
+    if (ow > 0) { const band = 1 - Math.abs(2 * ab[i] - 1), ol = sstep(.25, .75, band + .25 * nInk(x / 6, y / 6)) * ow;
+      if (ol > 0) { R[i] *= mix(1, .3, ol * .85); G[i] *= mix(1, .26, ol * .85); B[i] *= mix(1, .22, ol * .85); } }
+  }
+}
+function bake() {
+  bakeVellum(); bakeMarks();
+  for (let i = 0; i < N; i++) { const s = SHADE[i], w = 1 - s; BR[i] = VR[i] * s; BG[i] = VG[i] * s * (1 - .12 * w); BB[i] = VB[i] * s * (1 - .3 * w); }
+  // fore-edge: the folio ends, the leaves below show their edges, then the cradle's felt
+  const nf = noiseFor('felt');
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const i = y * W + x, dx = x - EDGE[y];
+    if (dx < -1.5) continue;
+    if (dx < 0) { const f = .9; BR[i] *= f; BG[i] *= f; BB[i] *= f; continue; }
+    let leaf = 4, lo = 0; for (let k = 0; k < 4; k++) { const e = 3.4 * (k + 1) + 1.1 * nf(y / 140, k * 7.3) + .4 * nf(y / 19, k * 3.1); if (dx < e) { leaf = k; break; } lo = e; }
+    if (leaf < 4) { const f = (.86 - .05 * leaf) * (dx - lo < 1 ? .66 : 1) * (dx < 3 ? .8 : 1); BR[i] = VR[i] * f; BG[i] = VG[i] * f * .97; BB[i] = VB[i] * f * .9; }
+    else { const v = 1 + .12 * fbm(nf, x / 1.6, y / 1.6, 2); BR[i] = 70 * v; BG[i] = 58 * v; BB[i] = 46 * v; } }
+  // a hole the calf was born with: the rim thickened as it healed, the leaf beneath shows through
+  { const hx = 966, hy = 1146, ra = 15, rb = 8, an = .55, ca = Math.cos(an), sa = Math.sin(an), nh = noiseFor('hole');
+    const qOf = (x, y) => { const lx = (x - hx) * ca + (y - hy) * sa, ly = -(x - hx) * sa + (y - hy) * ca; return Math.hypot(lx / ra, ly / rb) * (1 + .1 * nh(Math.atan2(ly, lx) * 1.6, 1)); };
+    for (let y = hy - 32; y < hy + 32; y++) for (let x = hx - 32; x < hx + 32; x++) {
+      const i = y * W + x, q = qOf(x, y);
+      if (q < 1) { const sh = sstep(.8, 1.15, qOf(x - 4.5, y - 5)), f = .8 * (1 - .4 * sh) * (1 - .25 * sstep(.75, 1, q));
+        BR[i] = VR[i] * f; BG[i] = VG[i] * f * .97; BB[i] = VB[i] * f * .92; }
+      else if (q < 1.6) { const k = 1 - (q - 1) / .6, f = 1 - .09 * k * k; BR[i] *= f; BG[i] *= f * .985; BB[i] *= f * .95; }
+    } }
+  scheduleText();
+  const ini = bakeInitial(); timeInitial(ini);
+  const bd = bakeBorder();
+  const mx = (a, b) => { for (let i = 0; i < N; i++) if (b[i] > a[i]) a[i] = b[i]; return a; };
+  // each colour is painted once on a scratch copy; seek lays what it changed, pixel by pixel, when the brush gets there
+  const C = [BR.slice(), BG.slice(), BB.slice()];
+  PAINTS.push(layerDelta(C, mx(ini.lapis, bd.lapis), [30, 38, 106], { key: 'lapis', seed: 3, grain: .24, brush: .1, edge: .22, pool: 5 }, PT, 1));
+  PAINTS.push(layerDelta(C, mx(ini.verm, bd.verm), [178, 52, 34], { key: 'verm', seed: 7, grain: .16, brush: .12, edge: .22, pool: 4 }, PT, 1));
+  PAINTS.push(layerDelta(C, mx(ini.white, bd.white), [240, 234, 218], { key: 'white', seed: 11, grain: .05, brush: .02, edge: .05, opacity: .93, pool: 1 }, WT, 0));
+  prepGold(mx(ini.gold, bd.gold));
+}
+const PAINTS = [];
+function layerDelta(C, a, col, o, TM, wet) {
+  const idx = []; for (let i = 0; i < N; i++) if (a[i] > .004) idx.push(i);
+  const n = idx.length, d = new Float32Array(n * 3), tt = new Float32Array(n);
+  idx.forEach((i, k) => { d[k * 3] = C[0][i]; d[k * 3 + 1] = C[1][i]; d[k * 3 + 2] = C[2][i]; });
+  paint(C[0], C[1], C[2], a, col, o);
+  idx.forEach((i, k) => { d[k * 3] = C[0][i] - d[k * 3]; d[k * 3 + 1] = C[1][i] - d[k * 3 + 1]; d[k * 3 + 2] = C[2][i] - d[k * 3 + 2]; tt[k] = TM[i]; });
+  return { idx: Int32Array.from(idx), d, tt, wet };
+}
+// a brush-load of body colour lands, darker and glossy while wet, then dries to its matte tone
+function applyPaint(L, t, R, G, B) {
+  const { idx, d, tt, wet } = L;
+  for (let k = 0; k < idx.length; k++) { const t0 = tt[k]; if (t0 >= t) continue;
+    const i = idx[k], m = sstep(t0, t0 + .04, t), w = wet ? 1 - .1 * m * (1 - sstep(t0 + .03, t0 + .45, t)) : 1;
+    R[i] = (R[i] + d[k * 3] * m) * w; G[i] = (G[i] + d[k * 3 + 1] * m) * w; B[i] = (B[i] + d[k * 3 + 2] * m) * w; }
+}
+// every pen stroke that has begun by t, the one in progress cut where the nib has got to
+function inkAt(t, R, G, B) {
+  const L = layer(), g = L.g, Wl = layer(), wg = Wl.g; g.globalCompositeOperation = 'lighter'; let any = false, wet = false;
+  for (const j of JOBS) { if (t <= j.t0) continue;
+    const f = j.t1 > j.t0 ? clamp((t - j.t0) / (j.t1 - j.t0), 0, 1) : 1, up = .5 * f + .5 * f * f * (3 - 2 * f);
+    g.fillStyle = `rgb(${j.k},${j.k},${j.k})`;
+    const e = nibStroke(g, j.pts, j.pen, up >= 1 ? undefined : up); any = true;
+    if (e && up >= 1 && j.pool) { g.save(); g.clip(); pool(g, e.end, j.pool, Math.round(j.k * .5)); g.restore(); }
+    // ink still wet from the last half second or so
+    if (t - j.t1 < .6) { wg.fillStyle = `rgba(255,255,255,${1 - clamp((t - j.t1) / .6, 0, 1)})`; nibStroke(wg, j.pts, j.pen, up >= 1 ? undefined : up); wet = true; } }
+  if (!any) return;
+  const c = chanOf(L), ab = blur(c.a, 2); inkOnto(R, G, B, c.a, c.r, ab);
+  // wet iron gall lies darker and glossy, a bead of light along the edge that faces the window
+  if (wet) { const wa = alphaOf(Wl);
+    for (let i = W; i < N - W; i++) { const w = wa[i]; if (w < .01) continue;
+      const sh = clamp(-((ab[i + 1] - ab[i - 1]) * LIGHT[0] + (ab[i + W] - ab[i - W]) * LIGHT[1]) * 1.6, 0, 1) * w;
+      R[i] = R[i] * (1 - .2 * w) + 78 * sh; G[i] = G[i] * (1 - .2 * w) + 72 * sh; B[i] = B[i] * (1 - .18 * w) + 64 * sh; } }
+}
+// ---------- the quill: its cut nib rides each stroke, the barrel rising back toward the hand ----------
+const PEN_D = [Math.cos(.62), Math.sin(.62)], PEN_OFF = [1260, 1380], PEN_EL = .7, PEN_LEN = 1700;
+// where the nib tip is at t, and how high it is lifted off the page (px)
+function penAt(t) {
+  if (!PEN.length || t < PEN[0].t0 - .35 || t > TEXT_END + .45) return null;
+  const tip = (s, f) => { const n = Math.max(1, Math.floor(s.d.length * (.5 * f + .5 * f * f * (3 - 2 * f)))); return s.d[n - 1]; };
+  const hop = (a, b, f, lift) => { const e = f * f * (3 - 2 * f); return { x: mix(a[0], b[0], e), y: mix(a[1], b[1], e), z: lift }; };
+  if (t < PEN[0].t0) { const f = (t - PEN[0].t0 + .35) / .35; return hop(PEN_OFF, PEN[0].d[0], f, 70 * (1 - f * f * (3 - 2 * f))); }
+  for (let k = 0; k < PEN.length; k++) { const s = PEN[k];
+    if (t <= s.t1) return t >= s.t0 ? Object.assign({ z: 0 }, { x: tip(s, (t - s.t0) / (s.t1 - s.t0))[0], y: tip(s, (t - s.t0) / (s.t1 - s.t0))[1] }) : null;
+    const nx = PEN[k + 1]; if (!nx) break;
+    if (t < nx.t0) { const a = s.d[s.d.length - 1], b = nx.d[0], f = (t - s.t1) / (nx.t0 - s.t1);
+      return hop(a, b, f, (3 + .1 * Math.hypot(b[0] - a[0], b[1] - a[1])) * Math.sin(Math.PI * f)); } }
+  const last = PEN[PEN.length - 1].d, f = (t - TEXT_END) / .45;
+  return hop(last[last.length - 1], PEN_OFF, f, 70 * f * f);
+}
+// the goose quill, long enough to leave the frame: a square-cut nib, the horn barrel, then the
+// rachis with its vane, broad on one side and narrow on the other; points carry their distance s from the tip
+const PEN_V0 = 250, PEN_W = 19;
+function penShapes(p) {
+  const [dx, dy] = PEN_D, nx = -dy, ny = dx, ex = Math.cos(NIB_ANG), ey = -Math.sin(NIB_ANG), hw = XH / X / 2;
+  const at = (s, w) => [p.x + dx * s + nx * w, p.y + dy * s + ny * w, s];
+  const half = [[12, 13], [40, PEN_W], [PEN_V0 - 20, PEN_W - 1], [PEN_V0 + 40, 10], [PEN_LEN, 7]];
+  const barrel = [[p.x + ex * hw, p.y + ey * hw, 0], ...half.map(([s, w]) => at(s, -w)), ...half.slice().reverse().map(([s, w]) => at(s, w)), [p.x - ex * hw, p.y - ey * hw, 0]];
+  const nv = noiseFor('quill:vane'), side = [], other = [];
+  for (let s = PEN_V0 - 10; s <= PEN_LEN; s += 10) {
+    side.push(at(s, 9 + 52 * sstep(PEN_V0 - 10, PEN_V0 + 150, s) * (1 + .08 * nv(s / 40, 1))));
+    other.push(at(s, -9 - 26 * sstep(PEN_V0, PEN_V0 + 120, s) * (1 + .1 * nv(s / 35, 7))));
+  }
+  return { barrel, vane: side.concat(other.reverse()), at };
+}
+function drawPen(t, R, G, B) {
+  const p = penAt(t); if (!p) return;
+  const { barrel, vane, at } = penShapes(p), x0 = Math.max(0, Math.floor(p.x - 40)), y0 = Math.max(0, Math.floor(p.y - 40));
+  if (x0 >= W || y0 >= H) return;
+  const bw = W - x0, bh = H - y0, sOf = (x, y) => (x - p.x) * PEN_D[0] + (y - p.y) * PEN_D[1];
+  // the shadow: the quill thrown down and right by the window, softer and paler the higher it stands
+  const kx = -LIGHT[0] / LIGHT[2] * .6, ky = -LIGHT[1] / LIGHT[2] * .6, proj = ([x, y, s]) => { const z = p.z + s * PEN_EL; return [x + kx * z, y + ky * z]; };
+  const S = layer(), sg = S.g; sg.filter = 'blur(3px)';
+  sg.fillStyle = 'rgba(0,0,0,.62)'; sg.beginPath(); for (const q of vane) sg.lineTo(...proj(q)); sg.closePath(); sg.fill();
+  sg.fillStyle = '#000'; sg.beginPath(); for (const q of barrel) sg.lineTo(...proj(q)); sg.closePath(); sg.fill();
+  const sd = sg.getImageData(x0, y0, bw, bh).data;
+  // the vane: soft grey-white barbs angled away from the nib, split in a few places
+  const Q = layer(), qg = Q.g, [dx, dy] = PEN_D, nx = -dy, ny = dx, qr = rngFor('quill:barbs');
+  qg.save(); qg.filter = 'blur(1.8px)'; qg.fillStyle = 'rgb(230,227,218)'; qg.beginPath(); for (const [x, y] of vane) qg.lineTo(x, y); qg.closePath(); qg.fill(); qg.restore();
+  qg.save(); qg.beginPath(); for (const [x, y] of vane) qg.lineTo(x, y); qg.closePath(); qg.clip();
+  qg.strokeStyle = 'rgba(150,146,136,.3)'; qg.lineWidth = 1; qg.beginPath();
+  for (let s = PEN_V0; s < PEN_LEN; s += 3.4) for (const sg2 of [1, -1]) { const a = at(s, sg2 * 8), b = at(s + 34, sg2 * 64); qg.moveTo(a[0], a[1]); qg.lineTo(b[0], b[1]); }
+  qg.stroke();
+  qg.globalCompositeOperation = 'destination-out'; qg.lineWidth = 2.2;
+  for (const s of [PEN_V0 + 120, PEN_V0 + 260, PEN_V0 + 330]) { const sg2 = qr() < .6 ? 1 : -1, a = at(s, sg2 * 14), b = at(s + 40, sg2 * 70); qg.beginPath(); qg.moveTo(a[0], a[1]); qg.lineTo(b[0], b[1]); qg.stroke(); }
+  qg.restore();
+  // the barrel and rachis: opaque horn, lit from the window side, ink-stained at the nib, the slit dark
+  const gr = qg.createLinearGradient(p.x + nx * PEN_W, p.y + ny * PEN_W, p.x - nx * PEN_W, p.y - ny * PEN_W);
+  gr.addColorStop(0, 'rgb(112,92,62)'); gr.addColorStop(.28, 'rgb(170,146,106)'); gr.addColorStop(.58, 'rgb(236,222,186)'); gr.addColorStop(.76, 'rgb(204,182,140)'); gr.addColorStop(1, 'rgb(122,100,70)');
+  qg.fillStyle = gr; qg.beginPath(); for (const [x, y] of barrel) qg.lineTo(x, y); qg.closePath(); qg.fill();
+  qg.save(); qg.clip(); const ink = qg.createLinearGradient(p.x, p.y, p.x + dx * 26, p.y + dy * 26);
+  ink.addColorStop(0, 'rgba(52,36,24,.95)'); ink.addColorStop(.55, 'rgba(70,50,34,.6)'); ink.addColorStop(1, 'rgba(90,70,50,0)');
+  qg.fillStyle = ink; qg.fillRect(p.x - 60, p.y - 60, 160, 160); qg.restore();
+  qg.strokeStyle = 'rgba(40,28,20,.8)'; qg.lineWidth = 1.4; qg.beginPath(); qg.moveTo(p.x + dx, p.y + dy); qg.lineTo(p.x + dx * 18, p.y + dy * 18); qg.stroke();
+  const qd = qg.getImageData(x0, y0, bw, bh).data;
+  for (let y = y0; y < H; y++) for (let x = x0; x < W; x++) {
+    const i = y * W + x, j = ((y - y0) * bw + (x - x0)) * 4;
+    const sa = sd[j + 3] / 255 * .46 * (1 - .55 * sstep(0, 900, sOf(x, y)));
+    if (sa > 0) { R[i] *= 1 - sa; G[i] *= 1 - sa; B[i] *= 1 - sa * .9; }
+    const qa = qd[j + 3] / 255; if (qa <= 0) continue;
+    R[i] = mix(R[i], qd[j], qa); G[i] = mix(G[i], qd[j + 1], qa); B[i] = mix(B[i], qd[j + 2], qa);
+  }
+}
+const OUT = cx.createImageData(W, H);
+function seek(t) {
+  t = clamp(+t || 0, 0, DUR);
+  const R = BR.slice(), G = BG.slice(), B = BB.slice();
+  for (const L of PAINTS) applyPaint(L, t, R, G, B);
+  gessoAt(t); goldShadow(R, G, B); shadeGold(t, R, G, B);
+  inkAt(t, R, G, B); drawPen(t, R, G, B);
+  const d = OUT.data;
+  for (let i = 0; i < N; i++) { d[i * 4] = R[i]; d[i * 4 + 1] = G[i]; d[i * 4 + 2] = B[i]; d[i * 4 + 3] = 255; }
+  cx.putImageData(OUT, 0, 0);
+}
+bake();
+window.__riso = { duration: DUR, ready: false, seek, hero: HERO, build: { end: BUILD_END } };
+seek(HERO);
+window.__riso.ready = true;
+</script>
+</body></html>

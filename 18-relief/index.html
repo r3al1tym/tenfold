@@ -1,0 +1,969 @@
+<!doctype html><meta charset="utf-8"><title>18 relief: a little faith in impossible things</title>
+<style>html,body{margin:0;background:#2a2b27;display:grid;place-items:center;min-height:100%}canvas{width:720px;height:900px;display:block}</style>
+<canvas id="c" width="1080" height="1350"></canvas>
+<script>
+'use strict';
+// 18 relief, phrase version. An Imhof-style relief sheet whose six named features read "a little
+// faith in impossible things". Every plate (shadow, light, green, brown, blue, rock, black, red)
+// is a coverage buffer drawn in code and overprinted on map white, a fraction of a pixel out of
+// register. seek(t) builds the sheet from blank: contours, relief, water, trail, then the names.
+const PHRASE_TO_RENDER = 'a little faith in impossible things';
+const W = 1080, H = 1350, N = W * H, DURATION = 6, BUILD_END = 4.9, HERO = 5.4;
+const cv = document.getElementById('c'), out = cv.getContext('2d');
+
+// ---------- seeded randomness ----------
+function hash(str) { let h = 2166136261 >>> 0; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+function rng(key) { let a = hash(key); return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function h2(seed, x, y) { let h = (seed ^ Math.imul(x, 374761393) ^ Math.imul(y, 668265263)) | 0; h = Math.imul(h ^ (h >>> 13), 1274126177); h ^= h >>> 16; return (h >>> 0) / 4294967296; }
+function vnoise(seed, x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy, sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+  const a = h2(seed, ix, iy), b = h2(seed, ix + 1, iy), c = h2(seed, ix, iy + 1), d = h2(seed, ix + 1, iy + 1);
+  return (a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy) * 2 - 1;
+}
+function fbm(seed, x, y, oct, gain = 0.5) { let s = 0, a = 1, t = 0, f = 1; for (let o = 0; o < oct; o++) { s += a * vnoise(seed + o * 1013, x * f, y * f); t += a; a *= gain; f *= 2.03; } return s / t; }
+const sm = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+const clamp = (x, a, b) => x < a ? a : x > b ? b : x;
+const lerp = (a, b, t) => a + (b - a) * t;
+
+// separable box blur, three passes approximate a gaussian of the given sigma
+function blur(src, w, h, sigma) {
+  const r = Math.max(1, Math.round(Math.sqrt(12 * sigma * sigma / 3 + 1) / 2 - 0.5)), n = w * h;
+  let a = Float32Array.from(src), b = new Float32Array(n);
+  for (let pass = 0; pass < 3; pass++) {
+    for (let y = 0; y < h; y++) { const o = y * w; let s = 0; for (let x = -r; x <= r; x++) s += a[o + clamp(x, 0, w - 1)];
+      for (let x = 0; x < w; x++) { b[o + x] = s / (2 * r + 1); s += a[o + Math.min(w - 1, x + r + 1)] - a[o + Math.max(0, x - r)]; } }
+    for (let x = 0; x < w; x++) { let s = 0; for (let y = -r; y <= r; y++) s += b[clamp(y, 0, h - 1) * w + x];
+      for (let y = 0; y < h; y++) { a[y * w + x] = s / (2 * r + 1); s += b[Math.min(h - 1, y + r + 1) * w + x] - b[Math.max(0, y - r) * w + x]; } }
+  }
+  return a;
+}
+function layer(w = W, h = H) { const c = document.createElement('canvas'); c.width = w; c.height = h; const x = c.getContext('2d'); x.fillStyle = '#fff'; x.strokeStyle = '#fff'; x.lineCap = 'round'; x.lineJoin = 'round'; return x; }
+function alphaOf(ctx) { const w = ctx.canvas.width, n = w * ctx.canvas.height, d = ctx.getImageData(0, 0, w, ctx.canvas.height).data, f = new Float32Array(n); for (let i = 0; i < n; i++) f[i] = d[i * 4 + 3] / 255; return f; }
+
+// ---------- sheet geometry ----------
+// The map window fills the sheet inside a neatline and a border band.
+const MX = 44, MY = 44, TW = 992, TH = 1262, TN = TW * TH;
+const MPX = 25;              // metres per pixel on the ground: slopes and shading use true gradients
+const FLOOR = 440, LAKE = 400, TOP = 7300;
+// The terrain is the shortcut sheet's, with a lower range added south of the lake now that the
+// map fills the sheet, split by a pass. Summit heights sit between contour levels, so no summit
+// carries a one-pixel contour ring. Each mountain is a tree of ridges grown from its summit.
+// arms: [bearing, share of L, from arm, at, fall]; the first pair is the crest a name follows; an
+// arm with a "from" branches off that arm part way down instead of leaving the summit itself; fall
+// shapes how fast an arm drops (below 1 it holds its height, so the summit sits at one end).
+// s0: flank steepness at the crest, metres per pixel. crest: [bearing, length] gives a summit a
+// level crest instead of a point; the first two arms leave from its two ends.
+const PEAKS = [
+  { id: 'cp',  h: 7340, x: 520, y: 300,  L: 420, s0: 58, arms: [[2.95, 0.85], [-0.2, 0.7], [1.25, 0.9], [-1.85, 0.42]] },
+  { id: 'obo', h: 4660, x: 200, y: 215,  L: 260, s0: 46, crest: [0.5, 40], arms: [[0.5, 1.0, , , 0.6], [-2.64, 0.5, , , 1.5], [-1.0, 0.55, 0, 0.3], [2.2, 0.6, 0, 0.55], [-2.0, 0.35, 1, 0.5]] },
+  { id: 'oic', h: 3060, x: 875, y: 305,  L: 210, s0: 36, arms: [[-0.3, 0.9], [2.9, 0.5], [-1.7, 0.8], [1.35, 0.8]] },
+  { id: 'cyu', h: 2060, x: 160, y: 575,  L: 165, s0: 26, arms: [[-0.4, 0.8], [2.7, 0.8], [1.3, 0.6], [-1.9, 0.6]] },
+  { id: 'cmu', h: 860,  x: 500, y: 775,  L: 95,  s0: 10, arms: [[-0.3, 1], [2.85, 1], [1.4, 0.6]] },
+  { id: 'oid', h: 840,  x: 850, y: 770,  L: 90,  s0: 9,  arms: [[0.2, 0.8], [3.3, 0.9], [-1.6, 0.6]] },
+  { id: 'sw',  h: 2960, x: 300, y: 1170, L: 330, s0: 30, arms: [[2.6, 0.95], [-0.4, 0.5], [1.2, 0.3], [-1.9, 0.12]] },
+  { id: 'se',  h: 3360, x: 740, y: 1175, L: 360, s0: 32, arms: [[3.05, 0.55], [-0.06, 0.9], [1.6, 0.3], [-1.55, 0.12]] },
+];
+
+// ---------- terrain ----------
+// A ridge kinks as it descends and throws off side spurs, which throw off their own, so the
+// massif branches the way real arêtes do. Heights here are above FLOOR.
+function ridgeTree(p) {
+  const r = rng('ridges-' + p.id), segs = [], foot = 150, paths = [];
+  const k0 = PEAKS.indexOf(p);
+  const grow = (x, y, a, L, h0, depth, arm, fall = 1.05) => {
+    const n = depth ? 3 : 4; let cx = x, cy = y, ch = h0, ang = a;
+    for (let k = 0; k < n; k++) {
+      ang += (r() - 0.5) * (depth ? 0.7 : 0.5);
+      const t = (k + 1) / n, nx = cx + Math.cos(ang) * L / n, ny = cy + Math.sin(ang) * L / n;
+      const nh = foot + (h0 - foot) * Math.pow(1 - t, depth ? 1.0 : fall);
+      segs.push([cx, cy, nx, ny, ch, nh, p.s0 * (depth ? 0.9 : 1), k0, arm, depth]); if (!depth) paths[arm].push([nx, ny, nh]);
+      if (depth < 2 && k < n - 1 && r() < (depth ? 0.4 : 0.8))
+        grow(nx, ny, ang + (r() < 0.5 ? -1 : 1) * (0.6 + 0.4 * r()), L * (1 - t) * (0.5 + 0.35 * r()) + L * 0.12, nh, depth + 1, arm);
+      cx = nx; cy = ny; ch = nh;
+    }
+  };
+  const ends = [[p.x, p.y], [p.x, p.y]];
+  if (p.crest) {
+    const [cb, cl] = p.crest, ux = Math.cos(cb) * cl / 2, uy = Math.sin(cb) * cl / 2;
+    ends[0] = [p.x + ux, p.y + uy]; ends[1] = [p.x - ux, p.y - uy];
+    segs.push([ends[1][0], ends[1][1], ends[0][0], ends[0][1], p.h - FLOOR, p.h - FLOOR, p.s0, k0, -1, 0]);
+  }
+  p.arms.forEach(([a, f, from, at, fall], j) => {
+    let [x, y] = ends[Math.min(j, 1)], h = p.h - FLOOR;
+    if (j > 1 && from === undefined) [x, y] = [p.x, p.y];
+    if (from !== undefined) { const q = paths[from]; [x, y, h] = q[Math.round(at * (q.length - 1))]; }
+    paths[j] = [[x, y, h]]; grow(x, y, a, p.L * f, h, 0, j, fall);
+  });
+  return segs;
+}
+const SEGS = PEAKS.flatMap(ridgeTree), TILE = 32, TX = Math.ceil(TW / TILE), TY = Math.ceil(TH / TILE);
+const BUCK = Array.from({ length: TX * TY }, () => []);
+SEGS.forEach((s, j) => {
+  const D = Math.max(s[4], s[5]) / s[6] * 1.5 + 60;
+  for (let ty = Math.max(0, Math.floor((Math.min(s[1], s[3]) - D) / TILE)); ty <= Math.min(TY - 1, Math.floor((Math.max(s[1], s[3]) + D) / TILE)); ty++)
+    for (let tx = Math.max(0, Math.floor((Math.min(s[0], s[2]) - D) / TILE)); tx <= Math.min(TX - 1, Math.floor((Math.max(s[0], s[2]) + D) / TILE)); tx++) BUCK[ty * TX + tx].push(j);
+});
+// The flank falls away from its crest on a concave profile and meets the valley floor at a
+// bounded distance, so neighbouring massifs stand apart with real valleys between them.
+function ridgeHeight(x, y) {
+  const b = BUCK[clamp((y / TILE) | 0, 0, TY - 1) * TX + clamp((x / TILE) | 0, 0, TX - 1)]; let m = 0;
+  for (let q = 0; q < b.length; q++) {
+    const s = SEGS[b[q]], vx = s[2] - s[0], vy = s[3] - s[1], t = clamp(((x - s[0]) * vx + (y - s[1]) * vy) / (vx * vx + vy * vy), 0, 1);
+    const hr = s[4] + (s[5] - s[4]) * t, D = hr / s[6] * 1.5 + 34, d0 = Math.hypot(x - s[0] - t * vx, y - s[1] - t * vy), d = Math.sqrt(d0 * d0 + 100) - 10;
+    if (d < D) { const u = 1 - d / D, v = hr * u * Math.sqrt(u), kk = 140, hh = Math.max(kk - Math.abs(m - v), 0) / kk; m = Math.max(m, v) + hh * hh * kk / 4; }
+  }
+  return m;
+}
+// The valley floor rises gently away from the lake. The lake fills a wandering glacial trough:
+// a west basin, a narrows, an east basin with a bay running north, and a headland off the
+// south shore. Under the mountains the shore drops as a cliff (isobaths crowd); on the south
+// side it shelves (isobaths spread). Each axis point is [x, y, half-width, cliff side].
+const LAKEAXIS = [[-40, 860, 84], [80, 892, 76], [200, 866, 108], [320, 898, 92], [362, 907, 66], [400, 914, 17], [438, 911, 62], [480, 905, 86], [575, 888, 104], [665, 902, 62], [715, 910, 30]];
+const LAKEBAY = [[585, 884, 52], [622, 852, 44], [640, 838, 30]];
+const HEADLAND = [[118, 1000], [150, 948], [170, 922], [200, 904]];
+function trough(x, y, axis) {
+  let best = 1e9, wid = 1, side = 0;
+  for (let k = 0; k < axis.length - 1; k++) {
+    const [ax, ay, aw] = axis[k], [bx, by, bw] = axis[k + 1], vx = bx - ax, vy = by - ay;
+    const t = clamp(((x - ax) * vx + (y - ay) * vy) / (vx * vx + vy * vy), 0, 1), d = Math.hypot(x - ax - t * vx, y - ay - t * vy);
+    if (d < best) { best = d; wid = aw + (bw - aw) * t; side = vx * (y - ay) - vy * (x - ax) > 0 ? 1 : -1; }
+  }
+  return [best, wid, side];
+}
+function baseHeight(x, y) {
+  const v = Math.min(y, 992) / 992;          // the floor falls toward the lake, then rises south of it
+  let h = FLOOR + 40 + 300 * Math.pow(1 - v, 1.6) + 220 * Math.pow(sm(990, TH, y), 1.3) + 40 * fbm(11, x / 260, y / 260, 4) + 10 * fbm(12, x / 80, y / 80, 3);
+  let [d, wid, side] = trough(x, y, LAKEAXIS); const [d2, w2] = trough(x, y, LAKEBAY);
+  if (d2 / w2 < d / wid) { d = d2; wid = w2; side = 1; }
+  wid *= 1 + 0.2 * fbm(13, x / 110, y / 110, 3) + 0.05 * fbm(14, x / 40, y / 40, 2);
+  const shelf = clamp(side > 0 ? 1.7 + 0.5 * fbm(18, x / 150, 0, 2) : 0.45 + 0.2 * fbm(19, x / 150, 0, 2), 0.3, 2.4);
+  h -= 300 * Math.pow(clamp(1 - d / Math.max(6, wid), 0, 1), shelf);
+  // the headland: a low rib of rock running out from the south shore
+  let dh = 1e9; for (let k = 0; k < HEADLAND.length - 1; k++) {
+    const [ax, ay] = HEADLAND[k], [bx, by] = HEADLAND[k + 1], vx = bx - ax, vy = by - ay, t = clamp(((x - ax) * vx + (y - ay) * vy) / (vx * vx + vy * vy), 0, 1);
+    dh = Math.min(dh, Math.hypot(x - ax - t * vx, y - ay - t * vy));
+  }
+  const tip = HEADLAND[HEADLAND.length - 1], hw = 3 + 13 * sm(0, 100, Math.hypot(x - tip[0], y - tip[1])) + 3 * fbm(20, x / 30, y / 30, 2);
+  return Math.max(h, LAKE + 30 * (1 - dh / hw) + 5 * fbm(21, x / 10, y / 10, 2) - (dh > hw ? 1e4 : 0));
+}
+// Erosion: stripes laid along the fall line, phase-blended between jittered cells, sharpened into
+// crests and gullies. Each octave reads the gradient left by the last, so small gullies branch
+// down the flanks of big ridges the way water cuts them.
+function gullies(Hm, relief, cell, k, seed) {
+  // the fall line is read from the ground generalised to this octave's scale, so it turns smoothly
+  const st = 2, add = new Float32Array(TN), C2 = 2.4, Hb = blur(Hm, TW, TH, cell * 0.3);
+  for (let y = 0; y < TH; y++) {
+    const y0 = Math.max(0, y - st) * TW, y1 = Math.min(TH - 1, y + st) * TW, cy = Math.floor(y / cell);
+    for (let x = 0; x < TW; x++) {
+      const i = y * TW + x; if (relief[i] <= 0.001) continue;
+      const gx = Hb[y * TW + Math.min(TW - 1, x + st)] - Hb[y * TW + Math.max(0, x - st)], gy = Hb[y1 + x] - Hb[y0 + x];
+      const mag = Math.hypot(gx, gy) / (2 * st); if (mag < 1e-4) continue;
+      const px = -gy, py = gx, pl = Math.hypot(px, py), ux = px / pl, uy = py / pl, cx = Math.floor(x / cell);
+      let Cs = 0, Ss = 0, Ws = 0;
+      for (let j = -1; j <= 2; j++) for (let k = -1; k <= 2; k++) {
+        const qx = (cx + k + h2(seed, cx + k, cy + j)) * cell, qy = (cy + j + h2(seed + 7, cx + k, cy + j)) * cell;
+        const dx = x - qx, dy = y - qy, d2 = (dx * dx + dy * dy) / (cell * cell); if (d2 >= C2) continue;
+        const w = (1 - d2 / C2) ** 3, ph = (dx * ux + dy * uy) / cell * 6.0;
+        Cs += w * Math.cos(ph); Ss += w * Math.sin(ph); Ws += w;
+      }
+      const phi = Math.abs(Math.atan2(Ss, Cs)) / Math.PI;           // 0 on a crest, 1 in a gully
+      const v = 1 - 2 * Math.pow(phi, 0.85);
+      // where neighbouring cells cancel, the phase is undefined: fade the stripes out there
+      add[i] = v * k * cell * Math.min(mag, 60) * relief[i] * sm(0.05, 0.3, mag / MPX) * sm(0.05, 0.4, Math.hypot(Cs, Ss) / (Ws || 1));
+    }
+  }
+  for (let i = 0; i < TN; i++) Hm[i] += add[i];
+}
+
+// a slow warp keeps the ridges from running ruler-straight between their kinks
+const warpAt = (x, y) => [16 * fbm(41, x / 110, y / 110, 3), 16 * fbm(42, x / 110, y / 110, 3)];
+// ---------- bake: the ground ----------
+const Ht = new Float32Array(TN);
+{
+  const raw = new Float32Array(TN);
+  for (let y = 0; y < TH; y++) for (let x = 0; x < TW; x++) {
+    // a slow warp keeps the ridges from running ruler-straight between their kinks
+    const wx = x + 16 * fbm(41, x / 110, y / 110, 3), wy = y + 16 * fbm(42, x / 110, y / 110, 3);
+    const h0 = baseHeight(x, y) + ridgeHeight(wx, wy);
+    // the valley north of the range climbs toward the north-west corner, to a pass off the sheet
+    raw[y * TW + x] = h0 + 300 * (1 - sm(516, 716, x)) * (1 - sm(256, 376, y)) * (1 - sm(1000, 1800, h0));
+  }
+  Ht.set(blur(raw, TW, TH, 0.8));
+  const relief = new Float32Array(TN);
+  // around each apex the fall line turns through a full circle, so erosion fades in away from it
+  for (let y = 0; y < TH; y++) for (let x = 0; x < TW; x++) {
+    // a summit crest keeps its two faces smooth well down from the crest, so no ribs radiate from it
+    let ap = 1; for (const p of PEAKS) {
+      if (!p.crest) { ap = Math.min(ap, sm(0.03, 0.14, Math.hypot(x - p.x, y - p.y) / p.L)); continue; }
+      const ux = Math.cos(p.crest[0]), uy = Math.sin(p.crest[0]), t = clamp((x - p.x) * ux + (y - p.y) * uy, -p.crest[1] / 2, p.crest[1] / 2);
+      ap = Math.min(ap, sm(0.04, 0.32, Math.hypot(x - p.x - t * ux, y - p.y - t * uy) / p.L));
+    }
+    const i = y * TW + x; relief[i] = sm(20, 300, Ht[i] - FLOOR) * ap;
+  }
+  gullies(Ht, relief, 120, 0.12, 101); gullies(Ht, relief, 60, 0.1, 202); gullies(Ht, relief, 30, 0.045, 303);
+  // Couloirs: two snow gullies cut deep into c p's north-west face, a main one and a branch,
+  // V-shaped and widening as they fall, so the lit face breaks into ribs.
+  const p = PEAKS[0], gul = [[-2.98, 0.3, 36, 250, 480], [-1.98, -0.22, 60, 220, 380]];
+  for (const [a0, bend, r0, r1, depth] of gul) {
+    const pts = []; for (let r = r0; r <= r1; r += 2) { const a = a0 + bend * (r - r0) / (r1 - r0); pts.push([p.x + Math.cos(a) * r, p.y + Math.sin(a) * r, r]); }
+    const cut = new Float32Array(TN);
+    for (const [cx, cy, r] of pts) {
+      const w = 9 + 0.09 * r, dep = depth * sm(r0, r0 + 40, r) * (1 - sm(r1 - 60, r1, r));
+      for (let yy = Math.max(0, cy - w | 0); yy < Math.min(TH, cy + w); yy++) for (let xx = Math.max(0, cx - w | 0); xx < Math.min(TW, cx + w); xx++) {
+        const d = Math.hypot(xx - cx, yy - cy); if (d < w) cut[yy * TW + xx] = Math.max(cut[yy * TW + xx], dep * (1 - d / w) ** 1.4);
+      }
+    }
+    for (let i = 0; i < TN; i++) Ht[i] -= cut[i];
+  }
+
+}
+// Each massif is rescaled so its highest point sits exactly at its set height.
+const SUMMITS = PEAKS.map(p => {
+  let best = -1e9, bx = p.x, by = p.y; const rad = p.L * 0.12;
+  for (let y = Math.max(0, p.y - rad | 0); y < Math.min(TH, p.y + rad); y++) for (let x = Math.max(0, p.x - rad | 0); x < Math.min(TW, p.x + rad); x++)
+    if (Math.hypot(x - p.x, y - p.y) < rad && Ht[y * TW + x] > best) { best = Ht[y * TW + x]; bx = x; by = y; }
+  return { x: bx, y: by, ratio: (p.h - FLOOR) / (best - FLOOR) };
+});
+for (let y = 0; y < TH; y++) for (let x = 0; x < TW; x++) {
+  const i = y * TW + x; if (Ht[i] <= FLOOR) continue;
+  let sw = 0, sr = 0;
+  for (let k = 0; k < PEAKS.length; k++) { const w = clamp(1 - Math.hypot(x - PEAKS[k].x, y - PEAKS[k].y) / (PEAKS[k].L * 1.2), 0, 1) ** 2; sw += w; sr += w * (SUMMITS[k].ratio - 1); }
+  Ht[i] = FLOOR + (Ht[i] - FLOOR) * (1 + sr / Math.max(1, sw));
+}
+// ---------- bake: the inflow river and its delta ----------
+// Meltwater leaves the c p glacier basin and takes the cheapest way to the lake, where cost
+// rises with height and with every uphill step, so it finds the valley bottoms. On the flat floor
+// it meanders; it cuts its own channel; where it meets the lake it drops its load, so the shore
+// pushes out in a lobed fan and the channel splits.
+const RIVER = [], DISTRIB = [], DELTAM = new Float32Array(TN);
+{
+  const S = 3, GW = Math.ceil(TW / S), GH = Math.ceil(TH / S), n = GW * GH, dist = new Float64Array(n).fill(Infinity), prev = new Int32Array(n).fill(-1);
+  const Hb = blur(Ht, TW, TH, 3), at = (gx, gy) => Math.min(TH - 1, gy * S) * TW + Math.min(TW - 1, gx * S), p = PEAKS[0];
+  const heap = [], push = (d, v) => { heap.push([d, v]); let i = heap.length - 1; while (i) { const q = (i - 1) >> 1; if (heap[q][0] <= heap[i][0]) break; [heap[q], heap[i]] = [heap[i], heap[q]]; i = q; } };
+  const pop = () => { const top = heap[0], last = heap.pop(); if (heap.length) { heap[0] = last; let i = 0; for (;;) { const l = 2 * i + 1, r = l + 1; let m = i; if (l < heap.length && heap[l][0] < heap[m][0]) m = l; if (r < heap.length && heap[r][0] < heap[m][0]) m = r; if (m === i) break; [heap[m], heap[i]] = [heap[i], heap[m]]; i = m; } } return top; };
+  const sx = Math.round((p.x + Math.cos(2.05) * 150) / S), sy = Math.round((p.y + Math.sin(2.05) * 150) / S), s0 = sy * GW + sx; let goal = -1;
+  dist[s0] = 0; push(0, s0);
+  while (heap.length) {
+    const [d, u] = pop(); if (d > dist[u]) continue;
+    const ux = u % GW, uy = (u / GW) | 0, hu = Hb[at(ux, uy)]; if (hu < LAKE - 3) { goal = u; break; }
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      if (!dx && !dy) continue; const vx = ux + dx, vy = uy + dy; if (vx < 0 || vy < 0 || vx >= GW || vy >= GH) continue;
+      const hv = Hb[at(vx, vy)], len = Math.hypot(dx, dy) * S, c = len * (1 + 5 * Math.max(0, hv - LAKE) / 1000) + 30 * Math.max(0, hv - hu);
+      const v = vy * GW + vx; if (d + c < dist[v]) { dist[v] = d + c; prev[v] = u; push(d + c, v); }
+    }
+  }
+  let pts = []; for (let v = goal; v >= 0; v = prev[v]) pts.push([(v % GW) * S, ((v / GW) | 0) * S]); pts.reverse();
+  for (let it = 0; it < 8; it++) for (let k = 1; k < pts.length - 1; k++) pts[k] = [(pts[k - 1][0] + 2 * pts[k][0] + pts[k + 1][0]) / 4, (pts[k - 1][1] + 2 * pts[k][1] + pts[k + 1][1]) / 4];
+  // meanders grow where the floor is flat
+  let sAcc = 0;
+  for (let k = 0; k < pts.length; k++) {
+    const a = pts[Math.max(0, k - 1)], b = pts[Math.min(pts.length - 1, k + 1)], tx = b[0] - a[0], ty = b[1] - a[1], tl = Math.hypot(tx, ty) || 1;
+    if (k) sAcc += Math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1]);
+    const i = clamp(pts[k][1] | 0, 0, TH - 1) * TW + clamp(pts[k][0] | 0, 0, TW - 1), gx = Hb[Math.min(TN - 1, i + 1)] - Hb[Math.max(0, i - 1)], gy = Hb[Math.min(TN - 1, i + TW)] - Hb[Math.max(0, i - TW)];
+    const flat = 1 - sm(4, 20, Math.hypot(gx, gy) / 2), off = 7 * flat * Math.sin(sAcc / 21 + 1.3 * fbm(16, sAcc / 90, 0, 2));
+    RIVER.push([pts[k][0] - ty / tl * off, pts[k][1] + tx / tl * off]);
+  }
+  const cut = new Float32Array(TN);
+  for (let k = 0; k < RIVER.length; k++) {
+    const [rx, ry] = RIVER[k];
+    for (let yy = Math.max(0, ry - 10 | 0); yy < Math.min(TH, ry + 10); yy++) for (let xx = Math.max(0, rx - 10 | 0); xx < Math.min(TW, rx + 10); xx++) {
+      const d = Math.hypot(xx - rx, yy - ry); if (d < 10) cut[yy * TW + xx] = Math.max(cut[yy * TW + xx], (1 - d / 10) ** 2);
+    }
+  }
+  for (let i = 0; i < TN; i++) if (cut[i] > 0) Ht[i] -= 18 * cut[i] * (1 - sm(1200, 2000, Ht[i]));
+  // The delta: the channel splits at the mouth into three distributaries, one of which splits
+  // again. Silt builds low land along each, tapering to its tip, inside a drowned fan.
+  const M = RIVER[RIVER.length - 1], B = RIVER[Math.max(0, RIVER.length - 25)], th0 = Math.atan2(M[1] - B[1], M[0] - B[0]), rr = rng('delta');
+  const grow = (x, y, a, n) => { const line = [[x, y]]; for (let k = 0; k < n; k++) { a += (rr() - 0.5) * 0.3; x += Math.cos(a) * 2; y += Math.sin(a) * 2; line.push([x, y]); } return line; };
+  const stem = grow(M[0], M[1], th0, 6), sA = stem[stem.length - 1];
+  const left = grow(sA[0], sA[1], th0 - 0.85, 24), right = grow(sA[0], sA[1], th0 + 0.6, 12), rB = right[right.length - 1];
+  DISTRIB.push(stem, left, right, grow(rB[0], rB[1], th0 + 0.15, 16), grow(rB[0], rB[1], th0 + 1.15, 14));
+  // Land grows out of the shore along each distributary, widest at the apex and tapering to the
+  // tips, so the lobes merge into one fan. Beyond the land edge the bed shoals back down to lake
+  // depth over about 40 px, so the shallows fade into the lake with no edge of their own.
+  const land = new Float32Array(TN).fill(-1e9), wsh = new Float32Array(TN);
+  for (const line of DISTRIB) line.forEach(([cx, cy], k) => {
+    const t = k / (line.length - 1), R = 26 * (1 - 0.6 * t) + 6, RF = R + 44;
+    for (let yy = Math.max(0, cy - RF | 0); yy < Math.min(TH, cy + RF); yy++) for (let xx = Math.max(0, cx - RF | 0); xx < Math.min(TW, cx + RF); xx++) {
+      const i = yy * TW + xx, d = Math.hypot(xx - cx, yy - cy); if (d > RF) continue;
+      if (d < R) land[i] = Math.max(land[i], LAKE + 2 + 5 * (1 - d / R));
+      wsh[i] = Math.max(wsh[i], 1 - sm(0, 42, d - R));
+    }
+  });
+  for (let i = 0; i < TN; i++) {
+    if (Ht[i] > LAKE + 8) continue;
+    const x = i % TW, y = (i / TW) | 0;
+    if (wsh[i] > 0) Ht[i] += (Math.max(Ht[i], LAKE - 2) - Ht[i]) * wsh[i];          // shoals blend into the bed
+    if (land[i] > -1e8) { const v = land[i] + 2.5 * fbm(15, x / 7, y / 7, 2); if (v > Ht[i]) { Ht[i] = v; if (v > LAKE) DELTAM[i] = 1; } }
+  }
+}
+const Hs = new Float32Array(TN); for (let i = 0; i < TN; i++) Hs[i] = Math.max(Ht[i], LAKE);
+// The shading surface lifts low relief (Imhof exaggerates small hills so they still model).
+const Hz = new Float32Array(TN); for (let i = 0; i < TN; i++) Hz[i] = LAKE + (TOP - LAKE) * Math.pow((Hs[i] - LAKE) / (TOP - LAKE), 0.78);
+
+// Normals at two scales: Imhof generalises the lowland and keeps detail on the heights.
+const VE = 1.35;
+function normals(src) {
+  const nx = new Float32Array(TN), ny = new Float32Array(TN), nz = new Float32Array(TN);
+  for (let y = 0; y < TH; y++) for (let x = 0; x < TW; x++) {
+    const i = y * TW + x, xl = Math.max(0, x - 1), xr = Math.min(TW - 1, x + 1), yu = Math.max(0, y - 1), yd = Math.min(TH - 1, y + 1);
+    const gx = (src[y * TW + xr] - src[y * TW + xl]) / ((xr - xl) * MPX) * VE, gy = (src[yd * TW + x] - src[yu * TW + x]) / ((yd - yu) * MPX) * VE;
+    const l = Math.hypot(gx, gy, 1); nx[i] = -gx / l; ny[i] = -gy / l; nz[i] = 1 / l;
+  }
+  return [nx, ny, nz];
+}
+const Hf = blur(Hs, TW, TH, 0.7), Hc = blur(Hs, TW, TH, 5), NF = normals(blur(Hz, TW, TH, 0.7)), NC = normals(blur(Hz, TW, TH, 5));
+const SLOPE = new Float32Array(TN), HN = new Float32Array(TN), LAP = new Float32Array(TN), LAPC = new Float32Array(TN), GX = new Float32Array(TN), GY = new Float32Array(TN);
+{
+  const Hl = blur(Hs, TW, TH, 3), Hk = blur(Hs, TW, TH, 12);
+  for (let y = 1; y < TH - 1; y++) for (let x = 1; x < TW - 1; x++) {
+    const i = y * TW + x, gx = (Hf[i + 1] - Hf[i - 1]) / 2, gy = (Hf[i + TW] - Hf[i - TW]) / 2;
+    GX[i] = (Hc[i + 1] - Hc[i - 1]) / 2; GY[i] = (Hc[i + TW] - Hc[i - TW]) / 2;
+    SLOPE[i] = Math.hypot(gx, gy) / MPX;
+    LAP[i] = Hl[i + 1] + Hl[i - 1] + Hl[i + TW] + Hl[i - TW] - 4 * Hl[i];
+    if (x > 3 && y > 3 && x < TW - 4 && y < TH - 4) LAPC[i] = (Hk[i + 3] + Hk[i - 3] + Hk[i + 3 * TW] + Hk[i - 3 * TW] - 4 * Hk[i]) / 9;
+  }
+  for (let i = 0; i < TN; i++) HN[i] = clamp((Hs[i] - LAKE) / (TOP - LAKE), 0, 1);
+}
+
+// ---------- bake: land cover ----------
+// Lake below its level; glacier on gentle, high, north-facing ground and in hollows; rock where
+// it is steep above the treeline; forest in patches on the lower flanks. Each indicator is
+// generalised before it is thresholded, so boundaries are coherent engraved edges, crisp and
+// antialiased over about a pixel.
+const LAKEM = new Float32Array(TN), ICE = new Float32Array(TN), ROCK = new Float32Array(TN), WOOD = new Float32Array(TN), CONT = new Float32Array(TN), ICECONT = new Float32Array(TN);
+{
+  const iceRaw = new Float32Array(TN), rockRaw = new Float32Array(TN);
+  for (let y = 0; y < TH; y++) for (let x = 0; x < TW; x++) {
+    const i = y * TW + x, h = Ht[i], s = SLOPE[i], g = Math.max(1e-3, s * MPX);
+    LAKEM[i] = clamp((LAKE - h) / g + 0.5, 0, 1);
+    const north = clamp(-NC[1][i] * 2.2 + 0.5, 0, 1), hollow = clamp(LAP[i] / 18, -1, 1), sc = Math.hypot(GX[i], GY[i]) / MPX;
+    const cirque = clamp(LAPC[i] / 0.3, -1, 1);   // only the big basins hold ice, not every gully
+    iceRaw[i] = sm(3700, 4400, h + 400 * fbm(21, x / 90, y / 90, 3) + 400 * north + 1100 * cirque) * sm(-0.15, 0.35, cirque) * sm(2.6, 1.7, sc);
+    rockRaw[i] = sm(0.78, 0.98, s + 0.14 * fbm(22, x / 30, y / 30, 3) - 0.1 * hollow) * sm(2300, 3000, h + 400 * fbm(23, x / 60, y / 60, 2));
+  }
+  const iceB = blur(iceRaw, TW, TH, 6), rockB = blur(rockRaw, TW, TH, 1.6);
+  // Only the three highest cirques hold glaciers: label the ice bodies and keep the top three.
+  {
+    for (let i = 0; i < TN; i++) ICE[i] = sm(0.5, 0.57, iceB[i]);
+    const lab = new Int32Array(TN).fill(-1), tops = [], stack = [];
+    for (let i0 = 0; i0 < TN; i0++) {
+      if (ICE[i0] < 0.3 || lab[i0] >= 0) continue;
+      const id = tops.length; let top = 0; lab[i0] = id; stack.push(i0);
+      while (stack.length) {
+        const i = stack.pop(), x = i % TW; top = Math.max(top, Hs[i]);
+        for (const j of [x > 0 ? i - 1 : -1, x < TW - 1 ? i + 1 : -1, i - TW, i + TW]) if (j >= 0 && j < TN && lab[j] < 0 && ICE[j] >= 0.3) { lab[j] = id; stack.push(j); }
+      }
+      tops.push([top, id]);
+    }
+    const keep = new Set(tops.sort((a, b) => b[0] - a[0]).slice(0, 3).map(t => t[1]));
+    for (let i = 0; i < TN; i++) {
+      if (lab[i] >= 0 && !keep.has(lab[i])) ICE[i] = 0;
+      else if (lab[i] < 0 && ICE[i] > 0) {                 // the antialiased fringe follows its body
+        const x = i % TW, n = [i - 1, i + 1, i - TW, i + TW, i - 2, i + 2, i - 2 * TW, i + 2 * TW].find(j => j >= 0 && j < TN && Math.abs((j % TW) - x) <= 2 && lab[j] >= 0);
+        if (n === undefined || !keep.has(lab[n])) ICE[i] = 0;
+      }
+    }
+  }
+  for (let y = 0; y < TH; y++) for (let x = 0; x < TW; x++) {
+    const i = y * TW + x, h = Ht[i], s = SLOPE[i], g = Math.max(1e-3, s * MPX);
+    ROCK[i] = sm(0.42, 0.54, rockB[i]) * (1 - ICE[i]);
+    const band = sm(760, 900, h + 80 * fbm(24, x / 40, y / 40, 2)) * (1 - sm(1700, 2000, h + 200 * fbm(25, x / 50, y / 50, 2))) * sm(0.1, 0.2, s);
+    const patch = fbm(26, x / 75, y / 75, 4) + 0.25 * fbm(27, x / 18, y / 18, 2);
+    WOOD[i] = sm(-0.03, 0.03, patch - 0.1) * band * sm(1.05, 0.8, s) * (1 - LAKEM[i]) * (1 - ROCK[i]);
+    // contours every 100, index every 500; dropped where they would crowd or where rock takes over
+    const F = Hs[i] / 100, k = Math.round(F), d = Math.abs(F - k) * 100 / g, idx = k % 5 === 0;
+    const spacing = 100 / g, w = idx ? 1.9 : 1.1;
+    let c = clamp(w / 2 + 0.5 - d, 0, 1) * (idx ? sm(1.6, 3.2, spacing) : sm(2.6, 4.4, spacing)) * (1 - LAKEM[i]) * (h > LAKE + 1 ? 1 : 0);
+    c *= (1 - ROCK[i] * 0.92) * (idx ? 1 : 0.72);
+    // no contour closes on a summit itself: a ring there would read as a dot
+    let ds = 1e9; for (const q of SUMMITS) ds = Math.min(ds, Math.hypot(x - q.x, y - q.y));
+    c *= sm(10, 20, ds);
+    ICECONT[i] = c * ICE[i]; CONT[i] = c * (1 - ICE[i]);
+  }
+}
+// shoreline: the darker blue edge a lake gets on every Swiss sheet
+const SHORE = new Float32Array(TN);
+{ const Lb = blur(LAKEM, TW, TH, 1.1); for (let i = 0; i < TN; i++) SHORE[i] = sm(0.08, 0.3, Lb[i]) * (1 - sm(0.7, 0.92, Lb[i])); }
+// Sand fringes the delta where land meets water: a pale tint stippled with gravel dots.
+const SAND = new Float32Array(TN), SANDDOT = new Float32Array(TN);
+{
+  const Lb = blur(LAKEM, TW, TH, 2.1), M = RIVER[RIVER.length - 1];
+  for (let y = 0; y < TH; y++) for (let x = 0; x < TW; x++) {
+    const i = y * TW + x; if (LAKEM[i] > 0.5 || Math.hypot(x - M[0], y - M[1]) > 95) continue;
+    SAND[i] = sm(0.08, 0.26, Lb[i]) * (1 - LAKEM[i]) * (1 - sm(80, 95, Math.hypot(x - M[0], y - M[1])));
+    if (SAND[i] > 0.3 && h2(91, x, y) < 0.2) SANDDOT[i] = 0.8;
+  }
+}
+// The lake deepens to blue toward its middle, with a shaded band along the shore and isobaths
+// every 75 below the surface. Tint and isobaths are kept apart: one is washed in, one is drawn.
+const LAKETINT = new Float32Array(TN), LAKEISO = new Float32Array(TN);
+{
+  const L7 = blur(LAKEM, TW, TH, 7);
+  for (let i = 0; i < TN; i++) {
+    const lk = LAKEM[i]; if (lk <= 0) continue;
+    const depth = LAKE - Ht[i], g0 = Math.max(0.05, Math.hypot(Ht[Math.min(TN - 1, i + 1)] - Ht[Math.max(0, i - 1)], Ht[Math.min(TN - 1, i + TW)] - Ht[Math.max(0, i - TW)]) / 2), g = g0, F = depth / 75, k = Math.round(F), dd = Math.abs(F - k) * 75 / g;
+    const iso = k > 0 ? clamp(1.0 - dd, 0, 1) * 0.42 : 0;
+    LAKETINT[i] = lk * (0.28 + 0.2 * sm(0, 200, depth) + 0.3 * clamp((1 - L7[i]) * 1.6, 0, 1)); LAKEISO[i] = lk * iso;
+  }
+}
+
+// ---------- the build ----------
+// The sheet starts blank inside its border, and the features are made in turn from the lower
+// right of the sheet to the upper left. Each massif's contours are traced round its summit,
+// starting on the side that faces the lower right and climbing as they go; the relief wash
+// follows up the mountain, and the rock is drawn on the cliffs after it. The isobaths run along
+// the lake from its east end, the river runs down from the glacier, the lake fills from its
+// mouth, the trail is walked, and the names are engraved last. The upper left, where the film's
+// caption sits on the blank sheet, is held back until t = 4 and then fills toward the corner.
+const ease = u => u <= 0 ? 0 : u >= 1 ? 1 : u * u * (3 - 2 * u);
+// The corner where the film's caption sits is the north side of the range, unsurveyed until t = 4:
+// the ground above the 900 contour lying north of the great crest (from its west foot over the
+// summit to its east end, then down the fall line), reached from the sheet's north-west corner.
+// Its edge is a drawn contour or the drawn crest, so the blank reads as sheet not yet surveyed.
+const Z = new Uint8Array(TN), ZCDF = new Float32Array(800); let ZTOP = 900;
+const ZEDGE = [];
+{
+  const cr = crestPath(0).map(([x, y]) => [x - MX, y - MY]), e = cr[cr.length - 1], fall = [];
+  for (let k = 0, x = e[0], y = e[1]; k < 400; k++) {
+    const i = clamp(y | 0, 1, TH - 2) * TW + clamp(x | 0, 1, TW - 2), m = Math.hypot(GX[i], GY[i]); if (Hs[i] < 900 || m < 1e-3) break;
+    x -= GX[i] / m; y -= GY[i] / m; fall.push([x, y]);
+  }
+  const c = layer(TW, TH), poly = cr.concat(fall), last = poly[poly.length - 1];
+  c.beginPath(); c.moveTo(-60, cr[0][1]); poly.forEach(([x, y]) => c.lineTo(x, y)); c.lineTo(last[0], -60); c.lineTo(-60, -60); c.closePath(); c.fill();
+  const inside = alphaOf(c), st = [30 * TW + 30]; Z[st[0]] = 1;
+  while (st.length) {
+    const i = st.pop(), x = i % TW; ZTOP = Math.max(ZTOP, Hs[i]);
+    for (const j of [x > 0 ? i - 1 : -1, x < TW - 1 ? i + 1 : -1, i - TW, i + TW]) if (j >= 0 && j < TN && !Z[j] && inside[j] > 0.5 && Hs[j] > 900) { Z[j] = 1; st.push(j); }
+  }
+  ZEDGE.push(...fall.filter((_, k) => k % 10 === 0).map(q => q.map(Math.round)));
+  // the share of the corner lying below each height, in 10 m steps, so its survey climbs at an even
+  // pace across the ground while every edge is still a contour
+  const n = Math.ceil((ZTOP - 900) / 10) + 1, hist = new Float64Array(n); let tot = 0;
+  for (let i = 0; i < TN; i++) if (Z[i]) { hist[Math.min(n - 1, (Hs[i] - 900) / 10 | 0)]++; tot++; }
+  for (let k = 0, acc = 0; k < n; k++) { acc += hist[k]; ZCDF[k] = acc / tot; }
+}
+const unease = f => 0.5 - Math.sin(Math.asin(1 - 2 * clamp(f, 0, 1)) / 3);   // when ease reaches f
+const TCON = new Float32Array(TN), TWASH = new Float32Array(TN), TLAKE = new Float32Array(TN), GATE = new Float32Array(TN);
+{
+  // [contour start, contour span, wash start, wash span], in the order the massifs are made
+  const WIN = { se: [0.55, 1.0, 1.35, 1.1], sw: [0.7, 1.0, 1.5, 1.1], oid: [0.6, 0.8, 1.3, 0.9], cmu: [0.75, 0.8, 1.45, 0.9], oic: [0.9, 1.1, 1.75, 1.2],
+    cyu: [1.05, 1.0, 1.9, 1.1], cp: [1.3, 1.6, 2.15, 1.5], obo: [2.0, 1.0, 2.8, 1.0] };
+  const M = RIVER[RIVER.length - 1], a0 = Math.PI / 4;
+  for (let y = 0; y < TH; y++) for (let x = 0; x < TW; x++) {
+    const i = y * TW + x, nz = 0.08 * fbm(51, x / 40, y / 40, 2);
+    // the valley floor between the massifs is made along a diagonal, lower right first
+    const fv = clamp(0.5 * (1 - x / TW) + 0.5 * (1 - y / TH) + nz, 0, 1);
+    let sw = 0.03, sc = sw * (0.6 + 1.2 * unease(fv)), sv = sw * (1.3 + 1.4 * unease(fv));
+    PEAKS.forEach((p, k) => {
+      const s = SUMMITS[k], dx = x - s.x, dy = y - s.y, w = clamp(1 - Math.hypot(dx, dy) / (p.L * 1.3), 0, 1) ** 2; if (w <= 0) return;
+      let da = Math.atan2(dy, dx) - a0; da = Math.abs(Math.atan2(Math.sin(da), Math.cos(da))) / Math.PI;
+      const lev = clamp((Hs[i] - LAKE) / (p.h - LAKE), 0, 1), [c0, cs, w0, ws] = WIN[p.id];
+      sw += w; sc += w * (c0 + cs * unease(0.55 * lev + 0.45 * da)); sv += w * (w0 + ws * unease(clamp(0.7 * lev + 0.3 * da + nz, 0, 1)));
+    });
+    let tc = sc / sw, tw = sv / sw;
+    // the lake and its shore are surveyed from the east end; the water fills from the river mouth
+    const shore = sm(LAKE + 40, LAKE, Ht[i]), dm = Math.hypot(x - M[0], y - M[1]);
+    tc += (0.5 + 0.9 * unease(clamp((760 - x) / 760, 0, 1)) - tc) * shore;
+    TLAKE[i] = 2.25 + 0.9 * unease(clamp(dm / 460 + nz, 0, 1));
+    tw += (TLAKE[i] - tw) * sm(130, 70, dm);                                // the delta lands with the water
+    if (Z[i]) {              // the corner is surveyed upward from its 900 contour, eased, then washed
+      const f = ZCDF[Math.min(799, (Hs[i] - 900) / 10 | 0)];
+      tc = 4.0 + 0.55 * unease(f); tw = 4.2 + 0.45 * unease(f);
+    }
+    TCON[i] = tc; TWASH[i] = Math.max(tw, tc + 0.12); GATE[i] = Z[i];
+  }
+}
+
+// ---------- bake: rock drawing ----------
+// Rock is drawn, never shaded, and only on the cliff bands. Lines follow the fall line and are
+// laid as evenly spaced streamlines, the way an engraver fills a face: close together and
+// heavier on the shadow side, sparse and fine where the light falls. Geometry is fixed at the
+// hero light; weights follow the light at draw time.
+const HATCH = [], ROCKBAND = new Float32Array(TN);
+// Rock is drawn only on the cliff bands that hang from the crests: within about 30 px of an
+// edge line, fading out below.
+function bakeBand() {
+  const D = new Float32Array(TN).fill(1e6);
+  for (let i = 0; i < TN; i++) if (CREST[i] > 0.7 && Hs[i] > 2800) D[i] = 0;
+  for (let y = 1; y < TH; y++) for (let x = 1; x < TW - 1; x++) { const i = y * TW + x; D[i] = Math.min(D[i], D[i - 1] + 1, D[i - TW] + 1, D[i - TW - 1] + 1.414, D[i - TW + 1] + 1.414); }
+  for (let y = TH - 2; y >= 0; y--) for (let x = TW - 2; x > 0; x--) { const i = y * TW + x; D[i] = Math.min(D[i], D[i + 1] + 1, D[i + TW] + 1, D[i + TW + 1] + 1.414, D[i + TW - 1] + 1.414); }
+  for (let i = 0; i < TN; i++) ROCKBAND[i] = ROCK[i] * sm(13, 4, D[i]);
+}
+function bakeHatch() {
+  shade(lightAt(HERO)); bakeCrests(); bakeBand();
+  const Hm = blur(Hs, TW, TH, 2.2), r = rng('rock-lines'), C = 3, GW = Math.ceil(TW / C), GH = Math.ceil(TH / C), grid = Array.from({ length: GW * GH }, () => []);
+  const at = (x, y) => clamp(y | 0, 0, TH - 1) * TW + clamp(x | 0, 0, TW - 1);
+  const sep = i => (8.5 - 4.0 * clamp(0.25 - REL[i] * 1.8, 0, 1)) * (0.75 + 0.5 * h2(77, i % TW >> 3, (i / TW) >> 3));
+  const near = (x, y, d) => {
+    const cx = (x / C) | 0, cy = (y / C) | 0, rr = Math.ceil(d / C);
+    for (let gy = cy - rr; gy <= cy + rr; gy++) for (let gx = cx - rr; gx <= cx + rr; gx++) {
+      if (gx < 0 || gy < 0 || gx >= GW || gy >= GH) continue;
+      const b = grid[gy * GW + gx]; for (let k = 0; k < b.length; k += 2) { const dx = b[k] - x, dy = b[k + 1] - y; if (dx * dx + dy * dy < d * d) return true; }
+    }
+    return false;
+  };
+  // rock lines stop short of each point summit at uneven distances, so they never meet in a star;
+// on a summit crest they hang along its length
+  const nearTop = (x, y) => SUMMITS.some((q, k) => !PEAKS[k].crest && Math.hypot(x - q.x, y - q.y) < 16 + 14 * h2(78, x >> 2, y >> 2));
+  const cand = [];
+  for (let y = 2; y < TH - 2; y += 2) for (let x = 2; x < TW - 2; x += 2) if (ROCKBAND[y * TW + x] > 0.5 && REL[y * TW + x] < -0.04) cand.push([x + r() * 2 - 1, y + r() * 2 - 1, r()]);
+  cand.sort((a, b) => a[2] - b[2]);
+  for (const [x, y] of cand) {
+    if (nearTop(x, y) || near(x, y, sep(at(x, y)))) continue;
+    const halves = [];
+    for (const dir of [1, -1]) {
+      let px = x, py = y; const pts = [];
+      for (let k = 0; k < 140; k++) {
+        const i = at(px, py), gx = Hm[i + 1] - Hm[i - 1], gy = Hm[i + TW] - Hm[i - TW], m = Math.hypot(gx, gy); if (m < 1) break;
+        px -= dir * gx / m * 0.9; py -= dir * gy / m * 0.9; const j = at(px, py);
+        if (ROCKBAND[j] < 0.35 || near(px, py, sep(j) * 0.55) || nearTop(px, py)) break;
+        pts.push(px, py);
+      }
+      halves.push(pts);
+    }
+    const up = halves[1], line = [];
+    for (let k = up.length - 2; k >= 0; k -= 2) line.push(up[k], up[k + 1]);
+    line.push(x, y, ...halves[0]);
+    if (line.length < 14) continue;
+    for (let k = 0; k < line.length; k += 2) grid[((line[k + 1] / C) | 0) * GW + ((line[k] / C) | 0)].push(line[k], line[k + 1]);
+    HATCH.push(line);
+  }
+}
+
+// Edge lines: crests and ribs are found where the ground is most convex across its fall line
+// and drawn on the zero of the slope across them, antialiased over a pixel, offset and
+// thickened toward the shadowed face, the way an engraver weights a ridge line.
+const CREST = new Float32Array(TN);
+function bakeCrests() {
+  const Hm = blur(Hs, TW, TH, 1.6);
+  for (let y = 4; y < TH - 4; y++) for (let x = 4; x < TW - 4; x++) {
+    const i = y * TW + x, h = Hs[i]; if (h < 2100) continue;
+    const zone = Math.max(ROCK[i], sm(2600, 3400, h) * sm(0.55, 0.9, SLOPE[i])) * (1 - ICE[i]); if (zone < 0.05) continue;
+    const hx = (Hm[i + 1] - Hm[i - 1]) / 2, hy = (Hm[i + TW] - Hm[i - TW]) / 2;
+    const hxx = Hm[i + 1] - 2 * Hm[i] + Hm[i - 1], hyy = Hm[i + TW] - 2 * Hm[i] + Hm[i - TW], hxy = (Hm[i + TW + 1] - Hm[i + TW - 1] - Hm[i - TW + 1] + Hm[i - TW - 1]) / 4;
+    const tr = hxx + hyy, det = hxx * hyy - hxy * hxy, l1 = tr / 2 - Math.sqrt(Math.max(0, tr * tr / 4 - det));
+    if (l1 > -0.9) continue;
+    let ex = hxy, ey = l1 - hxx; if (Math.abs(ex) + Math.abs(ey) < 1e-6) { ex = l1 - hyy; ey = hxy; }
+    const el = Math.hypot(ex, ey) || 1; ex /= el; ey /= el;
+    const tpos = (hx * ex + hy * ey) / -l1;                    // the crest lies tpos px along e from here
+    const ja = clamp(y + ey * 3 | 0, 0, TH - 1) * TW + clamp(x + ex * 3 | 0, 0, TW - 1), jb = clamp(y - ey * 3 | 0, 0, TH - 1) * TW + clamp(x - ex * 3 | 0, 0, TW - 1);
+    const sgn = REL[ja] < REL[jb] ? 1 : -1, sh = clamp(Math.abs(REL[ja] - REL[jb]) * 3, 0, 1);
+    const rpos = -tpos * sgn;                                  // > 0 on the shadow side of the crest
+    const c = clamp(0.5 + Math.min(rpos + 0.55, 0.55 + 1.5 * sh - rpos), 0, 1);
+    CREST[i] = c * sm(0.9, 3.0, -l1) * zone;
+  }
+}
+
+// ---------- light ----------
+// The cartographic lamp sits in the upper left. Once the sheet is made it breathes a little.
+function lightAt(t) {
+  const b = Math.sin(Math.PI * (t - HERO) / 1.6) * sm(BUILD_END - 0.3, BUILD_END + 0.2, t);
+  const az = (-45 + 3 * b) * Math.PI / 180, alt = (42 + 1.5 * b) * Math.PI / 180;
+  return [Math.sin(az) * Math.cos(alt), -Math.cos(az) * Math.cos(alt), Math.sin(alt)];
+}
+const SHADOW = new Float32Array(TN), LIGHTT = new Float32Array(TN), REL = new Float32Array(TN);
+function shade(L) {
+  const [lx, ly, lz] = L;
+  for (let i = 0; i < TN; i++) {
+    const d = Math.pow(HN[i], 0.7), wd = 0.3 + 0.7 * d;
+    const sF = NF[0][i] * lx + NF[1][i] * ly + NF[2][i] * lz, sC = NC[0][i] * lx + NC[1][i] * ly + NC[2][i] * lz;
+    const rel = (sC + (sF - sC) * wd - lz) * (0.25 + 1.9 * Math.pow(d, 1.05)) * (1 - LAKEM[i]);
+    REL[i] = rel;
+    // the cool valley haze holds up the lower flanks, so the relief runs straight into the lowland tint
+    SHADOW[i] = (0.74 * (1 - Math.exp(-Math.max(0, -rel) * 2.3)) + 0.17 * (1 - sm(0.12, 0.6, d))) * (1 - LAKEM[i]);
+    LIGHTT[i] = clamp(rel * 2.0, 0, 0.9) * (0.25 + 0.75 * Math.pow(d, 0.6)) * (1 - ICE[i]);
+  }
+}
+function drawRock(ctx) {
+  ctx.save(); ctx.translate(MX, MY); ctx.lineCap = 'round';
+  for (const line of HATCH) {
+    const n = line.length / 2;
+    for (let k = 1; k < n; k++) {
+      const x = line[k * 2], y = line[k * 2 + 1], i = clamp(y | 0, 0, TH - 1) * TW + clamp(x | 0, 0, TW - 1);
+      const dark = clamp(0.25 - REL[i] * 1.8, 0, 1), taper = 0.35 + 0.65 * Math.sin(Math.PI * k / n);
+      if (k % 24 > 20) continue;                                      // the graver lifts: lines break
+      ctx.lineWidth = (0.3 + 0.6 * Math.pow(dark, 1.1)) * taper;
+      ctx.beginPath(); ctx.moveTo(line[k * 2 - 2], line[k * 2 - 1]); ctx.lineTo(x, y); ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+// ---------- inks and press ----------
+const PAPER = [248, 245, 236];
+const INKS = {
+  shadow: [104, 112, 180], light: [254, 224, 118], green: [160, 200, 148], brown: [172, 106, 58],
+  blue: [58, 140, 205], rock: [112, 96, 84], black: [44, 38, 35], red: [205, 42, 34],
+};
+const PLATES = Object.keys(INKS);
+const REG = { shadow: [-0.6, 0.5], light: [0.5, -0.3], green: [0.9, -0.5], brown: [0.3, -0.7], blue: [1.0, 0.6], rock: [-0.3, 0.4], black: [0, 0], red: [-0.8, -0.9] };
+const MOTTLE = new Float32Array(N), FIBRE = new Float32Array(N);
+for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const i = y * W + x; MOTTLE[i] = fbm(31, x / 46, y / 46, 3); FIBRE[i] = 0.55 * fbm(32, x / 2.2, y / 7, 2) + 0.45 * fbm(33, x / 30, y / 30, 2); }
+// Fixed marks (the sheet's border, the streams, the hut) are baked once; the river, the trail and
+// the names are drawn at each moment of the build, and kept while they stand still.
+const FURN = new Float32Array(N), STREAMA = new Float32Array(N), HUTA = new Float32Array(N);
+const memo = {};
+function layerAt(name, key, draw) { const m = memo[name]; if (m && m.key === key) return m.a; const c = layer(); draw(c); const a = alphaOf(c); memo[name] = { key, a }; return a; }
+const rv = (u, r) => ease(u / r);
+
+function compose(t) {
+  shade(lightAt(t));
+  const P = {}; for (const k of PLATES) P[k] = new Float32Array(N);
+  const RR = new Float32Array(TN), WR = new Float32Array(TN);
+  for (let y = 0; y < TH; y++) for (let x = 0; x < TW; x++) {
+    const i = y * TW + x, o = (y + MY) * W + x + MX, d = HN[i], lake = LAKEM[i], ice = ICE[i], rock = ROCK[i], g = GATE[i];
+    // in the corner each contour lands in a frame and the wash follows as an edge: a survey's line
+    const c = rv(t - TCON[i], 0.16 - 0.13 * g), w = rv(t - TWASH[i], 0.45 - 0.37 * g), lt = rv(t - TLAKE[i], 0.4), s = rv(t - TCON[i] - 0.1, 0.2);
+    RR[i] = rv(t - TWASH[i] - 0.2 + 0.15 * g, 0.25 - 0.15 * g); WR[i] = w;
+    P.shadow[o] = SHADOW[i] * (1 - 0.62 * ice) * w;
+    P.light[o] = (LIGHTT[i] + SAND[i] * 0.5) * w;
+    const meadow = 0.42 - 0.28 * sm(0.1, 0.36, d) - 0.14 * sm(0.36, 0.46, d);       // the lowland green runs up the flanks
+    P.green[o] = (meadow * (1 - rock) * (1 - ice) * (1 - 0.8 * SAND[i]) + WOOD[i] * 0.6 + 0.2 * DELTAM[i] * (1 - SAND[i])) * (1 - lake) * w;
+    P.brown[o] = CONT[i] * 0.95 * c + ROCKBAND[i] * 0.08 * (1 - ice) * RR[i];
+    P.blue[o] = LAKETINT[i] * lt + (LAKEISO[i] + SHORE[i] * 0.9 + ICECONT[i] * 0.9) * c + STREAMA[o] * s;
+  }
+  if (t > 1) { const bl = layer(); drawRock(bl); P.rock = alphaOf(bl); }
+  for (let y = 0; y < TH; y++) for (let x = 0; x < TW; x++) { const i = y * TW + x, o = (y + MY) * W + x + MX; P.rock[o] = Math.min(1, (P.rock[o] + CREST[i]) * RR[i] + SANDDOT[i] * WR[i]); }
+  const fr = ease((t - 1.35) / 0.95), fd = ease((t - 2.2) / 0.3), reach = ease((t - 2.7) / 0.95), hut = ease((t - 3.6) / 0.1);
+  const riv = layerAt('river', fr + ',' + fd, c => drawRiver(c, fr, fd)), trail = layerAt('trail', String(reach), c => TRAIL(c, reach)), ty = typeAt(t);
+  for (let i = 0; i < N; i++) {
+    P.black[i] = Math.min(1, FURN[i] + HUTA[i] * hut + ty.black[i]);
+    P.blue[i] = Math.min(1, P.blue[i] + riv[i] + ty.blue[i]);
+    P.red[i] = Math.min(1, trail[i] + ty.red[i]);
+  }
+  const img = out.createImageData(W, H), D = img.data;
+  const taps = PLATES.map(k => { const fx = -REG[k][0], fy = -REG[k][1], ix = Math.floor(fx), iy = Math.floor(fy), tx = fx - ix, ty = fy - iy;
+    return { buf: P[k], off: iy * W + ix, w00: (1 - tx) * (1 - ty), w10: tx * (1 - ty), w01: (1 - tx) * ty, w11: tx * ty,
+      ink: INKS[k].map(v => 1 - v / 255), mot: (hash(k) % 977) + 131 * W }; });
+  for (let y = 1; y < H - 2; y++) for (let x = 1; x < W - 2; x++) {
+    const i = y * W + x, f = 1 + 0.016 * FIBRE[i];
+    let r = PAPER[0] * f, g = PAPER[1] * f, b = PAPER[2] * f;
+    for (const p of taps) {
+      const o = i + p.off, B = p.buf;
+      let a = p.w00 * B[o] + p.w10 * B[o + 1] + p.w01 * B[o + W] + p.w11 * B[o + W + 1];
+      if (a <= 0) continue;
+      a = Math.min(1, a * (1 + 0.07 * MOTTLE[(i + p.mot) % N]));
+      r *= 1 - a * p.ink[0]; g *= 1 - a * p.ink[1]; b *= 1 - a * p.ink[2];
+    }
+    D[i * 4] = r; D[i * 4 + 1] = g; D[i * 4 + 2] = b; D[i * 4 + 3] = 255;
+  }
+  for (let x = 0; x < W; x++) for (const y of [0, H - 2, H - 1]) { const i = (y * W + x) * 4; D[i] = PAPER[0]; D[i + 1] = PAPER[1]; D[i + 2] = PAPER[2]; D[i + 3] = 255; }
+  for (let y = 0; y < H; y++) for (const x of [0, W - 2, W - 1]) { const i = (y * W + x) * 4; D[i] = PAPER[0]; D[i + 1] = PAPER[1]; D[i + 2] = PAPER[2]; D[i + 3] = 255; }
+  out.putImageData(img, 0, 0);
+}
+
+// ---------- bake: streams ----------
+// Water runs down the smoothed ground from a grid of sources. Where enough paths gather, a
+// stream is drawn, thickening downstream, until it reaches the lake or leaves the sheet.
+const FLOW = new Uint16Array(TN), PATHS = [];
+{
+  const S = 8, r = rng('streams'), stamp = new Int32Array(TN).fill(-1); let id = 0;
+  for (let gy = 0; gy < TH; gy += S) for (let gx = 0; gx < TW; gx += S) {
+    let x = gx + r() * S, y = gy + r() * S, last = -1; const pts = []; id++;
+    for (let k = 0; k < 2400; k++) {
+      const xi = x | 0, yi = y | 0; if (xi < 1 || yi < 1 || xi >= TW - 1 || yi >= TH - 1) break;
+      const i = yi * TW + xi; if (LAKEM[i] > 0.5) { pts.push(x, y); break; }
+      if (i !== last) { if (stamp[i] === id) break;              // circling in a hollow: the water pools, stop
+        stamp[i] = id; if (FLOW[i] < 65000) FLOW[i]++; last = i; pts.push(x, y); }
+      const gx = GX[i], gy = GY[i], m = Math.hypot(gx, gy); if (m < 0.04) break;
+      x -= gx / m * 0.8; y -= gy / m * 0.8;
+    }
+    if (ICE[(gy | 0) * TW + (gx | 0)] < 0.5) PATHS.push(pts);
+  }
+}
+function drawStreams(ctx, T = 40) {
+  const done = new Uint8Array(TN);
+  ctx.save(); ctx.translate(MX, MY); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  for (const pts of PATHS) {
+    const n = pts.length / 2, run = [];
+    const flush = () => { if (run.length >= 150) for (let j = 3; j < run.length; j += 3) {
+      ctx.lineWidth = Math.min(j / 30, 1) * (0.8 + 0.42 * Math.log2(run[j + 2] / T + 1)); ctx.beginPath(); ctx.moveTo(run[j - 3], run[j - 2]); ctx.lineTo(run[j], run[j + 1]); ctx.stroke(); }
+      run.length = 0; };
+    for (let k = 0; k < n; k++) {
+      // a short moving average smooths the one-pixel wobble of steepest descent
+      let sx = 0, sy = 0, c = 0; for (let j = Math.max(0, k - 4); j <= Math.min(n - 1, k + 4); j++) { sx += pts[j * 2]; sy += pts[j * 2 + 1]; c++; }
+      const x = sx / c, y = sy / c, i = clamp(y | 0, 0, TH - 1) * TW + clamp(x | 0, 0, TW - 1), f = FLOW[i];
+      if (f < T || ICE[i] > 0.5) { flush(); continue; }
+      run.push(x, y, f);
+      if (done[i] && run.length > 3) break; done[i] = 1;
+    }
+    flush();
+  }
+  ctx.restore();
+}
+
+// ---------- engraved lettering ----------
+// Map names are cut, not typeset: each glyph is a skeleton drawn with a flat graver held level,
+// so stems and bowls swell and horizontals thin to hairlines, with hairline serifs and ball
+// terminals. Units: x-height 100, baseline 0, ascender 146. Items: n = nib stroke (optional
+// weight), h = hairline, b = ball.
+const NIB = 15, HAIR = 3.6;
+const G = {
+  ' ': [44],
+  a: [98, ['n', 'M 18 -82 C 26 -97 38 -102 52 -102 C 70 -102 80 -91 80 -72 L 80 -12 C 80 -3 85 1 94 -3'], ['n', 'M 80 -58 C 52 -56 12 -50 12 -24 C 12 -8 24 2 40 2 C 58 2 72 -10 80 -22', 0.85], ['b', 22, -80, 10]],
+  b: [100, ['n', 'M 14 -146 L 14 0'], ['n', 'M 14 -76 C 24 -95 38 -102 54 -102 C 78 -102 92 -80 92 -50 C 92 -20 78 2 54 2 C 38 2 24 -6 14 -22'], ['h', 'M 0 -146 L 15 -146']],
+  c: [94, ['n', 'M 82 -78 C 76 -95 64 -102 50 -102 C 24 -102 8 -80 8 -50 C 8 -20 24 2 52 2 C 70 2 82 -8 88 -24'], ['b', 78, -80, 10]],
+  d: [100, ['n', 'M 80 -78 C 72 -96 60 -102 46 -102 C 22 -102 8 -80 8 -50 C 8 -20 22 2 46 2 C 62 2 74 -8 80 -22'], ['n', 'M 82 -146 L 82 0'], ['h', 'M 66 -146 L 83 -146'], ['h', 'M 81 0 L 98 0']],
+  e: [96, ['n', 'M 89 -54 C 89 -86 72 -102 50 -102 C 24 -102 8 -80 8 -50 C 8 -20 24 2 52 2 C 70 2 83 -8 89 -24'], ['h', 'M 10 -54 L 89 -54']],
+  f: [62, ['n', 'M 26 0 L 26 -116 C 26 -138 38 -149 56 -149 C 64 -149 70 -146 74 -141'], ['b', 66, -136, 9], ['h', 'M 6 -100 L 58 -100'], ['h', 'M 8 0 L 46 0']],
+  g: [98, ['n', 'M 80 -78 C 72 -96 60 -102 46 -102 C 22 -102 8 -80 8 -52 C 8 -24 22 -2 46 -2 C 62 -2 74 -10 80 -24'], ['n', 'M 82 -100 L 82 14 C 82 38 66 50 44 50 C 30 50 18 46 12 38'], ['b', 18, 34, 9], ['h', 'M 82 -100 L 98 -100']],
+  h: [106, ['n', 'M 14 -146 L 14 0'], ['n', 'M 14 -72 C 22 -94 38 -102 54 -102 C 76 -102 88 -90 88 -66 L 88 0'], ['h', 'M 0 0 L 30 0'], ['h', 'M 72 0 L 104 0'], ['h', 'M 0 -146 L 15 -146']],
+  i: [34, ['n', 'M 16 -100 L 16 0'], ['b', 16, -136, 11], ['h', 'M 2 0 L 32 0'], ['h', 'M 2 -100 L 17 -100']],
+  l: [34, ['n', 'M 16 -146 L 16 0'], ['h', 'M 2 0 L 32 0'], ['h', 'M 2 -146 L 17 -146']],
+  m: [168, ['n', 'M 14 -100 L 14 0'], ['n', 'M 14 -72 C 20 -94 34 -102 48 -102 C 68 -102 82 -90 82 -66 L 82 0'], ['n', 'M 82 -72 C 88 -94 102 -102 116 -102 C 136 -102 150 -90 150 -66 L 150 0'], ['h', 'M 0 0 L 30 0'], ['h', 'M 67 0 L 97 0'], ['h', 'M 135 0 L 166 0'], ['h', 'M 0 -100 L 15 -100']],
+  n: [106, ['n', 'M 14 -100 L 14 0'], ['n', 'M 14 -72 C 22 -94 38 -102 54 -102 C 76 -102 88 -90 88 -66 L 88 0'], ['h', 'M 0 0 L 30 0'], ['h', 'M 72 0 L 104 0'], ['h', 'M 0 -100 L 15 -100']],
+  o: [100, ['n', 'M 92 -50 A 42 52 0 1 0 8 -50 A 42 52 0 1 0 92 -50']],
+  p: [100, ['n', 'M 14 -100 L 14 48'], ['n', 'M 14 -76 C 24 -95 38 -102 54 -102 C 78 -102 92 -80 92 -50 C 92 -20 78 2 54 2 C 38 2 24 -6 14 -22'], ['h', 'M 0 48 L 30 48'], ['h', 'M 0 -100 L 15 -100']],
+  r: [72, ['n', 'M 14 -100 L 14 0'], ['n', 'M 14 -68 C 22 -92 36 -102 52 -102 C 60 -102 66 -100 70 -96'], ['b', 64, -86, 10], ['h', 'M 0 0 L 34 0'], ['h', 'M 0 -100 L 15 -100']],
+  s: [90, ['n', 'M 74 -84 C 68 -97 58 -102 44 -102 C 26 -102 14 -92 14 -76 C 14 -58 32 -54 48 -49 C 66 -44 80 -38 80 -22 C 80 -6 66 2 46 2 C 30 2 18 -4 10 -18'], ['b', 72, -84, 8], ['b', 13, -20, 8]],
+  t: [68, ['n', 'M 24 -128 L 24 -18 C 24 -4 32 2 44 2 C 54 2 60 -4 64 -12'], ['h', 'M 4 -100 L 58 -100']],
+  u: [106, ['n', 'M 14 -100 L 14 -34 C 14 -10 26 2 46 2 C 64 2 80 -8 88 -28'], ['n', 'M 88 -100 L 88 0'], ['h', 'M 0 -100 L 15 -100'], ['h', 'M 73 -100 L 89 -100'], ['h', 'M 87 0 L 104 0']],
+  w: [148, ['n', 'M 6 -100 L 40 0'], ['n', 'M 40 0 L 74 -100', 0.12], ['n', 'M 74 -100 L 108 0'], ['n', 'M 108 0 L 142 -100', 0.12], ['h', 'M -6 -100 L 22 -100'], ['h', 'M 60 -100 L 88 -100'], ['h', 'M 128 -100 L 154 -100']],
+  k: [98, ['n', 'M 14 -146 L 14 0'], ['n', 'M 82 -100 L 16 -40', 0.12], ['n', 'M 38 -60 L 84 0'], ['h', 'M 0 0 L 30 0'], ['h', 'M 70 0 L 98 0'], ['h', 'M 66 -100 L 94 -100'], ['h', 'M 0 -146 L 15 -146']],
+  v: [96, ['n', 'M 6 -100 L 48 0'], ['n', 'M 48 0 L 90 -100', 0.12], ['h', 'M -6 -100 L 22 -100'], ['h', 'M 76 -100 L 102 -100']],
+  x: [92, ['n', 'M 8 -100 L 84 0'], ['n', 'M 84 -100 L 8 0', 0.12], ['h', 'M -2 -100 L 24 -100'], ['h', 'M 68 -100 L 94 -100'], ['h', 'M -2 0 L 24 0'], ['h', 'M 68 0 L 94 0']],
+  y: [100, ['n', 'M 8 -100 L 50 -2'], ['n', 'M 92 -100 L 50 -2 L 36 30 C 30 42 24 48 14 48', 0.12], ['b', 14, 43, 9], ['h', 'M -4 -100 L 24 -100'], ['h', 'M 78 -100 L 104 -100']],
+  // engraved roman capitals: cap height 140, drawn with the graver turned to an oblique angle
+  A: [140, ['n', 'M 10 0 L 70 -142', 0.5], ['n', 'M 70 -142 L 130 0'], ['n', 'M 34 -48 L 106 -48', 0.6], ['h', 'M -2 0 L 28 0'], ['h', 'M 112 0 L 146 0']],
+  B: [122, ['n', 'M 22 -140 L 22 0'], ['n', 'M 6 -140 L 60 -140 C 88 -140 102 -126 102 -106 C 102 -86 88 -74 60 -74 L 22 -74'], ['n', 'M 22 -74 L 64 -74 C 96 -74 114 -58 114 -37 C 114 -14 96 0 64 0 L 6 0']],
+  C: [130, ['n', 'M 116 -114 C 104 -133 86 -142 66 -142 C 30 -142 8 -110 8 -70 C 8 -28 32 2 68 2 C 90 2 108 -8 120 -30'], ['h', 'M 116 -114 L 117 -138']],
+  D: [142, ['n', 'M 22 -140 L 22 0'], ['n', 'M 6 -140 L 64 -140 C 110 -140 134 -110 134 -70 C 134 -30 110 0 64 0 L 6 0']],
+  H: [150, ['n', 'M 22 -140 L 22 0'], ['n', 'M 128 -140 L 128 0'], ['n', 'M 22 -72 L 128 -72', 0.6], ['h', 'M 4 0 L 40 0'], ['h', 'M 110 0 L 146 0'], ['h', 'M 4 -140 L 40 -140'], ['h', 'M 110 -140 L 146 -140']],
+  I: [48, ['n', 'M 24 -140 L 24 0'], ['h', 'M 6 0 L 42 0'], ['h', 'M 6 -140 L 42 -140']],
+  L: [112, ['n', 'M 22 -140 L 22 0'], ['n', 'M 22 0 L 104 0', 0.6], ['h', 'M 4 -140 L 40 -140'], ['h', 'M 4 0 L 22 0'], ['h', 'M 104 0 L 107 -30']],
+  E: [118, ['n', 'M 22 -140 L 22 0'], ['n', 'M 22 -140 L 102 -140', 0.6], ['n', 'M 22 -72 L 86 -72', 0.5], ['n', 'M 22 0 L 108 0', 0.6], ['h', 'M 4 -140 L 22 -140'], ['h', 'M 4 0 L 22 0'], ['h', 'M 102 -140 L 104 -114'], ['h', 'M 86 -84 L 86 -60'], ['h', 'M 108 0 L 111 -30']],
+  F: [110, ['n', 'M 22 -140 L 22 0'], ['n', 'M 22 -140 L 102 -140', 0.6], ['n', 'M 22 -72 L 84 -72', 0.5], ['h', 'M 4 -140 L 22 -140'], ['h', 'M 4 0 L 42 0'], ['h', 'M 102 -140 L 104 -114'], ['h', 'M 84 -84 L 84 -60']],
+  M: [176, ['n', 'M 20 -140 L 20 0', 0.4], ['n', 'M 20 -140 L 88 0'], ['n', 'M 88 0 L 156 -140', 0.45], ['n', 'M 156 -140 L 156 0'], ['h', 'M 4 0 L 36 0'], ['h', 'M 138 0 L 174 0'], ['h', 'M 4 -140 L 20 -140'], ['h', 'M 156 -140 L 172 -140']],
+  N: [146, ['n', 'M 22 -140 L 22 0', 0.4], ['n', 'M 22 -140 L 124 0'], ['n', 'M 124 -140 L 124 0', 0.4], ['h', 'M 6 0 L 38 0'], ['h', 'M 6 -140 L 22 -140'], ['h', 'M 108 -140 L 140 -140']],
+  O: [148, ['n', 'M 138 -70 A 64 72 0 1 0 10 -70 A 64 72 0 1 0 138 -70']],
+  P: [116, ['n', 'M 22 -140 L 22 0'], ['n', 'M 6 -140 L 60 -140 C 92 -140 108 -124 108 -100 C 108 -76 90 -62 60 -62 L 22 -62'], ['h', 'M 4 0 L 42 0']],
+  R: [130, ['n', 'M 22 -140 L 22 0'], ['n', 'M 6 -140 L 60 -140 C 92 -140 108 -124 108 -104 C 108 -82 90 -70 60 -70 L 22 -70'], ['n', 'M 58 -70 L 120 0'], ['h', 'M 4 0 L 42 0'], ['h', 'M 106 0 L 132 0']],
+  S: [108, ['n', 'M 94 -120 C 84 -136 70 -142 54 -142 C 32 -142 16 -128 16 -108 C 16 -84 38 -78 58 -71 C 80 -63 96 -54 96 -32 C 96 -10 78 2 54 2 C 34 2 18 -6 8 -24'], ['h', 'M 94 -120 L 95 -140'], ['h', 'M 8 -24 L 7 -2']],
+  T: [128, ['n', 'M 6 -140 L 122 -140', 0.6], ['n', 'M 64 -140 L 64 0'], ['h', 'M 44 0 L 84 0'], ['h', 'M 6 -140 L 4 -116'], ['h', 'M 122 -140 L 124 -116']],
+  U: [142, ['n', 'M 22 -140 L 22 -50 C 22 -16 42 2 72 2 C 98 2 116 -14 120 -40'], ['n', 'M 120 -140 L 120 -40', 0.45], ['h', 'M 4 -140 L 40 -140'], ['h', 'M 104 -140 L 136 -140']],
+  Y: [132, ['n', 'M 8 -140 L 66 -68'], ['n', 'M 124 -140 L 66 -68', 0.45], ['n', 'M 66 -68 L 66 0'], ['h', 'M -4 -140 L 30 -140'], ['h', 'M 104 -140 L 136 -140'], ['h', 'M 46 0 L 86 0']],
+  '0': [92, ['n', 'M 84 -68 A 38 70 0 1 0 8 -68 A 38 70 0 1 0 84 -68']],
+  '1': [80, ['n', 'M 42 -136 L 42 0'], ['n', 'M 42 -136 L 18 -112', 0.15], ['h', 'M 20 0 L 64 0']],
+  '2': [92, ['n', 'M 14 -106 C 18 -126 32 -138 48 -138 C 68 -138 80 -124 80 -104 C 80 -78 58 -60 38 -40 L 10 -4'], ['n', 'M 10 -3 L 84 -3', 0.4, 1.5708], ['b', 18, -104, 9]],
+  '3': [92, ['n', 'M 16 -112 C 22 -130 34 -138 48 -138 C 68 -138 80 -126 80 -106 C 80 -86 66 -76 42 -76'], ['n', 'M 42 -76 C 70 -76 86 -62 86 -38 C 86 -12 68 2 46 2 C 28 2 14 -6 8 -22'], ['b', 18, -110, 9], ['b', 12, -24, 9]],
+  '4': [94, ['n', 'M 62 -138 L 6 -42', 1.25], ['n', 'M 66 -134 L 66 0'], ['n', 'M 6 -40 L 90 -40', 0.45, 1.5708], ['h', 'M 44 0 L 86 0']],
+  '5': [92, ['n', 'M 80 -132 L 24 -132', 0.5, 1.5708], ['n', 'M 24 -136 L 18 -78'], ['n', 'M 18 -78 C 28 -86 38 -88 48 -88 C 72 -88 86 -70 86 -44 C 86 -16 68 2 44 2 C 28 2 14 -6 8 -22'], ['b', 12, -24, 9]],
+  '6': [92, ['n', 'M 74 -128 C 66 -136 58 -138 50 -138 C 24 -138 10 -108 10 -64 C 10 -22 24 2 48 2 C 72 2 86 -18 86 -44 C 86 -70 70 -86 48 -86 C 30 -86 16 -76 10 -60'], ['b', 72, -124, 9]],
+  '7': [88, ['n', 'M 8 -132 L 84 -132', 0.5, 1.5708], ['n', 'M 84 -136 C 64 -100 46 -56 40 0']],
+  '8': [94, ['n', 'M 78 -104 A 30 33 0 1 0 18 -104 A 30 33 0 1 0 78 -104'], ['n', 'M 85 -38 A 37 39 0 1 0 11 -38 A 37 39 0 1 0 85 -38']],
+  '9': [92, ['n', 'M 22 -10 C 30 -2 38 0 46 0 C 72 0 86 -30 86 -74 C 86 -116 72 -138 48 -138 C 24 -138 10 -118 10 -92 C 10 -66 26 -52 48 -52 C 66 -52 80 -62 86 -78'], ['b', 24, -14, 9]],
+  '+': [92, ['n', 'M 12 -56 L 80 -56', 0.5, 1.5708], ['n', 'M 46 -90 L 46 -22']],
+  '×': [84, ['n', 'M 16 -82 L 68 -30', 0.6], ['n', 'M 68 -82 L 16 -30', 0.6]],
+  ',': [30, ['b', 13, -7, 10], ['n', 'M 21 -7 C 21 8 15 20 5 28', 0.5]],
+  '.': [28, ['b', 14, -8, 10]],
+  '·': [34, ['b', 17, -50, 9]],
+  ':': [30, ['b', 15, -8, 9.5], ['b', 15, -84, 9.5]],
+};
+// a stroke's length, so the graver can cut it a fraction at a time (every arc here is a half ellipse)
+function pathLen(d) {
+  const tk = d.match(/[MLCA]|-?[\d.]+/g); let i = 0, x = 0, y = 0, L = 0, cmd = '';
+  const num = () => +tk[i++];
+  while (i < tk.length) {
+    if (/[MLCA]/.test(tk[i])) cmd = tk[i++];
+    if (cmd === 'M') { x = num(); y = num(); }
+    else if (cmd === 'L') { const nx = num(), ny = num(); L += Math.hypot(nx - x, ny - y); x = nx; y = ny; }
+    else if (cmd === 'C') {
+      const q = [x, y, num(), num(), num(), num(), num(), num()]; let px = x, py = y;
+      for (let k = 1; k <= 16; k++) { const u = k / 16, a = (1 - u) ** 3, b = 3 * u * (1 - u) ** 2, c = 3 * u * u * (1 - u), e = u ** 3;
+        const qx = a * q[0] + b * q[2] + c * q[4] + e * q[6], qy = a * q[1] + b * q[3] + c * q[5] + e * q[7]; L += Math.hypot(qx - px, qy - py); px = qx; py = qy; }
+      x = q[6]; y = q[7];
+    } else if (cmd === 'A') { const rx = num(), ry = num(); num(); num(); num(); x = num(); y = num(); L += Math.PI * (3 * (rx + ry) - Math.sqrt((3 * rx + ry) * (rx + 3 * ry))) / 2; }
+  }
+  return L;
+}
+for (const k in G) for (const it of G[k].slice(1)) if (it[0] !== 'b') { it.path = new Path2D(it[1]); it.len = pathLen(it[1]); }
+function advance(str, track) { let a = 0; for (const ch of str) a += (G[ch] || G[' '])[0] + track; return a - track; }
+// q is how far the graver has got through the glyph: its strokes are cut in turn, each along its path.
+function drawGlyph(ctx, g, px, py, phi, sc, o, q = 1) {
+  const c = Math.cos(phi), s = Math.sin(phi), wt = o.weight ?? 1, nibA = o.nib ?? 0;
+  ctx.save(); ctx.setTransform(sc * c, sc * s, -sc * s, sc * c, px, py);
+  if (o.italic) ctx.transform(1, 0, -0.2, 1, 0, 0);
+  ctx.translate(-g[0] / 2, 0); ctx.lineWidth = Math.max(HAIR * (o.hairW ?? (0.8 + 0.2 * wt)), 0.85 / sc); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  const m = g.length - 1;
+  for (let j = 1; j < g.length; j++) {
+    const it = g[j], f = clamp((q * (m + 1) - (j - 1)) / 2, 0, 1); if (f <= 0) continue;
+    if (it[0] === 'b') { if (f > 0.5) { ctx.beginPath(); ctx.arc(it[1], it[2], it[3] * (0.68 + 0.12 * wt), 0, Math.PI * 2); ctx.fill(); } continue; }
+    ctx.setLineDash(f < 1 ? [f * it.len, it.len + 60] : []);
+    if (it[0] === 'h') { ctx.stroke(it.path); continue; }
+    const len = NIB * (it[2] ?? 1) * wt, na = it[3] ?? nibA, n = Math.max(2, Math.ceil(len * sc * 2.5) + 1), vx = Math.cos(na) * len, vy = Math.sin(na) * len;
+    for (let k = 0; k < n; k++) { const f = k / (n - 1) - 0.5; ctx.save(); ctx.translate(vx * f, vy * f); ctx.stroke(it.path); ctx.restore(); }
+  }
+  ctx.restore();
+}
+// Set a string along a gentle arc: size is the x-height in px, curve is 1/px. Returns the glyph
+// placements, which engrave() cuts.
+function setLine(str, o) {
+  const { x, y, size, angle = 0, curve = 0, track = 6, align = 'center' } = o, sc = size / 100, total = advance(str, track) * sc, res = [];
+  let s = align === 'center' ? -total / 2 : align === 'right' ? -total : 0;
+  for (const ch of str) {
+    const g = G[ch] || G[' '], adv = g[0] * sc, mid = s + adv / 2, phi = angle + curve * mid;
+    const px = Math.abs(curve) < 1e-7 ? x + Math.cos(angle) * mid : x + (Math.sin(phi) - Math.sin(angle)) / curve;
+    const py = Math.abs(curve) < 1e-7 ? y + Math.sin(angle) * mid : y - (Math.cos(phi) - Math.cos(angle)) / curve;
+    if (g.length > 1) res.push([g, px, py, phi, sc, o]);
+    s += adv + track * sc;
+  }
+  return res;
+}
+// The graver cuts a word letter by letter, the letters overlapping a little; p runs 0 to 1.
+function engrave(ctx, places, p) {
+  const n = places.length;
+  places.forEach(([g, px, py, phi, sc, o], j) => { const q = clamp((p * (n + 1.5) - j) / 2.5, 0, 1); if (q > 0) drawGlyph(ctx, g, px, py, phi, sc, o, q); });
+}
+
+// ---------- crests and the trail ----------
+// The ground at p is read at p + warp(p), so a crest drawn as a ridge segment q sits on the map
+// where p = q - warp(p).
+function unwarp(q) { let p = q; for (let i = 0; i < 5; i++) { const w = warpAt(p[0], p[1]); p = [q[0] - w[0], q[1] - w[1]]; } return p; }
+function smoothLine(pts, it = 3) { for (let n = 0; n < it; n++) { const q = [pts[0]]; for (let i = 0; i < pts.length - 1; i++) { const a = pts[i], b = pts[i + 1]; q.push([a[0] * 0.75 + b[0] * 0.25, a[1] * 0.75 + b[1] * 0.25], [a[0] * 0.25 + b[0] * 0.75, a[1] * 0.25 + b[1] * 0.75]); } q.push(pts[pts.length - 1]); pts = q; } return pts; }
+// the massif's main crest, arm 0 through the summit to arm 1, in frame coordinates, left to right
+function crestPath(k) {
+  const own = SEGS.filter(s => s[7] === k && s[9] === 0), a = own.filter(s => s[8] === 0), b = own.filter(s => s[8] === 1), q = [];
+  for (let j = a.length - 1; j >= 0; j--) q.push([a[j][2], a[j][3]]);
+  q.push([PEAKS[k].x, PEAKS[k].y]); for (const s of b) q.push([s[2], s[3]]);
+  let pts = smoothLine(q.map(unwarp)).map(p => [p[0] + MX, p[1] + MY]);
+  if (pts[pts.length - 1][0] < pts[0][0]) pts.reverse();
+  return pts;
+}
+// Set a string along a line: at is the centre as a share of the line, off the distance above it.
+function setPath(str, pts, o) {
+  const arc = [0]; for (let i = 1; i < pts.length; i++) arc.push(arc[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
+  const sc = o.size / 100, track = o.track ?? 6, total = advance(str, track) * sc, L = arc[arc.length - 1];
+  let s = clamp((o.at ?? 0.5) * L, total / 2, L - total / 2) - total / 2, j = 0; const res = [];
+  for (const ch of str) {
+    const g = G[ch] || G[' '], adv = g[0] * sc, mid = s + adv / 2;
+    while (j < arc.length - 2 && arc[j + 1] < mid) j++;
+    const t = clamp((mid - arc[j]) / (arc[j + 1] - arc[j] || 1), 0, 1), a = pts[j], b = pts[j + 1];
+    const k0 = Math.max(0, j - 3), k1 = Math.min(pts.length - 1, j + 4), phi = Math.atan2(pts[k1][1] - pts[k0][1], pts[k1][0] - pts[k0][0]);
+    const px = a[0] + (b[0] - a[0]) * t + Math.sin(phi) * (o.off ?? 0), py = a[1] + (b[1] - a[1]) * t - Math.cos(phi) * (o.off ?? 0);
+    if (g.length > 1) res.push([g, px, py, phi, sc, o]);
+    s += adv + track * sc;
+  }
+  return res;
+}
+// The trail is routed: the cheapest walk from the cmu hill to a hut high on the c p south ridge,
+// where cost grows with the grade underfoot, so it takes the valley and zigzags up the ridge.
+function routeTrail(from, to) {
+  const S = 4, GW = Math.ceil(TW / S), GH = Math.ceil(TH / S), n = GW * GH, dist = new Float64Array(n).fill(Infinity), prev = new Int32Array(n).fill(-1);
+  const idx = (gx, gy) => Math.min(TH - 1, gy * S) * TW + Math.min(TW - 1, gx * S);
+  const moves = []; for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) if ((dx || dy) && !(Math.abs(dx) === 2 && (Math.abs(dy) === 2 || dy === 0)) && !(Math.abs(dy) === 2 && dx === 0)) moves.push([dx, dy, Math.hypot(dx, dy) * S]);
+  const heap = [], push = (d, v) => { heap.push([d, v]); let i = heap.length - 1; while (i) { const p = (i - 1) >> 1; if (heap[p][0] <= heap[i][0]) break; [heap[p], heap[i]] = [heap[i], heap[p]]; i = p; } };
+  const pop = () => { const top = heap[0], last = heap.pop(); if (heap.length) { heap[0] = last; let i = 0; for (;;) { const l = 2 * i + 1, r = l + 1; let m = i; if (l < heap.length && heap[l][0] < heap[m][0]) m = l; if (r < heap.length && heap[r][0] < heap[m][0]) m = r; if (m === i) break; [heap[m], heap[i]] = [heap[i], heap[m]]; i = m; } } return top; };
+  const s = Math.round(from[1] / S) * GW + Math.round(from[0] / S), goal = Math.round(to[1] / S) * GW + Math.round(to[0] / S);
+  dist[s] = 0; push(0, s);
+  while (heap.length) {
+    const [d, u] = pop(); if (d > dist[u]) continue; if (u === goal) break;
+    const ux = u % GW, uy = (u / GW) | 0, hu = Hs[idx(ux, uy)];
+    for (const [dx, dy, len] of moves) {
+      const vx = ux + dx, vy = uy + dy; if (vx < 0 || vy < 0 || vx >= GW || vy >= GH) continue;
+      const j = idx(vx, vy); if (LAKEM[j] > 0.3) continue;
+      const g = Math.abs(Hs[j] - hu) / (len * MPX), c = len * (1 + 30 * ICE[j] + 8 * ROCK[j] + 40 * Math.max(0, g - 0.1) ** 2 + 4 * g);
+      const v = vy * GW + vx; if (d + c < dist[v]) { dist[v] = d + c; prev[v] = u; push(d + c, v); }
+    }
+  }
+  let pts = []; for (let v = goal; v >= 0; v = prev[v]) pts.push([(v % GW) * S, ((v / GW) | 0) * S]);
+  pts.reverse(); pts[0] = from; pts[pts.length - 1] = to;
+  for (let it = 0; it < 3; it++) { const q = [pts[0]]; for (let i = 0; i < pts.length - 1; i++) { const a = pts[i], b = pts[i + 1]; q.push([a[0] * 0.75 + b[0] * 0.25, a[1] * 0.75 + b[1] * 0.25], [a[0] * 0.25 + b[0] * 0.75, a[1] * 0.25 + b[1] * 0.75]); } q.push(pts[pts.length - 1]); pts = q; }
+  return pts;
+}
+// The hut: the highest point on the c p south ridge still clear of ice and rock.
+const HUT = (() => {
+  const p = PEAKS[0], s = SUMMITS[0], a0 = p.arms[2][0]; let best = null, bh = -1e9;
+  for (let r = 70; r < 280; r += 2) for (let da = -0.4; da <= 0.4; da += 0.02) {
+    const x = Math.round(s.x + Math.cos(a0 + da) * r), y = Math.round(s.y + Math.sin(a0 + da) * r), i = y * TW + x;
+    const sc = Hs[i] - 4000 * ICE[i] - 3000 * ROCK[i] - 3000 * Math.max(0, SLOPE[i] - 0.75); if (sc > bh) { bh = sc; best = [x, y]; }
+  }
+  return best;
+})();
+// it crosses the valley to the foot of the south spur, then climbs the spur's crest
+const TRAILWP = [SUMMITS[4].x + 245, SUMMITS[4].y - 68];
+const TRAILLEG = routeTrail([SUMMITS[4].x, SUMMITS[4].y], TRAILWP), TRAILLINE = TRAILLEG.concat(routeTrail(TRAILWP, HUT).slice(1));
+// The trail is walked dot by dot from the cmu hill up to the hut; reach runs 0 to 1.
+function TRAIL(ctx, reach) {
+  if (reach <= 0) return;
+  const gap = 14; let total = 0;
+  for (let i = 1; i < TRAILLINE.length; i++) total += Math.hypot(TRAILLINE[i][0] - TRAILLINE[i - 1][0], TRAILLINE[i][1] - TRAILLINE[i - 1][1]);
+  let acc = 0, next = 0;
+  for (let i = 1; i < TRAILLINE.length && acc <= reach * total; i++) {
+    acc += Math.hypot(TRAILLINE[i][0] - TRAILLINE[i - 1][0], TRAILLINE[i][1] - TRAILLINE[i - 1][1]);
+    if (acc >= next) { ctx.beginPath(); ctx.arc(TRAILLINE[i][0] + MX, TRAILLINE[i][1] + MY, 3.8, 0, Math.PI * 2); ctx.fill(); next += gap; }
+  }
+}
+// ---------- the phrase ----------
+// "a little faith in impossible things" names six features, read from the upper left: two
+// massifs in spaced roman capitals along their crests, then the glacier under the high summit,
+// the river, the trail and the lake. Terrain names are black, water names blue and the trail's
+// name red, as on a Swiss sheet. The names are engraved last and in reverse, from the lake up
+// to the first word, so the phrase grows from its end: things, impossible things, and so on.
+const ROMAN = { nib: -0.45, weight: 1.35 }, NAME = { nib: -0.35, weight: 1.7, hairW: 1.0 };
+// the six names come from the phrase: massifs in capitals, every other feature's name capitalised
+const WORD = PHRASE_TO_RENDER.split(' '), CAPS = k => WORD[k].toUpperCase(), TITLE = k => WORD[k][0].toUpperCase() + WORD[k].slice(1);
+// the glacier under the c p summit's south-east face, the west basin of the lake, and the point
+// on the river beside which its name sits
+const centroid = test => { let n = 0, sx = 0, sy = 0; for (let y = 0; y < TH; y++) for (let x = 0; x < TW; x++) if (test(x, y, y * TW + x)) { n++; sx += x; sy += y; } return [sx / n + MX, sy / n + MY]; };
+const S0 = SUMMITS[0];
+const ICEC = centroid((x, y, i) => ICE[i] > 0.5 && x > S0.x + 10 && x < S0.x + 150 && y > S0.y - 5 && y < S0.y + 120);
+const LAKEW = centroid((x, y, i) => LAKEM[i] > 0.5 && x > 20 && x < 250);
+const RIVL = RIVER.reduce((b, q) => Math.abs(q[1] - 596) < Math.abs(b[1] - 596) ? q : b);
+// the trail's name is set level along the chord of its first leg, lifted clear of the dots
+const TRAILNAME = (() => {
+  const A = TRAILLEG[0], B = TRAILLEG[TRAILLEG.length - 1]; let ang = Math.atan2(B[1] - A[1], B[0] - A[0]); if (Math.cos(ang) < 0) ang += Math.PI;
+  const ux = Math.cos(ang), uy = Math.sin(ang), nx = Math.sin(ang), ny = -Math.cos(ang), mx = A[0] * 0.54 + B[0] * 0.46, my = A[1] * 0.54 + B[1] * 0.46, o = { size: 24, track: 10, ...NAME, weight: 1.55 };
+  const half = advance(TITLE(4), o.track) * o.size / 200 + 16; let dev = 0;
+  for (const q of TRAILLEG) { const along = (q[0] - mx) * ux + (q[1] - my) * uy; if (Math.abs(along) < half) dev = Math.max(dev, (q[0] - mx) * nx + (q[1] - my) * ny); }
+  return setLine(TITLE(4), { ...o, x: mx + MX + nx * (dev + 21), y: my + MY + ny * (dev + 21), angle: ang });
+})();
+// [ink, engraving starts, ends, placements], in the order they are cut
+const WORDS = [
+  ['blue', 3.0, 3.4, setLine(TITLE(5), { x: LAKEW[0], y: LAKEW[1] + 15, size: 30, track: 24, ...NAME })],
+  ['red', 3.25, 3.7, TRAILNAME],
+  ['blue', 3.55, 3.8, setLine(TITLE(3), { x: RIVL[0] + MX + 15, y: RIVL[1] + MY + 16, size: 32, align: 'left', track: 8, ...NAME })],
+  ['black', 3.7, 4.0, setLine(TITLE(2), { x: ICEC[0] + 8, y: ICEC[1] + 10, size: 28, track: 8, ...NAME })],
+  ['black', 4.45, 4.75, setPath(CAPS(1), crestPath(0), { at: 0.28, off: 30, size: 52 / 1.4, track: 46, ...ROMAN })],
+  ['black', 4.62, 4.9, setPath(CAPS(0), crestPath(1), { at: 0.1, off: 30, size: 64 / 1.4, track: 0, ...ROMAN })],
+];
+function typeAt(t) {
+  const st = WORDS.map(([, t0, t1]) => clamp((t - t0) / (t1 - t0), 0, 1)), A = {};
+  for (const ink of ['black', 'blue', 'red'])
+    A[ink] = layerAt('type-' + ink, WORDS.map((w, j) => w[0] === ink ? st[j] : '').join(), c => WORDS.forEach((w, j) => { if (w[0] === ink && st[j] > 0) engrave(c, w[3], ease(st[j])); }));
+  return A;
+}
+// The sheet's border: a neatline round the map, a heavy rule outside it and kilometre ticks between.
+function furniture(k) {
+  k.lineWidth = 1.6; k.strokeRect(MX - 0.8, MY - 0.8, TW + 1.6, TH + 1.6);
+  k.lineWidth = 6; k.strokeRect(MX - 15, MY - 15, TW + 30, TH + 30);
+  k.lineWidth = 1.4; k.beginPath();
+  for (let g = 124; g < TW; g += 124) { k.moveTo(MX + g, MY - 12); k.lineTo(MX + g, MY - 2); k.moveTo(MX + g, MY + TH + 2); k.lineTo(MX + g, MY + TH + 12); }
+  for (let g = 124; g < TH; g += 124) { k.moveTo(MX - 12, MY + g); k.lineTo(MX - 2, MY + g); k.moveTo(MX + TW + 2, MY + g); k.lineTo(MX + TW + 12, MY + g); }
+  k.stroke();
+}
+// The inflow river runs from the glacier snout to the delta, widening downstream (fr of the way),
+// then its distributaries spread across the fan (fd of their length).
+function drawRiver(b, fr, fd) {
+  if (fr <= 0) return;
+  b.save(); b.translate(MX, MY); b.lineCap = 'round'; b.lineJoin = 'round';
+  let k0 = RIVER.findIndex(p => ICE[clamp(p[1] | 0, 0, TH - 1) * TW + clamp(p[0] | 0, 0, TW - 1)] < 0.3); if (k0 < 0) k0 = 0;
+  const k1 = k0 + (RIVER.length - 1 - k0) * fr;
+  for (let k = k0 + 2; k <= k1; k += 2) {
+    b.lineWidth = 1.1 + 2.1 * (k - k0) / (RIVER.length - k0); b.beginPath(); b.moveTo(RIVER[k - 2][0], RIVER[k - 2][1]); b.lineTo(RIVER[k][0], RIVER[k][1]); b.stroke();
+  }
+  if (fd > 0) DISTRIB.forEach((line, j) => { for (let q = 1; q < line.length * fd; q++) { b.lineWidth = (j === 0 ? 3 : 2.2) * (1 - 0.6 * q / line.length) + 0.5; b.beginPath(); b.moveTo(line[q - 1][0], line[q - 1][1]); b.lineTo(line[q][0], line[q][1]); b.stroke(); } });
+  b.restore();
+}
+function bakeStatic() {
+  const k = layer(), b = layer(), h = layer();
+  furniture(k); drawStreams(b); h.fillRect(HUT[0] + MX - 5, HUT[1] + MY - 12, 10, 9);   // the hut at the trail's end
+  FURN.set(alphaOf(k)); STREAMA.set(alphaOf(b)); HUTA.set(alphaOf(h));
+}
+bakeHatch();
+bakeStatic();
+
+// ---------- film ----------
+window.__riso = { duration: DURATION, hero: HERO, ready: true, build: { end: BUILD_END }, seek(t) { compose(clamp(t, 0, DURATION)); } };
+if (!navigator.webdriver) setTimeout(() => window.__riso.seek(HERO), 0);
+</script>

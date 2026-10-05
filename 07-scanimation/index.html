@@ -1,0 +1,309 @@
+<!doctype html><meta charset="utf-8"><title>07 scanimation · a little faith in impossible things</title>
+<style>html,body{margin:0;height:100%;background:#2a2624;display:grid;place-items:center}canvas{height:96vh;width:auto;max-width:96vw}</style>
+<canvas id="c" width="1080" height="1350"></canvas>
+<script>
+/* Barrier-grid animation (scanimation). The phrase is drawn in two phases (upright, and leaning
+   right from the baseline), cut into 9 px strips and interlaced into one offset print: near-black
+   ink on vermilion board. A clear acetate printed with near-black bars (one 9 px slit per 18 px)
+   is lowered onto the card; through the slits only one phase shows, so the phrase locks upright
+   and, as the sheet creeps, sways.
+   Build: blank card; the strips print in two passes, one phase per pass; the acetate is laid. */
+'use strict';
+const PHRASE_TO_RENDER = 'a little faith in impossible things';
+const W = 1080, H = 1350, NPX = W * H, DUR = 6, BUILD_END = 4.6, HERO = 5.2;
+const N = 2, STRIP = 9;              // phases, print strip width (px): one slit in two is open
+const PB = 18.018;                   // barrier period: 2 strips plus 0.1% film stretch, one slit each
+const TILT = 0.0006;                 // acetate laid a hair off square to the print
+const YC = 860;                      // registration is best here
+const HERO_PHASE = 0;                // phase the slits sit on at the hero frame: upright
+const cv = document.getElementById('c'), cx = cv.getContext('2d');
+
+// ---------- seeded randomness (no Math.random anywhere) ----------
+function hstr(s) { let h = 2166136261 >>> 0; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+function rng(key) { let a = hstr(key); return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+function hash2(x, y, s) { let h = Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul(s | 0, 1442695041); h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; }
+const sm = t => t * t * (3 - 2 * t);
+function vnoise(x, y, s) {
+  const xi = Math.floor(x), yi = Math.floor(y), u = sm(x - xi), v = sm(y - yi);
+  const a = hash2(xi, yi, s), b = hash2(xi + 1, yi, s), c = hash2(xi, yi + 1, s), d = hash2(xi + 1, yi + 1, s);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function fbm(x, y, s, oct) { let t = 0, amp = 0.5, f = 1, n = 0; for (let o = 0; o < oct; o++) { t += amp * vnoise(x * f, y * f, s + o * 31); n += amp; amp *= 0.5; f *= 2.03; } return t / n; }
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const sstep = (a, b, v) => { const t = clamp((v - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const SEED = { card: hstr('card'), tooth: hstr('tooth'), ink: hstr('ink'), edge: hstr('edge'), bar: hstr('bar'), jit: hstr('jit'), film: hstr('film'), lift: hstr('lift') };
+
+// ---------- lettering: a condensed fat face, drawn with a flat nib held level ----------
+// Through a slit only one 9 px column in 18 is seen, so a vertical thinner than a period can fall
+// between slits and vanish, and a counter narrower than one closes. So the letters are a Victorian
+// fat face, the type of the optical-toy cards this medium came from: every vertical is the nib's
+// full width (32 px, nearly two periods), every horizontal is its edge (a 9 px hairline the slits
+// break into dashes), and every counter is at least 24 px wide.
+// Units: px; y up from the baseline. Skeletons are sampled at 0.5 px and the nib rectangle is
+// stamped along them, so stroke contrast comes from the nib, as it would in ink.
+const XH = 168, NIB_W = 32, NIB_H = 9, BOWL = 56, SPACE = 46, GAP = 18, EXP = 2.6;
+const YB = NIB_H / 2, YX = XH - NIB_H / 2, YA = 1.36 * XH - NIB_H / 2, YD = -0.34 * XH + NIB_H / 2, YM = YX - 60;
+function arcPts(cx_, cy_, rx, ry, a0, a1) {   // superellipse arc, degrees, y up
+  const pts = [], n = Math.max(8, Math.ceil(Math.abs(a1 - a0) * Math.max(rx, ry) / 25)), q = 2 / EXP;
+  for (let i = 0; i <= n; i++) {
+    const a = (a0 + (a1 - a0) * i / n) * Math.PI / 180, c = Math.cos(a), s_ = Math.sin(a);
+    pts.push([cx_ + rx * Math.sign(c) * Math.abs(c) ** q, cy_ + ry * Math.sign(s_) * Math.abs(s_) ** q]);
+  }
+  return pts;
+}
+// glyph parts: strokes {p}, balls {b: [x, y, r]}; k marks serifs, flags and bars that overhang
+// the letter's box and are ignored when spacing
+const st = p => ({ p }), kn = p => ({ p, k: 1 }), ball = (x, y, r, k) => ({ b: [x, y, r], k });
+const ln = (x0, y0, x1, y1) => [[x0, y0], [x1, y1]];
+const end = pts => pts[pts.length - 1];
+const bowl = x => st(arcPts(x + BOWL / 2, XH / 2, BOWL / 2, YX - XH / 2, 0, 360));
+const arch = (x, w) => st(arcPts(x + w / 2, YM, w / 2, YX - YM, 180, 0));
+const foot = x => kn(ln(x - 11, YB, x + 11, YB)), flag = (x, y) => kn(ln(x - 15, y, x, y));
+const GLYPH = (() => {
+  const aTop = arcPts(28, 118, 28, YX - 118, 0, 150), fTop = arcPts(30, YA - 38, 30, 38, 180, 85);
+  const gHook = arcPts(28, -18, 28, -18 - YD, 0, -162), tFoot = arcPts(30, 44, 30, 44 - YB, 180, 270);
+  return {
+    a: [st(ln(56, YB, 56, 118)), st(aTop), ball(end(aTop)[0] + 5, end(aTop)[1] - 7, 16), st(arcPts(27, 50, 27, 50 - YB, 0, 360)), kn(ln(56, YB, 70, YB))],
+    b: [st(ln(0, YB, 0, YA)), flag(0, YA), bowl(0)],
+    e: [st(arcPts(BOWL / 2, XH / 2, BOWL / 2, YX - XH / 2, 0, 318)), st(ln(0, 94, BOWL, 94))],
+    f: [st(ln(0, YB, 0, YA - 38)), st(fTop), ball(end(fTop)[0] + 6, end(fTop)[1] - 10, 15, 1), kn(ln(-14, YX, 40, YX)), foot(0)],
+    g: [bowl(0), st(ln(BOWL, YX, BOWL, -18)), st(gHook), ball(end(gHook)[0] + 5, end(gHook)[1] + 2, 15), kn(ln(BOWL, YX, BOWL + 16, YX))],
+    h: [st(ln(0, YB, 0, YA)), flag(0, YA), arch(0, BOWL), st(ln(BOWL, YM, BOWL, YB)), foot(0), foot(BOWL)],
+    i: [st(ln(0, YB, 0, YX)), flag(0, YX), foot(0), ball(0, YX + 44, 18)],
+    l: [st(ln(0, YB, 0, YA)), flag(0, YA), foot(0)],
+    m: [st(ln(0, YB, 0, YX)), flag(0, YX), arch(0, 54), st(ln(54, YM, 54, YB)), arch(54, 54), st(ln(108, YM, 108, YB)), foot(0), foot(54), foot(108)],
+    n: [st(ln(0, YB, 0, YX)), flag(0, YX), arch(0, BOWL), st(ln(BOWL, YM, BOWL, YB)), foot(0), foot(BOWL)],
+    o: [bowl(0)],
+    p: [st(ln(0, YX, 0, YD)), flag(0, YX), kn(ln(-11, YD, 11, YD)), bowl(0)],
+    s: [st(arcPts(26, YX - 42, 26, 42, 32, 270)), st(arcPts(28, (YX - 84 + YB) / 2, 28, (YX - 84 - YB) / 2, 90, -150))],
+    t: [st(ln(0, YX + 34, 0, 44)), st(tFoot), kn(ln(30, YB, 42, YB)), kn(ln(-14, YX, 38, YX))],
+  };
+})();
+// box of a glyph's spacing parts, from the skeleton plus half the nib
+const inkBox = ch => { let a = 1e9, b = -1e9;
+  for (const it of GLYPH[ch]) if (!it.k) { if (it.b) { a = Math.min(a, it.b[0] - it.b[2]); b = Math.max(b, it.b[0] + it.b[2]); } else for (const [x] of it.p) { a = Math.min(a, x - NIB_W / 2); b = Math.max(b, x + NIB_W / 2); } }
+  return [a, b]; };
+function layWord(str) {   // glyph origins for a word starting at x = 0 (unscaled); returns [origins, width]
+  const out = []; let x = 0;
+  for (let i = 0; i < str.length; i++) { const [a, b] = inkBox(str[i]); if (i) x += GAP; out.push(x - a); x += b - a; }
+  return [out, x];
+}
+// The phrase: "a little" set little, as a lead-in; then three big lines, the first two flush
+// left and "things" flush right under "impossible".
+const WORDS = PHRASE_TO_RENDER.split(' ');
+const LINES = [{ w: WORDS.slice(0, 2), sc: 0.72 }, { w: WORDS.slice(2, 4), sc: 1 }, { w: WORDS.slice(4, 5), sc: 1 }, { w: WORDS.slice(5), sc: 1, right: 1 }];
+const ASC = YA + NIB_H / 2, LEAD = 10, TOP = 362;
+const LAYOUT = (() => {
+  const lines = LINES.map(L => { let x = 0; const gl = [];
+    L.w.forEach((w, wi) => { if (wi) x += GAP + SPACE + GAP; const [o, wd] = layWord(w); o.forEach((ox, i) => gl.push([w[i], x + ox])); x += wd; });
+    return { gl, w: x * L.sc, sc: L.sc, right: L.right }; });
+  const x0 = Math.round((W - lines[2].w) / 2), right = x0 + lines[2].w;
+  let base = TOP + ASC * lines[0].sc;
+  return lines.map((l, li) => { if (li) base += ASC + LEAD; return { gl: l.gl, sc: l.sc, x: l.right ? right - l.w : x0, base, w: l.w }; });
+})();
+
+// ---------- the picture, one phase at a time (ink = opaque, card = clear) ----------
+// Phase 0 stands upright; phase 1 leans right, rooted at the baseline. The baseline is the same
+// in both, so the raw print is crisp at the foot of each letter and combs into slivers toward
+// the top, where the phases part.
+const SWAY = [0, 0.06];              // shear per phase: x shifts by SWAY * height above the baseline
+function drawPhase(g, k) {
+  g.clearRect(0, 0, W, H); g.fillStyle = '#000';
+  for (const L of LAYOUT) {
+    const sc = L.sc, sh = SWAY[k], nw = NIB_W * sc, nh = NIB_H;   // hairlines keep the full 9 px at any size
+    const X = (ox, x, y) => L.x + sc * (ox + x + sh * y), Y = y => L.base - sc * y;
+    for (const [ch, ox] of L.gl) for (const it of GLYPH[ch]) {
+      if (it.b) { g.beginPath(); g.arc(X(ox, it.b[0], it.b[1]), Y(it.b[1]), it.b[2] * sc, 0, Math.PI * 2); g.fill(); continue; }
+      const P = it.p;
+      for (let i = 1; i < P.length; i++) {
+        const [x0, y0] = P[i - 1], [x1, y1] = P[i], n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) * sc * 2));
+        for (let j = (i === 1 ? 0 : 1); j <= n; j++) {
+          const u = j / n, x = x0 + (x1 - x0) * u, y = y0 + (y1 - y0) * u;
+          g.fillRect(X(ox, x, y) - nw / 2, Y(y) - nh / 2, nw, nh);
+        }
+      }
+    }
+  }
+}
+
+// ---------- the offset print: interlace, then how ink behaves on coated board ----------
+// Strip s carries phase (-s mod N), so the picture runs forward as the acetate slides left.
+const stripPhase = s => (N - (s % N)) % N;
+// The ink is mixed to the bars' black, so through a slit a letter is as dark as the bars around it
+// and reads as a solid silhouette, as on Seder's cards.
+const VERM = [234, 78, 41], INK = [27, 25, 27], BAR = [27, 25, 27], GLINT = [255, 249, 240];
+let cardM, inkA;                     // board brightness and ink cover per pixel, baked once
+function bakePrint() {
+  const pc = document.createElement('canvas'); pc.width = W; pc.height = H;
+  const g = pc.getContext('2d', { willReadFrequently: true }), masks = [];
+  for (let k = 0; k < N; k++) {
+    drawPhase(g, k); const d = g.getImageData(0, 0, W, H).data, m = new Float32Array(NPX);
+    for (let i = 0; i < NPX; i++) m[i] = d[i * 4 + 3] / 255; masks.push(m);
+  }
+  const C = new Float32Array(NPX);
+  const FORCE = new URLSearchParams(location.search).get('phase');   // review aid: one phase, uninterlaced
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const i = y * W + x; C[i] = masks[FORCE !== null ? +FORCE : stripPhase((x / STRIP) | 0)][i]; }
+  // board fibres: short curled hairs under the coating, a little lighter (most) or darker than the board
+  const FIB = new Float32Array(NPX), fr = rng('fibre');
+  for (let f = 0; f < 70; f++) {
+    const x0 = fr() * W, y0 = fr() * H, an = fr() * Math.PI, len = 14 + 40 * fr(), cu = (fr() - 0.5) * 10, sg = fr() < 0.72 ? 1 : -1;
+    for (let s = 0; s <= len; s += 0.5) {
+      const px = x0 + Math.cos(an) * s - Math.sin(an) * cu * Math.sin(Math.PI * s / len), py = y0 + Math.sin(an) * s + Math.cos(an) * cu * Math.sin(Math.PI * s / len);
+      const ix = Math.round(px), iy = Math.round(py); if (ix < 1 || iy < 1 || ix >= W - 1 || iy >= H - 1) continue;
+      const fade = Math.sin(Math.PI * s / len) ** 0.5; FIB[iy * W + ix] = sg * fade;
+      for (const o of [1, -1, W, -W]) if (Math.abs(FIB[iy * W + ix + o]) < 0.35 * fade) FIB[iy * W + ix + o] = 0.35 * sg * fade;
+    }
+  }
+  cardM = new Float32Array(NPX); inkA = new Float32Array(NPX);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x, xm = x > 0 ? i - 1 : i, xp = x < W - 1 ? i + 1 : i, ym = y > 0 ? -W : 0, yp = y < H - 1 ? W : 0;
+    const b = (C[xm + ym] + 2 * C[i + ym] + C[xp + ym] + 2 * C[xm] + 4 * C[i] + 2 * C[xp] + C[xm + yp] + 2 * C[i + yp] + C[xp + yp]) / 16;
+    // ink spreads a little past the plate edge, and the edge wanders with the plate grain
+    const thr = 0.43 + 0.14 * (vnoise(x / 1.8, y / 1.8, SEED.edge) - 0.5);
+    let a = sstep(thr - 0.2, thr + 0.2, b);
+    // a solid lays down unevenly: soft mottle, plus rare snowflake voids where the board refused ink
+    const cxl = Math.floor(x / 16), cyl = Math.floor(y / 16);
+    if (hash2(cxl, cyl, SEED.ink) < 0.05) {
+      const px = cxl * 16 + 16 * hash2(cxl, cyl, 7), py = cyl * 16 + 16 * hash2(cxl, cyl, 9), rr = 0.6 + 1.1 * hash2(cxl, cyl, 11);
+      a *= 1 - 0.75 * (1 - sstep(rr * 0.5, rr, Math.hypot(x - px, y - py)));
+    }
+    const fib = FIB[i]; if (fib > 0) a *= 1 - 0.32 * fib;          // a fibre lifts the ink a little
+    const dens = 0.93 + 0.05 * fbm(x / 36, y / 36, SEED.ink, 3) + 0.02 * fbm(x / 8, y / 8, SEED.ink + 5, 2);   // a dense, opaque black
+    const m = (1 + 0.065 * (fbm(x / 120, y / 120, SEED.card, 4) - 0.5) + 0.025 * (fbm(x / 14, y / 14, SEED.card + 3, 2) - 0.5)
+      + 0.035 * (vnoise(x / 1.5, y / 1.5, SEED.tooth) - 0.5)) * (1 + 0.07 * fib);
+    cardM[i] = m; inkA[i] = a * dens;
+  }
+}
+
+// ---------- the build ----------
+// The strips print in two passes, one phase per pass, the press running left to right and then
+// back. Each pass sets its strips in an eased sweep, and each strip's ink runs down the card from
+// top to bottom, so the letters arrive as hatching and then fill in, combed.
+const PASS_T = [0.5, 1.5], SWEEP = 1.0, UNROLL = 0.34, PY0 = 320, PY1 = 1320;
+const PX0 = LAYOUT[2].x - 40, PX1 = LAYOUT[2].x + LAYOUT[2].w + 40;
+const sinv = y => 0.5 - Math.sin(Math.asin(clamp(1 - 2 * y, -1, 1)) / 3);   // inverse smoothstep
+const NSTRIP = Math.ceil(W / STRIP);
+const STRIP_T = Array.from({ length: NSTRIP }, (_, s) => {
+  const k = stripPhase(s); let u = clamp((s * STRIP + 3 - PX0) / (PX1 - PX0), 0, 1); if (k === 1) u = 1 - u;
+  return PASS_T[k] + SWEEP * sinv(u) + 0.06 * (hash2(s, 3, 91) - 0.5);
+});
+const stripFront = (s, t) => PY0 + (PY1 - PY0) * sm(clamp((t - STRIP_T[s]) / UNROLL, 0, 1));
+
+// ---------- the acetate ----------
+// It is lowered onto the card. Held above it, the sheet is nearer the camera, so it draws a little
+// larger about a point on its top edge and its bar pitch runs a touch wider than the print's: moiré
+// fringes sweep out across the phrase. It is out of focus and its shadow falls wide and soft. As
+// it lands, the fringes slow and widen to nothing, the shadow closes in, and the phrase locks
+// upright. In the hold it creeps one bar period left, so the phrase leans and straightens once.
+const TOP_EDGE = 350, CORNER = 16, EDGE_REST = 50, SCX = W / 2, SCY = TOP_EDGE;   // scaled about the top edge's line, so the sheet stays below the caption
+const T_IN = 3.05, T_SEEN = 0.4, T_LAND = 4.4, LIFT_SCALE = 0.05, BLUR_MAX = 16, T_CREEP = 5.25, T_CREEP_END = DUR;
+const heightAt = t => 1 - sm(clamp((t - T_IN) / (T_LAND - T_IN), 0, 1));     // 1 held up, 0 on the card
+const presenceAt = t => sm(clamp((t - T_IN) / T_SEEN, 0, 1));                 // it arrives out of focus
+const creepAt = t => PB * sm(clamp((t - T_CREEP) / (T_CREEP_END - T_CREEP), 0, 1));
+// Where the bars start relative to the cut edge: chosen so that once the sheet lies on the card
+// the slits sit squarely on the upright phase's strips mid-card.
+const DELTA = (() => {
+  let s0 = Math.round(600 / STRIP); while (stripPhase(s0) !== HERO_PHASE) s0++;
+  const m0 = Math.round((STRIP * s0 - EDGE_REST) / PB);
+  let d = STRIP * s0 - m0 * PB - EDGE_REST; d = ((d % PB) + PB) % PB; return d;
+})();
+// Bar coverage of a square wave (bar where frac(u) >= 1/N), seen through a tent filter of half-width
+// w: Gbar is the bar indicator integrated twice, so pixel area and defocus come out exact.
+const Gbar = u => { const f = Math.floor(u), r = u - f, a = 1 - 1 / N; return a * f * (f - 1) / 2 + f * a * a / 2 + r * f * a + Math.max(0, r - 1 / N) ** 2 / 2; };
+const barTent = (u, w) => (Gbar(u + w) - 2 * Gbar(u) + Gbar(u - w)) / (w * w);
+// signed distance into the sheet from its cut edges (left, top, a die-cut corner); NL is 1 on the
+// left edge and 0 on the top edge
+let NL = 0;
+function sheetFd(fx, fy) {
+  if (fx < CORNER && fy < CORNER) { const ax = CORNER - fx, ay = CORNER - fy; NL = ax / (ax + ay + 1e-9); return CORNER - Math.hypot(ax, ay); }
+  if (fx < fy) { NL = 1; return fx; } NL = 0; return fy;
+}
+// horizontal hairline scratches from sliding, fixed to the film
+const SCR = (() => { const r = rng('scratch'), a = []; for (let i = 0; i < 6; i++) a.push({ x: 20 + 640 * r(), y: 60 + 1230 * r(), len: 90 + 260 * r(), bow: (r() - 0.5) * 6, a: 0.035 + 0.04 * r() }); return a; })();
+
+function compose(t) {
+  const hn = heightAt(t), pres = presenceAt(t), S = 1 + LIFT_SCALE * hn, c = creepAt(t);
+  const rb = 0.5 + BLUR_MAX * hn ** 1.5, ks = 1 / (1 + 0.35 * rb);   // defocus radius (px) and how much fine detail survives it
+  const ox = 1 + 48 * hn, oy = 1 + 30 * hn, rsE = 1 + 14 * hn, rsB = 0.6 + 12 * hn;   // shadow offset down-left; penumbra of the outline and of each bar (px)
+  const bx = EDGE_REST + DELTA, img = cx.createImageData(W, H), o = img.data;
+  const FR = new Float32Array(NSTRIP); for (let s = 0; s < NSTRIP; s++) FR[s] = t > STRIP_T[s] ? stripFront(s, t) : -1e9;
+  const blurG = (d, c0, w, a) => a * w / (w + rb) * Math.exp(-(((d - c0) / (w + rb)) ** 2));   // an edge highlight, defocused
+  for (let y = 0; y < H; y++) {
+    const Y = SCY + (y + 0.5 - SCY) / S, Y2 = SCY + (y + 0.5 - oy - SCY) / S;   // film rows seen here, and casting the shadow here
+    const ex = EDGE_REST - (Y - YC) * TILT + 1.6 * (fbm(Y / 240, 0.5, SEED.edge, 3) - 0.5) * 2, us = (Y - YC) * TILT;
+    const ex2 = EDGE_REST - (Y2 - YC) * TILT;
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x, light = 1.035 - 0.075 * (0.55 * (1 - x / W) + 0.45 * y / H);   // one window, upper right
+      // the print so far: this strip's ink has run down to its front
+      const m = cardM[i], ae = inkA[i] * clamp((FR[(x / STRIP) | 0] - y) / 14 + 0.5, 0, 1);
+      let r = VERM[0] * m * (1 - ae) + (INK[0] + VERM[0] * m * 0.02) * ae, R = 0;
+      let g = VERM[1] * m * (1 - ae) + (INK[1] + VERM[1] * m * 0.02) * ae;
+      let b = VERM[2] * m * (1 - ae) + (INK[2] + VERM[2] * m * 0.02) * ae;
+      if (pres > 0) {
+        const xs = SCX + (x + 0.5 - SCX) / S + c, fx = xs - ex;
+        const fd = sheetFd(fx, Y - (TOP_EDGE + 1.2 * (fbm((xs - EDGE_REST) / 260, 7.5, SEED.edge, 2) - 0.5) * 2)), nl = NL, fdS = fd * S;
+        // The sheet's shadow on the card: the bars cast stripes at the print's own pitch, offset down and
+        // left by the sheet's height and softened by the window's size. The camera sees those stripes
+        // through slits at the sheet's larger pitch, so they beat into moiré fringes; as the sheet lands
+        // the offset closes, the fringes slow and widen, and the shadow tucks in under the edge.
+        const inSh = sstep(-rsE, rsE, sheetFd(SCX + (x + 0.5 + ox - SCX) / S + c - ex2, Y2 - TOP_EDGE) * S);
+        const lift = 0.5 + 2.2 * Math.exp(-Math.max(fd, 0) / 50) + 0.5 * fbm(xs / 300, Y / 300, SEED.lift, 2) + ox - 1;
+        const shS = barTent((x + 0.5 + c - bx + us + lift) / PB, Math.max(0.6, rsB) / PB);
+        let q = 1 - pres * inSh * (0.06 + 0.3 * shS);
+        if (fd < 0 && fd > -14) q *= 1 - (1 - hn) * 0.3 * nl * Math.exp(fd / 4.5) * (0.7 + 0.3 * fbm(Y / 150, 4.5, SEED.lift, 2));   // the curled edge, once down
+        r *= q; g *= q; b *= q;
+        const rN = r, gN = g, bN = b;
+        const cov = pres * clamp(fdS / (2 * Math.max(rb, 0.5)) + 0.5, 0, 1);
+        if (cov > 0) {
+          const X = xs - bx;                                        // film coordinate
+          let u = (X + us) / PB; u += 0.012 * (vnoise(Math.floor(u + 0.25) * 5.1, Y / 7, SEED.jit) - 0.5) * 2;
+          let bc = barTent(u, Math.max(0.6, rb) / (S * PB));
+          // pinholes in the screen-printed bars
+          const pcx = Math.floor(X / 22), pcy = Math.floor(Y / 22);
+          if (hash2(pcx, pcy, SEED.bar) < 0.035) {
+            const hx = pcx * 22 + 22 * hash2(pcx, pcy, 3), hy = pcy * 22 + 22 * hash2(pcx, pcy, 5), hr = 0.5 + 0.9 * hash2(pcx, pcy, 8);
+            bc *= 1 - ks * (1 - sstep(hr * 0.4, hr, Math.hypot(X - hx, Y - hy)));
+          }
+          const bd = 0.85 + 0.3 * vnoise(X / 26, Y / 26, SEED.bar);
+          let tr = 0.97;                                            // the view through the film
+          // dust on the film: bright on the bars, a dark fleck in the slits
+          const dcx = Math.floor(X / 64), dcy = Math.floor(Y / 64);
+          if (hash2(dcx, dcy, SEED.film) < 0.22) {
+            const qx = dcx * 64 + 64 * hash2(dcx, dcy, 2), qy = dcy * 64 + 64 * hash2(dcx, dcy, 4), qr = 0.6 + 1.6 * hash2(dcx, dcy, 6);
+            const dm = ks * (1 - sstep(qr * 0.4, qr, Math.hypot(X - qx, Y - qy))); R += 0.16 * dm; tr *= 1 - 0.55 * dm;
+          }
+          let fr = r * tr * (1 - bc) + (BAR[0] * bd + r * 0.035) * bc;
+          let fg = g * tr * (1 - bc) + (BAR[1] * bd + g * 0.035) * bc;
+          let fb = b * tr * (1 - bc) + (BAR[2] * bd + b * 0.035) * bc;
+          // reflections live on the film surface: room veil, the window sheen, the curl, a thumbprint
+          let Rf = 0.018;                                          // the room, faintly, in the gloss
+          const dist = (x - 420) * 0.357 + (y - 700) * 0.934 + 64 * (fbm(x / 200, y / 200, SEED.film + 1, 3) - 0.5);   // the sheet is not flat, so its reflection wavers
+          const along = (x - 420) * 0.934 - (y - 700) * 0.357, fade = sstep(-60, 160, along) * (1 - sstep(420, 640, along));
+          Rf += fade * (0.115 * sstep(-96, -70, dist) * Math.exp(-((Math.max(dist + 70, 0) / 120) ** 2)) + 0.05 * Math.exp(-(((dist + 132) / 16) ** 2)));
+          const crest = 0.55 + 0.45 * fbm(Y / 180, 2.5, SEED.lift, 2);   // where the curled edge faces the window
+          Rf += nl * crest * (blurG(fdS, 4.5, 1.6, 0.26) + blurG(fdS, 16, 8, 0.07));
+          Rf += (1 - nl) * (blurG(fdS, 0.9, 0.9, 0.34) + blurG(fdS, 9, 5, 0.05));   // the top edge faces the window
+          const pxp = fx - 72, pyp = Y - 1196, cr = Math.cos(0.35), sr = Math.sin(0.35);
+          const qx = (pxp * cr + pyp * sr) / 30, qy = (-pxp * sr + pyp * cr) / 42, re = Math.hypot(qx, qy);
+          if (re < 1.6) { const env = Math.exp(-(re ** 4)); Rf += ks * env * (0.016 + 0.034 * (0.5 + 0.5 * Math.cos(re * 60 + 3 * vnoise(qx * 3, qy * 3, 77)))); }
+          for (const s of SCR) {
+            const ax = X - s.x; if (ax < 0 || ax > s.len) continue;
+            const yy = s.y + s.bow * Math.sin(Math.PI * ax / s.len), dd = Math.abs(Y - yy);
+            if (dd < 1.4) Rf += ks * s.a * (1 - dd / 1.4);
+          }
+          R += Rf;
+          if (fdS >= 0 && fdS < 2.2 + rb) { const q2 = 1 - ks * nl * (0.45 - 0.25 * clamp(fdS / (2.2 + rb), 0, 1)); fr *= q2; fg *= q2; fb *= q2; }   // left cut face, turned from the light
+          r = rN + (fr - rN) * cov; g = gN + (fg - gN) * cov; b = bN + (fb - bN) * cov; R *= cov;
+        } else { r = rN; g = gN; b = bN; }
+      }
+      o[i * 4] = r * light + R * GLINT[0]; o[i * 4 + 1] = g * light + R * GLINT[1]; o[i * 4 + 2] = b * light + R * GLINT[2]; o[i * 4 + 3] = 255;
+    }
+  }
+  cx.putImageData(img, 0, 0);
+}
+function seek(t) { compose(clamp(t, 0, DUR)); }
+window.__riso = { duration: DUR, ready: false, seek, hero: HERO, build: { end: BUILD_END } };
+bakePrint();
+seek(Number(new URLSearchParams(location.search).get('t')) || HERO);
+window.__riso.ready = true;
+</script>

@@ -1,0 +1,802 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>12 kintsugi</title>
+<style>html,body{margin:0;background:#2b2926}canvas{display:block;width:720px;height:900px}</style>
+</head><body><canvas id="c" width="1080" height="1350"></canvas>
+<script>
+"use strict";
+// a little faith in impossible things. A black raku tea bowl seen from directly above on linen.
+// It is set down whole, breaks, its shards rejoin, and the gold of the kintsugi repair, flowing
+// into each seam in turn, writes the phrase in a joined hand: the fracture is the handwriting.
+const PHRASE_TO_RENDER = 'a little faith in impossible things';
+// The frame is 1080 x 1350. The scene is baked in a world FY px taller and the frame shows its
+// lower part (frame y = world y - FY), so the bowl, its foot and its shadow end 24 px or more above
+// the film's edge strip (y 1250). The linen is drawn in frame coordinates, so it fills the frame as before.
+const W = 1080, HF = 1350, FY = 290, H = HF + FY, N = W * H, DUR = 6, BUILD_END = 4.6, HERO = 5.2;
+const cv = document.getElementById('c'), cx = cv.getContext('2d');
+
+// ---------- seeded randomness ----------
+function hash(s) { let h = 2166136261 >>> 0; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+function rngFor(key) {
+  let a = hash(key);
+  return () => { a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+function noiseFor(key) {
+  const r = rngFor(key), P = new Uint8Array(512), G = new Float32Array(256);
+  for (let i = 0; i < 256; i++) { P[i] = i; G[i] = r() * 2 - 1; }
+  for (let i = 255; i > 0; i--) { const j = (r() * (i + 1)) | 0, t = P[i]; P[i] = P[j]; P[j] = t; }
+  for (let i = 0; i < 256; i++) P[i + 256] = P[i];
+  return (x, y) => {
+    const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi, X = xi & 255, Y = yi & 255;
+    const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+    const a = G[P[P[X] + Y]], b = G[P[P[X + 1] + Y]], c = G[P[P[X] + Y + 1]], d = G[P[P[X + 1] + Y + 1]];
+    return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+  };
+}
+function fbm(n, x, y, oct) { let s = 0, a = .5, f = 1; for (let i = 0; i < oct; i++) { s += a * n(x * f + i * 17.3, y * f - i * 9.1); f *= 2.03; a *= .5; } return s; }
+// integer-lattice white noise, stable per pixel
+function white(x, y, k) { let h = Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul(k, 2246822519); h = Math.imul(h ^ h >>> 13, 1274126177); return ((h ^ h >>> 16) >>> 0) / 4294967296; }
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const sstep = (a, b, v) => { const t = clamp((v - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const mix = (a, b, t) => a + (b - a) * t;
+const DEG = Math.PI / 180;
+const toS = v => v <= 0 ? 0 : v >= 1 ? 255 : Math.round(255 * Math.pow(v, 1 / 2.2));
+
+// ---------- light: one window light low on the upper left, raking ----------
+const ELEV = 63 * Math.PI / 180, TANE = Math.tan(ELEV);   // high enough that the rim's shade ends above the first line
+const L2 = [-0.5, -0.866];                       // horizontal direction toward the light
+const LV = [L2[0] * Math.cos(ELEV), L2[1] * Math.cos(ELEV), Math.sin(ELEV)];
+const HV = (() => { const h = [LV[0], LV[1], LV[2] + 1], l = Math.hypot(...h); return h.map(v => v / l); })();
+const KEY = [1.0, .975, .94], SKY = [.25, .26, .285];   // the window, and the room's diffuse fill
+
+// ---------- the bowl: a hand-pinched chawan whose well sits off centre ----------
+const CX = 540, CY = 868, R0 = 470, SC = R0 / 470, LIPW = 62, DEPTH = 250, LIP = 26, HB = 380;
+const FC = [CX + 12, CY + 2], RF = 0.6 * R0;   // a broad flat well, so the phrase lies level
+const rimN = noiseFor('rim'), floorN = noiseFor('floor'), lipN = noiseFor('lip');
+function angDiff(a, b) { let d = a - b; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; }
+const pinchAt = th => Math.exp(-((angDiff(th, 2.5) / .34) ** 2));
+function rimOuter(th) {
+  const c = Math.cos(th), s = Math.sin(th);
+  const pinch = -.05 * pinchAt(th) - .032 * Math.exp(-((angDiff(th, -.5) / .42) ** 2));
+  return R0 * (1 + .02 * Math.sin(2 * th + .7) + .013 * Math.sin(3 * th + 2.1) + .009 * Math.sin(4 * th + 5.2) + .005 * Math.sin(5 * th + 4) + .008 * rimN(c * 1.6 + 5, s * 1.6 + 5) + pinch);
+}
+function rimInner(th) {
+  const c = Math.cos(th), s = Math.sin(th);
+  return rimOuter(th) - (LIPW * (1 - .3 * pinchAt(th)) + 8 * Math.sin(th * 2 + 1.3) + 5 * rimN(c * 2.2 + 11, s * 2.2 + 3));
+}
+// distance from the bowl's centre, along angle th, to the edge of the floor of the well
+function floorEdge(th) {
+  const dx = Math.cos(th), dy = Math.sin(th), fx = FC[0] - CX, fy = FC[1] - CY;
+  const rf = RF * (1 + .07 * floorN(dx * 1.4 + 3, dy * 1.4 + 7) + .035 * Math.sin(3 * th + 1));
+  const b = dx * fx + dy * fy; return b + Math.sqrt(Math.max(0, b * b - (fx * fx + fy * fy) + rf * rf));
+}
+// The lip is no tube: some runs were cut flat, others keep the potter's round, the pinch rises
+// and narrows, and a few spatula cuts leave planar facets on the inner shoulder.
+const FACETS = [[200, 16], [-38, 13], [72, 11], [128, 9], [-150, 10]], HERA = [[172, 24], [236, 18], [18, 16], [98, 22], [-72, 15], [-118, 12]];
+function lipZ(u, th) {
+  const flat = sstep(-.35, .15, lipN(Math.cos(th) * 1.3 + 2, Math.sin(th) * 1.3 + 8));
+  const dome = Math.pow(Math.max(0, 1 - u * u), .55), slab = Math.pow(Math.max(0, 1 - u ** 6), .35);
+  let z = LIP * (1 + .35 * pinchAt(th)) * mix(dome, slab, flat) - LIP;
+  for (const [a, w] of FACETS) {
+    const m = sstep(w / 2 + 3, w / 2 - 3, Math.abs(angDiff(th, a * DEG)) / DEG);
+    if (m > 0 && u < .2) { const chord = mix(-13, -.6, (u + .85) / 1.05); z = mix(z, Math.max(z - 3, Math.min(z, chord)), m); }
+  }
+  // spatula (hera) cuts down the outside of the lip, each a flat plane
+  for (const [a, w] of HERA) {
+    const m = sstep(w / 2 + 2, w / 2 - 2, Math.abs(angDiff(th, a * DEG)) / DEG);
+    if (m > 0 && u > .25) z = mix(z, Math.max(z - 4.5, Math.min(z, mix(-1.2, -LIP * .8, (u - .25) / .75))), m);
+  }
+  return z;
+}
+// height of the glaze surface, 0 at the top of the lip, before facets and texture
+function zProfile(x, y, r, th, ro, ri) {
+  if (r >= ri) return lipZ(2 * (r - ri) / (ro - ri) - 1, th);
+  const rf = floorEdge(th);
+  if (r > rf) { const u = (ri - r) / (ri - rf); return -LIP - (DEPTH - LIP) * (1 - Math.pow(1 - u, 2.2)); }
+  const q = r / rf, d = 1 - q * q, w = Math.hypot(x - FC[0] - 10, y - FC[1] - 6) / 74, well = w < 1 ? (1 - w * w) ** 2 : 0;
+  return -DEPTH - 16 * d * d - 9 * well;
+}
+// the rim shades the inner wall: a crescent of shade on the side toward the window
+function innerVis(x, y, z) {
+  const rise = Math.max(0, -6 - z) / TANE, qx = x + L2[0] * rise - CX, qy = y + L2[1] * rise - CY;
+  const th = Math.atan2(qy, qx), pen = 2 + rise * .07;
+  return sstep(-pen, pen, rimInner(th) + 4 - Math.hypot(qx, qy));
+}
+// the bowl's shadow on the cloth: its outline stacked by height, foot ring up to rim
+function outerFrac(h) { return h < .07 ? .44 : h < .2 ? mix(.44, .9, sstep(.07, .2, h)) : mix(.9, 1, sstep(.2, 1, h)); }
+function groundVis(x, y) {
+  let v = 1;
+  for (let k = 0; k <= 20; k++) {
+    const h = k / 20, ht = h * HB, o = ht / TANE, ox = x - (CX - L2[0] * o), oy = y - (CY - L2[1] * o);
+    const d = Math.hypot(ox, oy) - rimOuter(Math.atan2(oy, ox)) * outerFrac(h), pen = 1.5 + ht * .045;
+    if (d < pen) v = Math.min(v, sstep(-pen, pen, d));
+  }
+  return v;
+}
+// ---------- paths ----------
+function smoothPath(ctrl, closed, sub = 10) {
+  const out = [], n = ctrl.length, m = closed ? n : n - 1;
+  const P = i => closed ? ctrl[(i % n + n) % n] : ctrl[clamp(i, 0, n - 1)];
+  for (let i = 0; i < m; i++) {
+    const p0 = P(i - 1), p1 = P(i), p2 = P(i + 1), p3 = P(i + 2);
+    for (let k = 0; k < sub; k++) {
+      const t = k / sub, t2 = t * t, t3 = t2 * t, c = j => .5 * (2 * p1[j] + (-p0[j] + p2[j]) * t + (2 * p0[j] - 5 * p1[j] + 4 * p2[j] - p3[j]) * t2 + (-p0[j] + 3 * p1[j] - 3 * p2[j] + p3[j]) * t3);
+      out.push([c(0), c(1)]);
+    }
+  }
+  out.push(closed ? out[0].slice() : ctrl[n - 1].slice());
+  return out;
+}
+function resample(pts, step) {
+  const cum = [0];
+  for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
+  const L = cum[cum.length - 1], n = Math.max(2, Math.round(L / step) + 1), p = [], s = [];
+  let j = 0;
+  for (let k = 0; k < n; k++) {
+    const d = L * k / (n - 1);
+    while (j < cum.length - 2 && cum[j + 1] < d) j++;
+    const t = (d - cum[j]) / Math.max(1e-9, cum[j + 1] - cum[j]);
+    p.push([mix(pts[j][0], pts[j + 1][0], t), mix(pts[j][1], pts[j + 1][1], t)]); s.push(d);
+  }
+  return { p, s, L };
+}
+function roundPts(p, closed, rad) {   // moving average: rounds the corners of a polyline
+  const n = p.length, m = closed ? n - 1 : n, out = [];
+  for (let i = 0; i < n; i++) {
+    let sx = 0, sy = 0, c = 0;
+    for (let j = -rad; j <= rad; j++) { let q = i + j; if (closed) q = ((q % m) + m) % m; else q = clamp(q, 0, n - 1); sx += p[q][0]; sy += p[q][1]; c++; }
+    out.push(closed || (i > 0 && i < n - 1) ? [sx / c, sy / c] : p[i].slice());
+  }
+  return out;
+}
+function tangents(p, closed) {
+  const n = p.length, T = [];
+  for (let i = 0; i < n; i++) {
+    const a = closed ? p[(i - 2 + n - 1) % (n - 1)] : p[Math.max(0, i - 2)], b = closed ? p[(i + 2) % (n - 1)] : p[Math.min(n - 1, i + 2)];
+    const tx = b[0] - a[0], ty = b[1] - a[1], l = Math.hypot(tx, ty) || 1; T.push([tx / l, ty / l]);
+  }
+  return T;
+}
+// A crack that wanders: a coarse route, smoothed, then pushed sideways by noise along its length,
+// with a few sudden jogs where the fracture changed plane. Width swells where lacquer pooled.
+function crack(ctrl, o) {
+  const base = resample(roundPts(resample(o.closed ? [...ctrl, ctrl[0]] : ctrl, 2).p, o.closed, o.round ?? 5), 2), n4 = noiseFor(o.key + 'f'), n1 = noiseFor(o.key + 'a'), n2 = noiseFor(o.key + 'b'), n3 = noiseFor(o.key + 'w');
+  const r = rngFor(o.key + 'j'), L = base.L, T = tangents(base.p, o.closed), amp = o.amp ?? 3.2, jogs = [];
+  if (!o.closed && o.jog !== false) for (let k = 0; k < Math.floor(L / 60); k++) jogs.push([20 + r() * (L - 40), (r() - .5) * amp * 1.4]);
+  const pairs = []; if (o.closed) for (let k = 0; k < Math.floor(L / 110); k++) { const s0 = r() * L; pairs.push([s0, s0 + 18 + 40 * r(), (r() - .5) * amp * 1.6]); }
+  const n5 = noiseFor(o.key + 's');
+  const P = [], Wd = [];
+  for (let i = 0; i < base.p.length; i++) {
+    const s = base.s[i];
+    let f1, f2, f3;
+    if (o.closed) { const ph = 2 * Math.PI * s / L, rr = L / (2 * Math.PI); f1 = n1(rr / 46 * Math.cos(ph) + 9, rr / 46 * Math.sin(ph) + 9); f2 = n2(rr / 11 * Math.cos(ph) + 3, rr / 11 * Math.sin(ph) + 3); f3 = n3(rr / 30 * Math.cos(ph) + 5, rr / 30 * Math.sin(ph) + 5); }
+    else { f1 = n1(s / 46, 9.5); f2 = n2(s / 11, 3.5); f3 = n3(s / 30, 5.5); }
+    let d = amp * (.7 * f1 + .45 * f2) + (o.rough ?? .6) * n4(s / 4.5, 1.5);
+    for (const [s0, j] of jogs) d += j * sstep(s0 - 2.5, s0 + 2.5, s);
+    for (const [s0, s1, j] of pairs) d += j * (sstep(s0 - 2, s0 + 2, s) - sstep(s1 - 2, s1 + 2, s));
+    P.push([base.p[i][0] - T[i][1] * d, base.p[i][1] + T[i][0] * d]);
+    const rw = L / (2 * Math.PI * 80), sw = o.closed ? n5(rw * Math.cos(2 * Math.PI * s / L) + 4, rw * Math.sin(2 * Math.PI * s / L) + 4) : n5(s / 80, 4);
+    let w = o.w * clamp(1 + .75 * sw + .12 * f3, .6, 1.4) * (o.wf ? o.wf(base.p[i][0] - CX, base.p[i][1] - CY) : 1);
+    if (o.tipA) w *= .3 + .7 * sstep(0, o.tipA, s);
+    if (o.tipB) w *= .3 + .7 * sstep(0, o.tipB, L - s);
+    Wd.push(Math.max(1.1, w));
+  }
+  return { P, Wd };
+}
+
+// ---------- the seam field: every seam and brush line is a union of round-capped segments ----------
+// E = signed distance to the gold edge (negative inside), WD = local half-width, SID = seam,
+// SP = how far along its seam the nearest point lies (0..1), which drives the fill in time.
+const E = new Float32Array(N).fill(99), WD = new Float32Array(N), SID = new Int16Array(N).fill(-1), SP = new Float32Array(N);
+const SEAMS = [];   // {kind, t0, t1: gold flows; c0, c1: the crack runs; wet}
+function addSeam(P, Wd, kind, t0, t1, wet = 0, c0 = 0, c1 = 0) {
+  const id = SEAMS.length;
+  const cum = [0]; for (let i = 1; i < P.length; i++) cum.push(cum[i - 1] + Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]));
+  const Ltot = Math.max(1e-6, cum[cum.length - 1]); SEAMS.push({ kind, t0, t1, wet, c0, c1, L: Math.max(Ltot, 6) });
+  for (let i = 0; i < P.length - 1 || (P.length === 1 && i === 0); i++) {
+    const a = P[i], b = P[Math.min(i + 1, P.length - 1)], wa = Wd[i], wb = Wd[Math.min(i + 1, P.length - 1)];
+    const m = Math.max(wa, wb) + 4, x0 = Math.max(0, Math.floor(Math.min(a[0], b[0]) - m)), x1 = Math.min(W - 1, Math.ceil(Math.max(a[0], b[0]) + m));
+    const y0 = Math.max(0, Math.floor(Math.min(a[1], b[1]) - m)), y1 = Math.min(H - 1, Math.ceil(Math.max(a[1], b[1]) + m));
+    const dx = b[0] - a[0], dy = b[1] - a[1], ll = dx * dx + dy * dy;
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      const px = x + .5 - a[0], py = y + .5 - a[1], t = ll > 0 ? clamp((px * dx + py * dy) / ll, 0, 1) : 0;
+      const d = Math.hypot(px - t * dx, py - t * dy), w = mix(wa, wb, t), e = d - w, k = y * W + x;
+      if (e < E[k]) { E[k] = e; WD[k] = w; SID[k] = id; SP[k] = (cum[i] + t * (cum[Math.min(i + 1, P.length - 1)] - cum[i])) / Ltot; }
+    }
+  }
+  return id;
+}
+// a group of strokes written one after another inside [t0, t1], each getting time by its length
+function addGroup(strokes, kind, t0, t1, wet = 0, c0 = 0, c1 = 0) {
+  const lens = strokes.map(s => { let l = 0; for (let i = 1; i < s.P.length; i++) l += Math.hypot(s.P[i][0] - s.P[i - 1][0], s.P[i][1] - s.P[i - 1][1]); return Math.max(l, 6); });
+  const tot = lens.reduce((a, b) => a + b, 0); let acc = 0;
+  for (let i = 0; i < strokes.length; i++) {
+    const f0 = acc / tot, f1 = (acc += lens[i]) / tot;
+    addSeam(strokes[i].P, strokes[i].Wd, kind, mix(t0, t1, f0), mix(t0, t1, f1), wet, mix(c0, c1, f0), mix(c0, c1, f1));
+  }
+}
+
+// ---------- the phrase, written by the fracture: a joined hand in which every letter is crack ----------
+// Each glyph is a path in x-height units (baseline 0, up positive) from its entry to its exit.
+// Retraced runs (the top of an a, the stem of a t) lie on themselves, so they read as one line.
+// hi: the glyph leaves at the x-height, so the next glyph drops its baseline entry.
+const CUR = {
+  a: { w: .98, p: [[0, 0], [.06, .35], [.13, .78], [.38, 1], [.78, .94], [.38, 1], [.1, .7], [.06, .3], [.3, 0], [.62, .12], [.79, .55], [.8, .95], [.79, .3], [.84, .05], [.98, .02]] },
+  l: { w: .62, p: [[0, 0], [.3, .55], [.52, 1.3], [.54, 1.66], [.42, 1.76], [.3, 1.5], [.22, .8], [.2, .2], [.3, 0], [.62, .04]] },
+  i: { w: .5, p: [[0, 0], [.28, 1], [.24, .25], [.32, 0], [.5, .04]], dot: [.33, 1.55] },
+  t: { w: .56, p: [[0, 0], [.3, .7], [.42, 1.48], [.32, .6], [.3, .15], [.4, 0], [.56, .04]], bar: [.05, .98, .66, 1.0] },
+  e: { w: .72, p: [[0, 0], [.35, .3], [.6, .55], [.6, .82], [.42, .94], [.2, .74], [.14, .36], [.3, .05], [.55, 0], [.72, .06]] },
+  f: { w: .62, p: [[0, 0], [.3, .5], [.54, 1.3], [.57, 1.65], [.45, 1.76], [.34, 1.5], [.29, .8], [.24, 0], [.18, -.55], [.12, -.85], [.22, -.82], [.34, -.42], [.5, 0], [.62, .04]] },
+  h: { w: .88, p: [[0, 0], [.3, .55], [.5, 1.3], [.52, 1.66], [.4, 1.76], [.29, 1.5], [.21, .7], [.16, 0], [.22, .5], [.45, .95], [.65, .86], [.69, .4], [.68, 0], [.88, .04]] },
+  n: { w: .92, p: [[0, 0], [.12, .7], [.22, .96], [.16, .4], [.13, 0], [.2, .5], [.45, .96], [.66, .86], [.7, .4], [.7, 0], [.92, .04]] },
+  m: { w: 1.28, p: [[0, 0], [.12, .7], [.22, .96], [.16, .4], [.13, 0], [.2, .5], [.42, .96], [.6, .86], [.62, .4], [.6, 0], [.66, .5], [.86, .96], [1.04, .86], [1.06, .4], [1.07, 0], [1.28, .04]] },
+  p: { w: .96, p: [[0, 0], [.22, .75], [.28, 1], [.25, .3], [.2, -.85], [.25, -.2], [.28, .4], [.42, .85], [.68, .94], [.86, .55], [.76, .12], [.46, .02], [.3, .15], [.6, 0], [.96, .04]] },
+  o: { w: .86, hi: 1, p: [[0, 0], [.1, .3], [.2, .75], [.45, .98], [.7, .75], [.72, .35], [.5, .02], [.22, .08], [.1, .3], [.2, .75], [.45, .98], [.86, .86]] },
+  s: { w: .64, p: [[0, 0], [.3, 1.02], [.46, .62], [.5, .3], [.37, .04], [.1, .08], [.32, 0], [.64, .04]] },
+  b: { w: .86, hi: 1, p: [[0, 0], [.3, .55], [.5, 1.3], [.52, 1.66], [.4, 1.76], [.29, 1.5], [.21, .7], [.16, .05], [.36, 0], [.62, .15], [.7, .5], [.6, .86], [.4, .86], [.26, .72], [.46, .84], [.86, .82]] },
+  g: { w: .92, p: [[0, 0], [.06, .35], [.13, .78], [.38, 1], [.76, .94], [.38, 1], [.1, .7], [.06, .3], [.3, 0], [.62, .12], [.77, .55], [.78, .95], [.76, .1], [.7, -.55], [.5, -.85], [.3, -.72], [.45, -.35], [.78, -.02], [.92, .04]] },
+};
+const XH = 58, SLANT = .2, SPACE = 1.15;
+// one line of the phrase: its crack path in px, cut into words and the joins between them, plus
+// the i dots and t bars. A join is a finer crack that dips 0.3 x-height below the baseline in a
+// shallow V with a jog on its way up, so the words stand apart and the join reads as fracture.
+function cursiveLine(str, cx0, by) {
+  let w = 0; for (const ch of str) w += ch === ' ' ? SPACE : CUR[ch].w;
+  const x0 = cx0 - w * XH / 2 - SLANT * .5 * XH, P = [], dots = [], bars = [], segs = [{ P: [], join: false }];
+  const at = (gx, gy) => [x0 + (gx + SLANT * gy) * XH, by - gy * XH];
+  let ox = 0, hi = false;
+  for (const ch of str) {
+    if (ch === ' ') {
+      const a = P[P.length - 1], V = [at(ox + SPACE * .4, -.3), at(ox + SPACE * .53, -.18), at(ox + SPACE * .6, -.23)];
+      segs.push({ P: [a, ...V], join: true }); P.push(...V); ox += SPACE; continue;
+    }
+    const g = CUR[ch];
+    g.p.forEach(([gx, gy], i) => {
+      if (i === 0 && hi) return;
+      const q = at(ox + gx, gy), sg = segs[segs.length - 1]; P.push(q); sg.P.push(q);
+      if (sg.join) segs.push({ P: [q], join: false });
+    });
+    if (g.dot) dots.push(at(ox + g.dot[0], g.dot[1]));
+    if (g.bar) { const b = [...at(ox + g.bar[0], g.bar[1]), ...at(ox + g.bar[2], g.bar[3])], l = bars[bars.length - 1];
+      if (l && b[0] - l[2] < .3 * XH) { l[2] = b[2]; l[3] = b[3]; } else bars.push(b); }
+    hi = !!g.hi; ox += g.w;
+  }
+  return { P, segs, dots, bars, width: w * XH, x0 };
+}
+// four lines, each tilted its own way and set off centre, as a hand sets them: words per line,
+// then x offset, baseline and tilt; the words themselves come from PHRASE_TO_RENDER
+const LAYOUT = (() => { const w = PHRASE_TO_RENDER.split(' '); let i = 0;
+  return [[2, -8, -206, -3], [2, 10, -48, 2], [1, -4, 110, -2], [1, 14, 268, 3]].map(([n, ...at]) => [w.slice(i, i += n).join(' '), ...at]); })();
+const rel = (x, y) => [CX + x * SC, CY + y * SC];   // layout units: a 470-radius bowl
+const atRim = (a, out = 6) => { const th = a * DEG, r = rimOuter(th) + out; return [CX + r * Math.cos(th), CY + r * Math.sin(th)]; };
+function chip(a0, a1, w) { const P = []; for (let k = 0; k <= 14; k++) { const th = mix(a0, a1, k / 14) * DEG, r = rimOuter(th) - 6; P.push([CX + r * Math.cos(th), CY + r * Math.sin(th)]); } return { P, Wd: P.map((_, k) => 2 + w * Math.pow(Math.sin(Math.PI * k / 14), .7)) }; }
+function dotSeam([x, y], key) { const r = rngFor(key), a = r() * 6.3; return { P: [0, 1, 2, 0].map(i => [x + 2.2 * Math.cos(a + i * 2.1), y + 2.2 * Math.sin(a + i * 2.1)]), Wd: [6.4, 6.9, 6, 6.4] }; }
+// A fracture runs on from a point at a steep angle, bending a little, until it reaches the rim
+// or meets an earlier crack, where it stops: a T-junction, as real breaks do.
+function march(p, ang, kink = 0, max = 900, sMin = 16) {
+  const pts = [p.slice()]; let x = p[0], y = p[1];
+  for (let s = 2; s <= max; s += 2) {
+    const a = (ang + kink * sstep(50, 130, s)) * DEG; x += 2 * Math.cos(a); y += 2 * Math.sin(a);
+    const th = Math.atan2(y - CY, x - CX), k = Math.round(y) * W + Math.round(x);
+    if (Math.hypot(x - CX, y - CY) > rimOuter(th) + 6 || (s > sMin && E[k] < -2)) { pts.push([x, y]); return pts; }
+    if (s % 40 === 0) pts.push([x, y]);
+  }
+  pts.push([x, y]); return pts;
+}
+const along = (P, f) => P[Math.floor((P.length - 1) * f)];
+// Each line of the phrase is one crack: in at a steep angle, through its words, out at a steep
+// angle, alternating up and down so no two run parallel. Line 3 starts on line 2's crack and
+// line 4 ends on line 3's. Angles are screen degrees, away from the words.
+const LEADS = [[225, 6, -50, -6], [140, -5, 40, 5], [230, 4, 50, 4], [145, -4, -40, 3]];
+const GOLD = [[3.4, 3.64], [3.64, 3.92], [3.92, 4.26], [4.26, 4.6]];
+function buildSeams() {
+  const leads = [];
+  LAYOUT.forEach(([str, dx, by, tilt], li) => {
+    const L = cursiveLine(str, CX + dx, CY + by), ca = Math.cos(tilt * DEG), sa = Math.sin(tilt * DEG);
+    const rot = ([x, y]) => [CX + dx + (x - CX - dx) * ca - (y - CY - by) * sa, CY + by + (x - CX - dx) * sa + (y - CY - by) * ca];
+    const P = L.P.map(rot), [ai, ki, ao, ko] = LEADS[li], key = 'L' + li;
+    const lead = (pts, k) => crack(pts, { key: k, w: 5.6, amp: 2.4 });
+    const lin = lead(march(P[0], ai, ki).reverse(), key + 'i'), lout = lead(march(P[P.length - 1], ao, ko), key + 'o');
+    const words = L.segs.map((g, j) => crack(g.P.map(rot), g.join ? { key: key + 'j' + j, w: 3.6, amp: .7, rough: .3, round: 2, jog: false }
+      : { key: j ? key + 'w' + j : key, w: 4.8, amp: .8, rough: .3, round: 3, jog: false }));
+    const strokes = [lin, ...words, lout];
+    L.bars.forEach((b, j) => strokes.push(crack([rot([b[0], b[1]]), rot([b[2], b[3]])], { key: key + 'b' + j, w: 4.2, amp: .5, jog: false, tipA: 12, tipB: 12 })));
+    L.dots.forEach((d, j) => strokes.push(dotSeam(rot(d), key + 'd' + j)));
+    const c0 = 1.55 + .09 * li;
+    addGroup(strokes, 'crack', GOLD[li][0], GOLD[li][1], li === 3 ? 1 : 0, c0, c0 + .26);
+    leads.push([lin.P, lout.P]);
+    if (li === 3) placeBrush(along(lout.P, .55));
+  });
+  // short cracks that finish the break into shards, and two that stopped short
+  const link = (from, ang, kink, key, w, max) => crack(march(from, ang, kink, max), { key, w, amp: 2, tipB: max ? 40 : 0 });
+  addGroup([link(along(leads[0][0], .5), 98, -4, 'K1', 4.2), link(along(leads[0][1], .45), -100, 5, 'K4', 4.2)], 'crack', 3.58, 3.76, 0, 1.7, 1.86);
+  addGroup([link(along(leads[1][0], .7), 205, 6, 'F1', 3.2, 46)], 'crack', 3.86, 3.95, 0, 1.8, 1.86);
+  addGroup([link(along(leads[1][1], .45), 95, -3, 'K2', 4.2), link(along(leads[2][1], .62), 85, 5, 'F2', 3.2, 40)], 'crack', 4.12, 4.3, 0, 1.86, 1.98);
+  addGroup([link(along(leads[3][0], .5), 80, -5, 'K3', 4.2)], 'crack', 4.3, 4.48, 0, 1.95, 2.06);
+  addGroup([chip(146, 152, 7), chip(-104, -97, 7)], 'crack', 3.3, 3.5, 0, 1.6, 1.75);
+}
+// ---------- the linen: slubby flax, plain weave, no two threads alike ----------
+const LPW = 5.4, LPF = 5.9, LIN = [.67, .625, .54];
+const nW = noiseFor('warp'), nF = noiseFor('weft'), nT = noiseFor('thick'), nS = noiseFor('slub'), nC = noiseFor('cloth');
+// cloth relief on a coarse grid: slow undulation and one fold pressed in by storage
+const CG = 8, CGW = Math.ceil(W / CG) + 2, CGH = Math.ceil(HF / CG) + 2, CLOTH = new Float32Array(CGW * CGH);
+for (let j = 0; j < CGH; j++) for (let i = 0; i < CGW; i++) {
+  const x = i * CG, y = j * CG, dy = y - (226 + 9 * Math.sin(x / 310 + .6) + x * .028);
+  CLOTH[j * CGW + i] = 28 * fbm(nC, x / 280, y / 280, 3) + (dy < 0 ? 2.6 * Math.exp(dy / 8) : 2.6 * Math.exp(-dy / 24));
+}
+function clothH(x, y) {
+  const gx = Math.max(0, x) / CG, gy = Math.max(0, y) / CG, i = Math.floor(gx), j = Math.floor(gy), fx = gx - i, fy = gy - j, k = j * CGW + i;
+  return mix(mix(CLOTH[k], CLOTH[k + 1], fx), mix(CLOTH[k + CGW], CLOTH[k + CGW + 1], fx), fy);
+}
+function threadN(a, b, c) { const l = Math.hypot(a, b, c); return Math.max(0, (a * LV[0] + b * LV[1] + c * LV[2]) / l) / LV[2]; }
+// one sample of the weave. Thread index space is warped, so spacing and straightness change from
+// thread to thread; each yarn has its own thickness and tone, and slubs swell along its length.
+function weave(x, y, out) {
+  const xw = x / LPW + .9 * nW(x / 41, y / 520) + .6 * nW(x / 23 + 11, y / 90) + .25 * nW(x / 9 + 30, y / 160), yw = y / LPF + .9 * nF(x / 560, y / 37) + .6 * nF(x / 90 + 21, y / 23) + .25 * nF(x / 170 + 50, y / 8);
+  const i = Math.floor(xw), j = Math.floor(yw), u = xw - i - .5, v = yw - j - .5;
+  const sw = Math.max(0, nS(i * 1.71 + 3, y / 38) - .42) * 2.2, sf = Math.max(0, nS(j * 1.63 + 17, x / 30) - .38) * 2.2;
+  const tw = clamp((.56 + .16 * white(i, 1, 17) + .14 * nT(i * 2.1 + 9, y / 70)) * (white(i, 4, 27) < .1 ? .6 : 1) + .08 * nT(i * 1.37, y * .006) + .42 * sw, .25, 1.15);
+  const th = clamp((.58 + .16 * white(j, 2, 19) + .14 * nT(j * 2.3 + 19, x / 70)) * (white(j, 6, 29) < .08 ? .6 : 1) + .1 * nT(j * 1.41 + 40, x * .006) + .5 * sf, .25, 1.2);
+  const top = ((i + j) & 1) === 0, cu = sstep(tw / 2 + .08, tw / 2 - .08, Math.abs(u)), cvv = sstep(th / 2 + .08, th / 2 - .08, Math.abs(v));
+  const au = clamp(1.6 * u / tw, -.95, .95), av = clamp(1.6 * v / th, -.95, .95);
+  const sWarp = threadN(au, (top ? .55 : -.55) * Math.sin(Math.PI * v), Math.sqrt(1 - au * au));
+  const sWeft = threadN((top ? -.55 : .55) * Math.sin(Math.PI * u), av, Math.sqrt(1 - av * av));
+  const cw = .98 + .02 * white(i, 7, 11) + .02 * nT(i * 1.53 + 70, y / 50) + .07 * sw, cf = .98 + .02 * white(j, 9, 13) + .02 * nT(j * 1.57 + 90, x / 50) + .07 * sf;
+  let bw, bf, bg;   // weights of warp, weft and the shadowed gap between threads
+  if (top) { bw = cu; bf = (1 - cu) * cvv * .93; bg = (1 - cu) * (1 - cvv); }
+  else { bf = cvv; bw = (1 - cvv) * cu * .93; bg = (1 - cvv) * (1 - cu); }
+  out[0] = (bw * (.97 + .03 * sWarp) * cw + bf * (.97 + .03 * sWeft) * cf + bg * .97) * (1 + .045 * nT(x / 150 + 7, y / 150 + 3));
+  out[1] = white(i, 3, 21) < .22 ? bw : 0;   // greyer flax yarns
+  out[2] = white(j, 5, 23) < .18 ? bf : 0;
+}
+// ---------- the makie brush: its gold-loaded point rests on the wet seam, its body on the rim ----------
+// placed once the wet seam exists: BT is the point of contact, BSC where the brush lies on the
+// lip, H_TIP and BK the height of the axis above the cloth at the tip and its rise per px
+let BT = [0, 0], BSC = 0, H_TIP = 0, BK = 0;
+const BD = (() => { const l = Math.hypot(.62, -.78); return [.62 / l, -.78 / l]; })(), BP = [-BD[1], BD[0]];
+function brushR(a) {
+  if (a < 0) return 0;
+  if (a < 118) return Math.max(2.2 * sstep(-2, 5, a), 12 * Math.pow(Math.sin(Math.min(1, a / 118) * Math.PI / 2), 1.1));   // a long, fine point
+  if (a < 138) return 13.4;                                                                                               // thread binding
+  return Math.max(6, 15.5 - (a - 138) * .016);                                                                                           // handle
+}
+const brushH = a => H_TIP + a * BK;   // height of the axis above the cloth
+function placeBrush(tip) {
+  BT = tip;
+  for (let a = 0; a < 600; a++) {
+    const x = tip[0] + a * BD[0] - CX, y = tip[1] + a * BD[1] - CY, th = Math.atan2(y, x);
+    if (Math.hypot(x, y) >= .5 * (rimOuter(th) + rimInner(th))) { BSC = a; break; }
+  }
+  const x = tip[0] - CX, y = tip[1] - CY, th = Math.atan2(y, x);
+  H_TIP = HB + zProfile(tip[0], tip[1], Math.hypot(x, y), th, rimOuter(th), rimInner(th)) + 2;
+  BK = (HB + brushR(BSC) - H_TIP) / BSC;
+}
+// is the window visible from a surface point at height zs, or does the brush block it? The
+// brush's axis is a straight line, so its shadow on the plane z = zs is a line too.
+function brushShadow(x, y, zs) {
+  const dx = BD[0] - L2[0] * BK / TANE, dy = BD[1] - L2[1] * BK / TANE, dd = dx * dx + dy * dy, h0 = H_TIP - zs;
+  const px = x - (BT[0] - L2[0] * h0 / TANE), py = y - (BT[1] - L2[1] * h0 / TANE), a = (px * dx + py * dy) / dd;
+  if (a < -4 || a > 1600) return 1;
+  const d = Math.hypot(px - a * dx, py - a * dy), r = brushR(Math.max(.5, a)), pen = 1 + Math.max(0, brushH(a) - zs) * .02;
+  return 1 - .9 * sstep(r + pen, r - pen, d) * sstep(-1, 3, a);
+}
+
+// ---------- bake: the glaze surface ----------
+const BX0 = 40, BX1 = 1040, BY0 = 378, BY1 = Math.min(H - 1, CY + 520);
+const Z = new Float32Array(N), ZS = new Float32Array(N), ZG = new Float32Array(N), ROv = new Float32Array(N), RIv = new Float32Array(N);
+const CRAWL = new Float32Array(N), PIT = new Float32Array(N), ASH = new Float32Array(N), LBL = new Int32Array(N).fill(-1);
+function surfaceDetail() {
+  const nFa = noiseFor('facet'), nOp = noiseFor('peel');
+  for (let y = BY0; y < BY1; y++) for (let x = BX0; x < BX1; x++) {
+    const k = y * W + x, dx = x + .5 - CX, dy = y + .5 - CY, r = Math.hypot(dx, dy), th = Math.atan2(dy, dx), ro = rimOuter(th), ri = rimInner(th);
+    ROv[k] = ro; RIv[k] = ri; if (r > ro + 5) continue;
+    // spatula facets are strongest on the wall, where the potter carved the inside
+    const onWall = mix(.5, 1, sstep(RF - 60, RF + 10, r)), lip = sstep(ri - 4, ri + 4, r);
+    ZS[k] = zProfile(x + .5, y + .5, Math.min(r, ro), th, ro, ri) + 7 * onWall * fbm(nFa, x / 90, y / 90, 3) + 3.4 * lip * Math.sin(5 * th + .8);
+    const peel = .25 + 1.1 * sstep(-.3, .4, nOp(x / 150 + 9, y / 150 + 4));   // the glaze ran thick and smooth in places, thin and pitted in others
+    Z[k] = ZS[k] + peel * ((.32 - .12 * lip) * nOp(x / 3.4, y / 3.4) + .2 * nOp(x / 11 + 50, y / 11));
+  }
+  // crawled glaze, all over: the glaze pulled back in the firing and rolled into a bead round bare clay
+  const nCr = noiseFor('crawl'), rc = rngFor('crawls');
+  for (let n = 0; n < 15; n++) {
+    const a = rc() * 2 * Math.PI, rf = .12 + .85 * Math.sqrt(rc()), rad = 5 + 15 * rc() * rc();
+    const c0 = CX + rf * R0 * Math.cos(a), c1 = CY + rf * R0 * Math.sin(a);
+    for (let y = Math.floor(c1 - rad * 2); y < c1 + rad * 2; y++) for (let x = Math.floor(c0 - rad * 2); x < c0 + rad * 2; x++) {
+      if (y < 0 || y >= H) continue;
+      const k = y * W + x, d = Math.hypot(x - c0, y - c1) / rad + .45 * fbm(nCr, x / 8, y / 8, 3);
+      if (d < 1) { CRAWL[k] = Math.max(CRAWL[k], sstep(1, .86, d)); Z[k] -= 1.1 * sstep(1, .8, d); }
+      else if (d < 1.3) Z[k] += .9 * Math.sin(Math.PI * (d - 1) / .3);
+    }
+  }
+  const r = rngFor('pinholes');
+  for (let n = 0; n < 700; n++) {
+    const a = r() * 2 * Math.PI, rr = Math.sqrt(r()) * R0 * .98, px = CX + rr * Math.cos(a), py = CY + rr * Math.sin(a), rad = .7 + 1.7 * r() * r();
+    for (let y = Math.floor(py - 3); y <= py + 3; y++) for (let x = Math.floor(px - 3); x <= px + 3; x++) {
+      const d = Math.hypot(x + .5 - px, y + .5 - py) / rad;
+      if (d < 1 && y < H) { const k = y * W + x; Z[k] -= 1.4 * (1 - d * d); PIT[k] = Math.max(PIT[k], sstep(1, .5, d)); }
+    }
+  }
+  const ra = rngFor('ash');
+  for (let n = 0; n < 2400; n++) {
+    const a = ra() * 2 * Math.PI, rr = Math.sqrt(ra()) * R0, px = CX + rr * Math.cos(a), py = CY + rr * Math.sin(a);
+    const rad = .4 + .9 * ra() * ra(), str = .18 + .45 * ra();
+    for (let y = Math.floor(py - 2); y <= py + 2; y++) for (let x = Math.floor(px - 2); x <= px + 2; x++) {
+      const d = Math.hypot(x + .5 - px, y + .5 - py); if (d < rad + .7 && y < H) { const k = y * W + x; ASH[k] = Math.max(ASH[k], str * sstep(rad + .7, rad - .5, d)); }
+    }
+  }
+}
+// the shards: regions the seams cut the bowl into, each set back a hair off true
+function labelShards() {
+  const tilts = []; let lab = 0; const stack = new Int32Array(N);
+  const wall = k => E[k] < .8 && SEAMS[SID[k]].kind === 'crack';
+  for (let y = BY0; y < BY1; y++) for (let x = BX0; x < BX1; x++) {
+    const k0 = y * W + x;
+    if (LBL[k0] >= 0 || wall(k0)) continue;
+    const dx = x + .5 - CX, dy = y + .5 - CY; if (Math.hypot(dx, dy) > ROv[k0]) continue;
+    const r = rngFor('shard' + lab); tilts.push([(r() - .5) * .1, (r() - .5) * .1]);
+    let sp = 0; stack[sp++] = k0; LBL[k0] = lab;
+    while (sp) {
+      const k = stack[--sp];
+      for (const n of [k - 1, k + 1, k - W, k + W]) {
+        const nx = n % W, ny = (n - nx) / W;
+        if (nx < BX0 || nx >= BX1 || ny < BY0 || ny >= BY1 || LBL[n] >= 0 || wall(n)) continue;
+        if (Math.hypot(nx + .5 - CX, ny + .5 - CY) > ROv[n]) continue;
+        LBL[n] = lab; stack[sp++] = n;
+      }
+    }
+    lab++;
+  }
+  return tilts;
+}
+
+// each shard was set a hair high or low against its neighbours: the glaze steps sharply at the
+// crack, and the gold bridges the step, so it slopes across the seam
+function liftShards(tilts) {
+  const off = tilts.map((_, i) => (rngFor('lift' + i)() - .5) * 3.6), A = new Float32Array(N), M = new Float32Array(N), T = new Float32Array(N), R = 9;
+  for (let y = BY0; y < BY1; y++) for (let x = BX0; x < BX1; x++) { const k = y * W + x; if (LBL[k] >= 0) { A[k] = off[LBL[k]]; M[k] = 1; } }
+  // two passes of a separable box blur: a smooth ramp across each seam, with no kink at its centre
+  const blur = F => {
+    for (let p = 0; p < 2; p++) {
+      for (let y = BY0; y < BY1; y++) for (let x = BX0 + R; x < BX1 - R; x++) { let a = 0; for (let j = -R; j <= R; j++) a += F[y * W + x + j]; T[y * W + x] = a / (2 * R + 1); }
+      for (let y = BY0 + R; y < BY1 - R; y++) for (let x = BX0; x < BX1; x++) { let a = 0; for (let j = -R; j <= R; j++) a += T[(y + j) * W + x]; F[y * W + x] = a / (2 * R + 1); }
+    }
+  };
+  const A0 = A.slice(); blur(A); blur(M);
+  for (let y = BY0; y < BY1; y++) for (let x = BX0; x < BX1; x++) {
+    const k = y * W + x, ob = M[k] > 1e-4 ? A[k] / M[k] : 0;
+    ZS[k] += .3 * ob;   // the gold bridges the shards' small misfit; the glaze stays whole until it breaks
+  }
+}
+// ---------- bake: shading ----------
+const BASE = new Float32Array(N * 3);
+const AG = [1.0, .67, .25], AL = [.10, .026, .012];
+const kfall = (x, y) => 1.12 - .4 * (x * .5 + y * .866) / (W * .5 + HF * .866);
+
+function gradAt(A, k, lim) { let gx = (A[k + 1] - A[k - 1]) * .5, gy = (A[k + W] - A[k - W]) * .5; const m = Math.hypot(gx, gy); if (m > lim) { gx *= lim / m; gy *= lim / m; } return [gx, gy]; }
+function crackle(x, y, C, sd) {   // one crazing network of cell size C: distance to the Voronoi edge
+  const i0 = Math.floor(x / C), j0 = Math.floor(y / C); let f1 = 1e9, f2 = 1e9;
+  for (let j = j0 - 1; j <= j0 + 1; j++) for (let i = i0 - 1; i <= i0 + 1; i++) {
+    const d = Math.hypot(x - (i + .1 + .8 * white(i, j, sd)) * C, y - (j + .1 + .8 * white(i, j, sd + 2)) * C);
+    if (d < f1) { f2 = f1; f1 = d; } else if (d < f2) f2 = d;
+  }
+  return 1 - sstep(.5, 1.9, f2 - f1);
+}
+const BOWL = new Float32Array(N * 3), BA = new Float32Array(N);
+function shadeBowl(tilts) {
+  const nM = noiseFor('mottle'), nM2 = noiseFor('mottle2'), nPool = noiseFor('pool'), nLac = noiseFor('lac'), nWarp = noiseFor('cw');
+  // the gold stands a hair proud of the glaze: flat on top, rounded only at its edges
+  for (let y = BY0; y < BY1; y++) for (let x = BX0; x < BX1; x++) {
+    const k = y * W + x; ZG[k] = ZS[k];
+    if (E[k] < 0) { const q = clamp((E[k] + WD[k]) / WD[k], 0, 1), wet = SEAMS[SID[k]].wet; if (wet) ZG[k] += .4 * WD[k] * Math.pow(1 - q * q, .8); }
+  }
+  const list = [];
+  for (let y = BY0 + 1; y < BY1 - 1; y++) for (let x = BX0 + 1; x < BX1 - 1; x++) {
+    const k = y * W + x, dx = x + .5 - CX, dy = y + .5 - CY, r = Math.hypot(dx, dy), ro = ROv[k], ri = RIv[k];
+    if (r > ro + 1.5) continue;
+    const z = Z[k], kf = kfall(x, y), vis = r < ri ? innerVis(x + .5, y + .5, z) : 1;
+    const df = clamp(-z / DEPTH, 0, 1), bxa = (x + .5 - BT[0]) * BD[0] + (y + .5 - BT[1]) * BD[1], bxc = Math.abs((x + .5 - BT[0]) * BP[0] + (y + .5 - BT[1]) * BP[1]);
+    const ao = 1 - .62 * Math.pow(df, .7), lipAO = 1 - .45 * Math.exp(-(((bxa - BSC) / 22) ** 2)) * sstep(brushR(BSC) + 9, brushR(BSC), bxc);
+    let [gx, gy] = gradAt(Z, k, 9);
+    let nl = Math.hypot(gx, gy, 1), nx = -gx / nl, ny = -gy / nl, nz = 1 / nl;
+    // albedo: a deep black that is never one colour
+    const m1 = fbm(nM, x / 85, y / 85, 3), m2 = fbm(nM2, x / 22, y / 22, 2), v = 1 + .55 * m1 + .22 * m2;
+    let ar = .022 * v, ag = .0185 * v * (1 + .14 * m2), ab = .0155 * v * (1 + .12 * m1);
+    if (r > ri) { const t = (r - ri) / (ro - ri), e = Math.max(sstep(.3, 0, t), sstep(.72, 1, t)); ar += .012 * e; ag += .007 * e; ab += .003 * e; }
+    // celadon-grey glaze pooled in the well; crackle runs through all of the glaze, lighter hairlines
+    // in the black, tea-stained dark in the pool
+    const pd = Math.hypot(x - FC[0] - 6, y - FC[1] - 4) / 126 + .5 * fbm(nPool, x / 70, y / 70, 3), pool = sstep(1.0, .7, pd) * sstep(RF + 10, RF - 40, Math.hypot(x - FC[0], y - FC[1]));
+    // crazing is hierarchical: large primary cells, finer secondary cracks in patches, each line fading along its run
+    const wx = x + 10 * nWarp(x / 45, y / 45), wy = y + 10 * nWarp(x / 45 + 30, y / 45);
+    const cl = Math.max(crackle(wx, wy, 43, 41), crackle(wx + 13, wy - 7, 19, 47) * sstep(-.1, .35, nWarp(x / 70 + 50, y / 70 + 9)))
+      * (.5 + .5 * sstep(-.4, .4, nWarp(x / 14 + 70, y / 14)));
+    const cm = sstep(.1, .5, fbm(nM2, x / 160 + 20, y / 160, 2)) * (1 - pool) * .16;   // crackle shows only where the black runs thin
+    ar *= 1 + cl * cm; ag *= 1 + cl * cm; ab *= 1 + 1.05 * cl * cm;
+    if (pool > 0) { ar = mix(ar, .036, pool * .8); ag = mix(ag, .044, pool * .8); ab = mix(ab, .041, pool * .8); ar *= 1 - .5 * cl * pool; ag *= 1 - .55 * cl * pool; ab *= 1 - .6 * cl * pool; }
+    const cr = CRAWL[k] * .7; ar = mix(ar, .052, cr); ag = mix(ag, .042, cr); ab = mix(ab, .034, cr);
+    const pit = 1 - .65 * PIT[k], as = ASH[k] * (1 - cr);
+    ar = mix(ar * pit, .25, as); ag = mix(ag * pit, .225, as); ab = mix(ab * pit, .19, as);
+    const NL = Math.max(0, nx * LV[0] + ny * LV[1] + nz * LV[2]), NH = Math.max(0, nx * HV[0] + ny * HV[1] + nz * HV[2]);
+    const fres = .04 + .96 * Math.pow(1 - nz, 5), gloss = (1 - .9 * cr) * (1 + .25 * pool) * (r > ri ? 1.6 : 1) * (.55 + .9 * sstep(-.25, .45, m1));
+    const sp = vis * gloss * (.022 * Math.pow(NH, 60) + (r > ri ? .045 : .006) * Math.pow(NH, r > ri ? 22 : 7)) * (1 + 2.5 * fres);
+    const env = gloss * fres * .45 * sstep(-.2, 1, 2 * nz * nz - 1) * ao;
+    const lit = KEY.map((c, i) => c * NL * vis * .95 * kf), amb = SKY.map(c => c * ao * (.55 + .45 * nz));
+    const col = [ar, ag, ab].map((a, i) => a * (lit[i] + amb[i]) + KEY[i] * sp * kf + SKY[i] * env);
+    const cov = clamp(ro - r + .5, 0, 1);
+    for (let i = 0; i < 3; i++) BOWL[k * 3 + i] = col[i];
+    BA[k] = cov; BSH[k] = mix(BSH[k], (1 - (1 - brushShadow(x + .5, y + .5, HB + z)) * .85 * vis) * lipAO, cov);
+    if (E[k] < 3 && SID[k] >= 0) list.push(k, vis, ao, kf, nLac(x / 9, y / 9), nLac(x / 13 + 40, y / 13), fbm(nLac, x / 6 + 90, y / 6, 2), fbm(nLac, x / 2.4 + 70, y / 2.4, 2));
+  }
+  return list;
+}
+// gold and the urushi it is bedded in, baked dry and wet; the fill is decided per frame
+const AU = [.03, .013, .008], BG = [.36, .062, .03], CLAY = [.2, .158, .118];   // black urushi, red bengara urushi, the raku body
+function shadeGold(list) {
+  const NS = 8, n = list.length / NS, S = { k: new Int32Array(n), cg: new Float32Array(n), cu: new Float32Array(n), cc: new Float32Array(n),
+    gd: new Float32Array(n * 3), gw: new Float32Array(n * 3), ud: new Float32Array(n * 3), uw: new Float32Array(n * 3), cl: new Float32Array(n * 3) };
+  const CGA = new Float32Array(N), CCA = new Float32Array(N);
+  for (let m = 0; m < n; m++) {
+    const o = m * NS, k = list[o], vis = list[o + 1], ao = list[o + 2], kf = list[o + 3], j1 = list[o + 4], j2 = list[o + 5], j3 = list[o + 6], j4 = list[o + 7], wetS = SEAMS[SID[k]].wet;
+    const x = k % W, y = (k - x) / W, crackK = SEAMS[SID[k]].kind === 'crack';
+    const [gx, gy] = gradAt(ZG, k, 6), nl = Math.hypot(gx, gy, 1), nx = -gx / nl, ny = -gy / nl, nz = 1 / nl;
+    const NL = Math.max(0, nx * LV[0] + ny * LV[1] + nz * LV[2]), NH = Math.max(0, nx * HV[0] + ny * HV[1] + nz * HV[2]);
+    const RL = Math.max(0, 2 * nz * nx * LV[0] + 2 * nz * ny * LV[1] + (2 * nz * nz - 1) * LV[2]);
+    // satin: the powder scatters, so gold reads almost matte with one broad sheen and no bevel
+    const q = clamp((E[k] + WD[k]) / WD[k], 0, 1), tex = (.86 + .24 * white(x, y, 31) + .12 * white(x >> 1, y >> 1, 33) + .08 * j3) * (white(x, y, 39) < .035 ? .62 : 1);
+    const sheen = vis * .42 * Math.pow(RL, 1.5), env = .08 * (.4 + .6 * nz) * ao, wetGl = vis * (2.4 * Math.pow(NH, 120) + .35 * Math.pow(NH, 14)), wetSky = sstep(.2, 1, 2 * nz * nz - 1) * ao;
+    const red = clamp(.04 + sstep(.3, .6, j3) * .28 + sstep(.76, 1, q) * .5, 0, .6);   // bengara where the powder lies thin
+    for (let i = 0; i < 3; i++) {
+      const dif = KEY[i] * NL * vis * kf + SKY[i] * ao, g = AG[i] * (.32 * dif + .62 * KEY[i] * sheen * kf + KEY[i] * env * kf) * tex;   // satin: a broad sheen and the room's light
+      S.gd[m * 3 + i] = .85 * g;
+      S.gw[m * 3 + i] = mix(.92 * g, BG[i] * dif, red) + KEY[i] * wetGl * kf + .06 * SKY[i] * wetSky;
+      S.ud[m * 3 + i] = AU[i] * dif + .05 * KEY[i] * vis * Math.pow(NH, 30) * kf;
+      S.uw[m * 3 + i] = BG[i] * .7 * dif + .8 * KEY[i] * wetGl * kf;
+      S.cl[m * 3 + i] = CLAY[i] * (KEY[i] * .6 * vis * kf + SKY[i] * .9) * (.85 + .3 * white(x, y, 77));   // a fresh break shows the buff body
+    }
+    // the urushi fills the whole crack; the gold sits inside it, leaving a dark edge on each side
+    const e = E[k], ej = crackK ? .35 * j1 + .55 * j4 : .1 * j1, lw = crackK ? 1.0 + .9 * Math.max(0, j2 + .2) + .7 * Math.abs(j4) : .6;
+    S.k[m] = k; S.cu[m] = clamp(.5 - (e + ej), 0, 1); S.cg[m] = clamp(.5 - (e + ej + lw), 0, 1);
+    S.cc[m] = crackK ? clamp(.5 - (e + WD[k] - 1.0), 0, 1) : 0; CGA[k] = S.cu[m]; CCA[k] = S.cc[m];
+  }
+  S.CG = CGA; S.CC = CCA; S.M = new Int32Array(N).fill(-1); for (let m = 0; m < n; m++) S.M[S.k[m]] = m;
+  return S;
+}
+// ---------- bake: linen, its shadows, and the brush ----------
+function fibres() {
+  const F = new Float32Array(N), S = new Float32Array(N), r = rngFor('fibres'), so = [-L2[0] * 1.6, -L2[1] * 1.6];
+  for (let n = 0; n < 26; n++) {
+    const x0 = r() * W, y0 = r() * HF + FY, a = r() * Math.PI, len = 22 + 70 * r() * r(), bend = (r() - .5) * 40, tone = r() < .7 ? 1 : -1;
+    if (Math.hypot(x0 - CX, y0 - CY) < R0 + 40) continue;
+    const ex = x0 + len * Math.cos(a), ey = y0 + len * Math.sin(a), mx = (x0 + ex) / 2 - bend * Math.sin(a), my = (y0 + ey) / 2 + bend * Math.cos(a);
+    for (let t = 0; t <= 1; t += .5 / len) {
+      const px = (1 - t) * (1 - t) * x0 + 2 * t * (1 - t) * mx + t * t * ex, py = (1 - t) * (1 - t) * y0 + 2 * t * (1 - t) * my + t * t * ey, amp = .55 * Math.sin(Math.PI * t) ** .3;
+      for (const [A, ox, oy, g] of [[F, 0, 0, amp * tone], [S, so[0], so[1], amp * .6]]) {
+        const qx = px + ox, qy = py + oy, ix = Math.floor(qx), iy = Math.floor(qy);
+        for (let yy = iy - 1; yy <= iy + 1; yy++) for (let xx = ix - 1; xx <= ix + 1; xx++) {
+          if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+          const w = Math.exp(-((xx + .5 - qx) ** 2 + (yy + .5 - qy) ** 2) / .45), k = yy * W + xx;
+          if (Math.abs(g * w) > Math.abs(A[k])) A[k] = g * w;
+        }
+      }
+    }
+  }
+  return [F, S];
+}
+// The cloth is baked bare and whole, under the bowl too, since the bowl arrives and parts. The
+// bowl's shadow and the brush's are kept as separate multipliers, so each can move with its caster.
+const GRD = new Float32Array(N * 3), SHB = new Float32Array(N).fill(1), BSH = new Float32Array(N).fill(1);
+function shadeGround() {
+  const smp = [0, 0, 0], [FIB, FSH] = fibres();
+  for (let y = FY; y < H; y++) for (let x = 0; x < W; x++) {
+    const k = y * W + x, yf = y - FY, dx = x + .5 - CX, dy = y + .5 - CY, r = Math.hypot(dx, dy), ro = rimOuter(Math.atan2(dy, dx)), kf = kfall(x, yf);
+    let b = 0, gw = 0, gf = 0;
+    // under the bowl the cloth is seen only in motion or through a gap, so one sample will do
+    const ss = r < ro - 4 ? [[.5, .5]] : [[.25, .25], [.75, .25], [.25, .75], [.75, .75]], sw = 1 / ss.length;
+    for (const [ox, oy] of ss) { weave(x + ox, yf + oy, smp); b += smp[0] * sw; gw += smp[1] * sw; gf += smp[2] * sw; }
+    const hx = (clothH(x + 2, yf) - clothH(x - 2, yf)) / 4, hy = (clothH(x, yf + 2) - clothH(x, yf - 2)) / 4, cs = threadN(-hx, -hy, 1);
+    const sx = -L2[0] * HB / TANE, sy = -L2[1] * HB / TANE, ts = clamp((dx * sx + dy * sy) / (sx * sx + sy * sy), 0, 1);
+    const vis = Math.hypot(dx - ts * sx, dy - ts * sy) < R0 * 1.12 ? groundVis(x + .5, y + .5) : 1, ao = 1 - .15 * Math.exp(-Math.max(0, r - ro) / 5), grey = gw + gf;
+    const tint = [mix(1, .93, grey), mix(1, .96, grey), mix(1, .97, grey)];
+    const fb = (1 + .22 * FIB[k]) * (1 - .14 * FSH[k] * (1 - Math.abs(FIB[k])));
+    for (let i = 0; i < 3; i++) GRD[k * 3 + i] = LIN[i] * tint[i] * b * fb * (KEY[i] * .78 * cs * kf + SKY[i] * 1.05);
+    const key = KEY[1] * .78 * cs * kf, amb = SKY[1] * 1.05;
+    SHB[k] = (key * vis + amb * ao) / (key + amb);
+    BSH[k] = 1 - (1 - brushShadow(x + .5, y + .5, 0)) * key * vis / (key * vis + amb * ao);
+  }
+}
+// the brush is above everything, so it is drawn last: tanuki hair with a gold-loaded point,
+// a silk binding, a black-lacquered handle
+const BCOV = new Float32Array(N);
+const BRC = new Uint8ClampedArray(N * 4);
+function drawBrush() {
+  const aX = (W - BT[0]) / BD[0], y0 = Math.max(0, Math.floor(BT[1] + aX * BD[1] - 30)), y1 = Math.min(H, Math.ceil(BT[1] + 25));
+  for (let y = y0; y < y1; y++) for (let x = Math.max(0, Math.floor(BT[0] - 25)); x < W; x++) {
+    const k = y * W + x, bx = x + .5 - BT[0], by = y + .5 - BT[1], a = bx * BD[0] + by * BD[1], c = bx * BP[0] + by * BP[1], rr = brushR(a);
+    if (rr <= 0 || Math.abs(c) > rr + 1) continue;
+    const cov = sstep(rr + .7, rr - .7, Math.abs(c)) * sstep(-.5, 1.5, a), nc = clamp(c / rr, -1, 1), up = Math.sqrt(1 - nc * nc * .92);
+    let nx = BP[0] * nc * .96 - BD[0] * BK * up, ny = BP[1] * nc * .96 - BD[1] * BK * up, nz = up; const l = Math.hypot(nx, ny, nz); nx /= l; ny /= l; nz /= l;
+    const NL = Math.max(0, nx * LV[0] + ny * LV[1] + nz * LV[2]), NH = Math.max(0, nx * HV[0] + ny * HV[1] + nz * HV[2]), kf = kfall(x, y);
+    const RL = Math.max(0, 2 * nz * nx * LV[0] + 2 * nz * ny * LV[1] + (2 * nz * nz - 1) * LV[2]);
+    let alb, ks, pw, gl = 0;
+    if (a < 118) {
+      const f = white(Math.floor(c * 1.6 + 40), Math.floor(a / 7), 61);
+      alb = [.15, .095, .052].map(v => v * (.6 + .6 * f) * (.55 + .45 * sstep(118, 60, a))); ks = .08; pw = 30;
+      gl = sstep(38, 14, a) * (.75 + .25 * white(x, y, 63));
+    } else if (a < 138) {
+      const band = .5 + .5 * Math.sin((a * 1.3 + c * .5) * 2.1);
+      alb = [.16, .05, .03].map(v => v * (.6 + .5 * band)); ks = .04; pw = 12;
+    } else { alb = [.05, .02, .014]; ks = .5; pw = 60; }
+    for (let i = 0; i < 3; i++) {
+      let v = alb[i] * (KEY[i] * NL * kf + SKY[i] * (.6 + .4 * nz)) + KEY[i] * kf * (ks * Math.pow(NH, pw) + (a > 138 ? .1 * Math.pow(NH, 16) : .02 * Math.pow(NH, 6)));
+      if (gl > 0) v = mix(v, AG[i] * (.42 * (KEY[i] * NL * kf + SKY[i]) + .5 * KEY[i] * RL * RL * kf) * (.92 + .16 * white(x, y, 65)) + .4 * KEY[i] * Math.pow(NH, 70) * kf, gl);
+      BRC[k * 4 + i] = toS(v);
+    }
+    BRC[k * 4 + 3] = Math.round(255 * cov); BCOV[k] = cov;
+  }
+}
+
+// ---------- the shards as sprites: every bowl pixel belongs to one, so they part and rejoin cleanly ----------
+// Crack pixels go to the nearest shard (a breadth-first fill from all shards at once). Each shard
+// has two looks: apart, its broken edge shows the buff clay body; home, the dark lacquered crack.
+const OWN = new Int32Array(N).fill(-1);
+let SHARDS = [], T_LOCK = 0;
+const canvasOf = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
+const ease = u => { u = clamp(u, 0, 1); return u * u * u * (u * (6 * u - 15) + 10); };   // slow in, slow out
+function buildShards(S) {
+  const q = new Int32Array(N); let h = 0, n = 0;
+  for (let y = BY0; y < BY1; y++) for (let x = BX0; x < BX1; x++) { const k = y * W + x; if (LBL[k] >= 0 && BA[k] > 0) { OWN[k] = LBL[k]; q[n++] = k; } }
+  while (h < n) {
+    const k = q[h++], x = k % W;
+    for (const m of [x > BX0 ? k - 1 : -1, x < BX1 - 1 ? k + 1 : -1, k - W, k + W]) if (m >= BY0 * W && m < BY1 * W && OWN[m] < 0 && BA[m] > 0) { OWN[m] = OWN[k]; q[n++] = m; }
+  }
+  const st = [];
+  for (let k = BY0 * W; k < BY1 * W; k++) {
+    const i = OWN[k]; if (i < 0) continue;
+    const x = k % W, y = (k - x) / W, o = st[i] || (st[i] = { x0: x, x1: x, y0: y, y1: y, sx: 0, sy: 0, n: 0 });
+    o.x0 = Math.min(o.x0, x); o.x1 = Math.max(o.x1, x); o.y0 = Math.min(o.y0, y); o.y1 = Math.max(o.y1, y); o.sx += x; o.sy += y; o.n++;
+  }
+  const nC = noiseFor('clay'), ys = st.filter(Boolean).map(o => o.sy / o.n), yLo = Math.min(...ys), yHi = Math.max(...ys);
+  SHARDS = st.map((o, i) => {
+    if (!o) return null;
+    const w = o.x1 - o.x0 + 1, hh = o.y1 - o.y0 + 1, pre = new ImageData(w, hh), apart = new ImageData(w, hh), home = new ImageData(w, hh);
+    for (let y = o.y0; y <= o.y1; y++) for (let x = o.x0; x <= o.x1; x++) {
+      const k = y * W + x; if (OWN[k] !== i) continue;
+      const j = ((y - o.y0) * w + (x - o.x0)) * 4, kf = kfall(x, y), cc = S.CC[k], edge = LBL[k] < 0, m = S.M[k];
+      // the fracture face: buff clay, darker deep in the break
+      const deep = edge ? sstep(-.2 * WD[k], -WD[k], E[k]) : 0, g = (.82 + .36 * nC(x / 2.6, y / 2.6)) * (1 - .45 * deep);
+      for (let c = 0; c < 3; c++) {
+        const b = BOWL[k * 3 + c];
+        apart.data[j + c] = toS(edge ? CLAY[c] * g * (KEY[c] * .6 * kf + SKY[c] * .9) : b);
+        home.data[j + c] = toS(mix(b, [.004, .0035, .003][c], cc));
+        pre.data[j + c] = toS(m >= 0 ? mix(b, S.cl[m * 3 + c], cc) : b);
+      }
+      pre.data[j + 3] = apart.data[j + 3] = home.data[j + 3] = Math.round(255 * BA[k]);
+    }
+    const [ca, cb, cp] = [apart, home, pre].map(im => { const c = canvasOf(w, hh); c.getContext('2d').putImageData(im, 0, 0); return c; });
+    // its own shadow: the silhouette, darkened and softened once at quarter size
+    const sil = canvasOf(w, hh), gs = sil.getContext('2d'); gs.drawImage(cb, 0, 0); gs.globalCompositeOperation = 'source-in'; gs.fillStyle = 'rgb(7,6,5)'; gs.fillRect(0, 0, w, hh);
+    const sh = canvasOf(Math.ceil(w / 4) + 10, Math.ceil(hh / 4) + 10), gq = sh.getContext('2d'); gq.filter = 'blur(2.5px)'; gq.drawImage(sil, 5, 5, w / 4, hh / 4);
+    const r = rngFor('part' + i), cx0 = o.sx / o.n, cy0 = o.sy / o.n;
+    // an exploded view: each shard lifts off the cloth, moves out from the bowl's centre, turns a
+    // little and tips (foreshortened along one axis); the foot end goes home first, the far rim last
+    const back = 2.72 + .3 * (1 - (cy0 - yLo) / Math.max(1, yHi - yLo)) + .03 * r();
+    return { apart: ca, home: cb, pre: cp, sh, x0: o.x0, y0: o.y0, w, h: hh, cx: cx0, cy: cy0, dx: (cx0 - CX) * .075 + (r() - .5) * 5, dy: (cy0 - CY) * .075 + (r() - .5) * 5,
+      rot: (r() - .5) * 2.6 * DEG, lift: .02 + .02 * r(), axis: r() * Math.PI, out: 2.03 + .06 * r(), back };
+  }).filter(Boolean).sort((a, b) => a.lift - b.lift);   // the highest shard is drawn last, its shadow on the others
+  T_LOCK = Math.max(...SHARDS.map(o => o.back)) + .34;
+}
+// how far a shard is from home, and how high it is: up over 0.6 s; home in 0.34 s, landing at 80%
+// of that and lifting a hair once more as it settles
+function sepOf(o, t) {
+  const u = (t - o.back) / .34, down = 1 - ease(u / .8), up = ease((t - o.out) / .6);
+  return [up * down, up * (down + .045 * Math.sin(Math.PI * clamp((u - .8) / .2, 0, 1)))];
+}
+
+// ---------- bake and seek ----------
+// t 0-0.5 bare linen; 0.5-1.5 the bowl is carried in from the far edge and set down; 1.55-2.1 it cracks, each line
+// of the phrase one crack; 2.03-2.7 the shards lift apart; 2.72-T_LOCK they go home one by one;
+// 3.38-4.6 gold flows line by line, the last still wet; 4.0-4.6 the brush is laid on it; then a hold.
+const OUT = cx.createImageData(W, H);
+let REST8 = null, G8, SH, SHQ, TQ, WHOLE, FOOT, BRS, BRSH, SPX;
+function layer(fn) { const c = canvasOf(W, H), g = c.getContext('2d'), im = g.createImageData(W, H); fn(im.data); g.putImageData(im, 0, 0); return c; }
+const MS = {}; const timed = (k, f) => { const a = performance.now(), v = f(); MS[k] = Math.round(performance.now() - a); return v; };
+function bake() {
+  timed('seams', buildSeams); timed('detail', surfaceDetail);
+  const tilts = timed('label', labelShards); timed('lift', () => liftShards(tilts));
+  timed('ground', shadeGround);
+  SPX = timed('gold', () => shadeGold(timed('bowl', () => shadeBowl(tilts))));
+  timed('brush', drawBrush);
+  REST8 = new Uint8ClampedArray(N * 4);
+  for (let k = 0; k < N; k++) {
+    for (let i = 0; i < 3; i++) { BASE[k * 3 + i] = mix(GRD[k * 3 + i] * SHB[k], BOWL[k * 3 + i], BA[k]); REST8[k * 4 + i] = toS(BASE[k * 3 + i]); }
+    REST8[k * 4 + 3] = 255;
+  }
+  G8 = layer(d => { for (let k = 0; k < N; k++) { for (let i = 0; i < 3; i++) d[k * 4 + i] = toS(GRD[k * 3 + i]); d[k * 4 + 3] = 255; } });
+  const grey = A => d => { for (let k = 0; k < N; k++) { d[k * 4] = d[k * 4 + 1] = d[k * 4 + 2] = toS(A[k]); d[k * 4 + 3] = 255; } };
+  SH = layer(grey(SHB)); BRSH = layer(grey(BSH));
+  // a quarter-size copy of the shadow, padded with white so a blur never pulls in the canvas edge
+  SHQ = canvasOf(W / 4 + 80, H / 4 + 360); TQ = canvasOf(W / 4 + 80, H / 4 + 360);
+  { const g = SHQ.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, W / 4 + 80, H / 4 + 360); g.drawImage(SH, 40, 320, W / 4, H / 4); }
+  WHOLE = layer(d => { for (let k = 0; k < N; k++) if (BA[k] > 0) { for (let i = 0; i < 3; i++) d[k * 4 + i] = toS(BOWL[k * 3 + i]); d[k * 4 + 3] = Math.round(255 * BA[k]); } });
+  FOOT = layer(d => { for (let k = 0; k < N; k++) { d[k * 4] = 9; d[k * 4 + 1] = 8; d[k * 4 + 2] = 7; d[k * 4 + 3] = Math.round(215 * BA[k]); } });
+  BRS = layer(d => d.set(BRC));
+  timed('shards', () => buildShards(SPX)); window.__ms = MS;
+}
+// the bowl arrives from the far edge of the cloth and is lowered: high, it is larger and its
+// shadow falls further off and softer, arriving first; at rest the shadow tucks in under the foot.
+// It comes from the far edge so that it never crosses the film's edge strip at the near one.
+const LIFT = 1460;   // far enough that the leading shadow starts out of frame
+function setDown(u) {
+  const h = (1 - u) * 170, hn = h / 170, lift = -(1 - u) * LIFT, s = 1 + h / 1500, so = h / TANE;
+  const place = (ox, oy) => cx.setTransform(s, 0, 0, s, CX - s * CX + ox, CY - s * CY + oy - FY);
+  cx.drawImage(G8, 0, 0);
+  cx.globalCompositeOperation = 'multiply';
+  place(-L2[0] * so, lift - L2[1] * so);
+  cx.imageSmoothingEnabled = false; cx.globalAlpha = 1 - hn; cx.drawImage(SH, 0, 0); cx.imageSmoothingEnabled = true;
+  const g = TQ.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, W / 4 + 80, H / 4 + 360); g.filter = `blur(${(.3 + h * .016).toFixed(2)}px)`; g.drawImage(SHQ, 0, 0); g.filter = 'none';
+  cx.globalAlpha = hn * (1 - .4 * hn); cx.drawImage(TQ, 0, 0, W / 4 + 80, H / 4 + 360, -160, -1280, W + 320, H + 1440);
+  cx.globalCompositeOperation = 'source-over'; cx.globalAlpha = 1;
+  place(0, lift); cx.drawImage(WHOLE, 0, 0);
+  cx.setTransform(1, 0, 0, 1, 0, -FY);
+}
+// apart: the cloth shows dark through the gaps; each shard turns its broken clay edge to us
+function apart(t) {
+  cx.drawImage(G8, 0, 0);
+  cx.globalCompositeOperation = 'multiply'; cx.drawImage(SH, 0, 0); cx.globalCompositeOperation = 'source-over';
+  let mx = 0; for (const o of SHARDS) mx = Math.max(mx, sepOf(o, t)[0]);
+  cx.globalAlpha = mx; cx.drawImage(FOOT, 0, 0); cx.globalAlpha = 1;
+  for (const o of SHARDS) {
+    const [e, hl] = sepOf(o, t), rest = t < o.back ? o.pre : o.home;   // before it leaves, the bare break; once home, the lacquered seam
+    if (e < .002 && hl < .002) { cx.drawImage(rest, o.x0, o.y0); continue; }
+    // lifted, it is a little larger, tipped, and casts a soft shadow down and to the right
+    const S = 1 + o.lift * hl, fs = 1 - .02 * hl, so = 34 * hl, place = (ox, oy) => {
+      cx.setTransform(1, 0, 0, 1, o.cx + o.dx * e + ox, o.cy + o.dy * e + oy - FY); cx.rotate(o.rot * e + o.axis); cx.scale(S, S * fs); cx.rotate(-o.axis); cx.translate(-o.cx, -o.cy); };
+    place(-L2[0] * so, -L2[1] * so); cx.globalAlpha = .62 * sstep(0, .3, hl); cx.drawImage(o.sh, o.x0 - 20, o.y0 - 20, o.sh.width * 4, o.sh.height * 4);
+    place(0, 0);
+    const kA = sstep(0, .25, e); cx.globalAlpha = 1 - kA; cx.drawImage(rest, o.x0, o.y0); cx.globalAlpha = kA; cx.drawImage(o.apart, o.x0, o.y0);
+    cx.globalAlpha = 1; cx.setTransform(1, 0, 0, 1, 0, -FY);
+  }
+}
+// at rest: the crack runs along each line, then gold follows it seam by seam, glossy as it lands
+// and drying to satin, the last seam still wet
+function pixels(t) {
+  const d = OUT.data; d.set(REST8);
+  const S = SPX, n = S.k.length;
+  const run = (k, a, b) => { const s = SEAMS[SID[k]]; return clamp(((t - a) / Math.max(1e-3, b - a) - SP[k]) * s.L / 5 + 1, 0, 1); };
+  const fillAt = k => run(k, SEAMS[SID[k]].t0, SEAMS[SID[k]].t1);
+  const px = (k, r, g, b) => { d[k * 4] = toS(r); d[k * 4 + 1] = toS(g); d[k * 4 + 2] = toS(b); };
+  for (let m = 0; m < n; m++) {
+    const k = S.k[m], s = SEAMS[SID[k]], cr = run(k, s.c0, s.c1); if (cr <= 0) continue;
+    const fl = run(k, s.t0, s.t1), tp = s.t0 + SP[k] * (s.t1 - s.t0);
+    const wt = fl <= 0 ? 0 : s.wet ? 1 : Math.exp(-Math.max(0, t - tp) / .5);
+    let r = BASE[k * 3], g = BASE[k * 3 + 1], b = BASE[k * 3 + 2];
+    const q = k - 1 - 2 * W;
+    if (S.CG[q] > 0) { const sh = .25 * S.CG[q] * fillAt(q) * (1 - S.cg[m]); r *= 1 - sh; g *= 1 - sh; b *= 1 - sh; }
+    const cc = S.cc[m] * cr * (1 - fl), j = m * 3;
+    if (cc > 0) { if (t < T_LOCK) { r = mix(r, S.cl[j], cc); g = mix(g, S.cl[j + 1], cc); b = mix(b, S.cl[j + 2], cc); } else { r = mix(r, .004, cc); g = mix(g, .0035, cc); b = mix(b, .003, cc); } }
+    const cu = S.cu[m] * fl, cg = S.cg[m] * fl;
+    r = mix(mix(r, mix(S.ud[j], S.uw[j], wt), cu), mix(S.gd[j], S.gw[j], wt), cg);
+    g = mix(mix(g, mix(S.ud[j + 1], S.uw[j + 1], wt), cu), mix(S.gd[j + 1], S.gw[j + 1], wt), cg);
+    b = mix(mix(b, mix(S.ud[j + 2], S.uw[j + 2], wt), cu), mix(S.gd[j + 2], S.gw[j + 2], wt), cg);
+    px(k, r, g, b);
+  }
+  cx.putImageData(OUT, 0, -FY, 0, FY, W, HF);
+}
+// the brush slides down its own axis until its point rests on the wet seam; its shadow travels with it
+function brush(t) {
+  const off = 660 * (1 - ease((t - 4.0) / .6)), sx = BD[0] - L2[0] * BK / TANE, sy = BD[1] - L2[1] * BK / TANE;
+  cx.globalCompositeOperation = 'multiply'; cx.drawImage(BRSH, off * sx, off * sy);
+  cx.globalCompositeOperation = 'source-over'; cx.drawImage(BRS, off * BD[0], off * BD[1]);
+}
+function seek(t) {
+  t = clamp(+t || 0, 0, DUR);
+  cx.setTransform(1, 0, 0, 1, 0, -FY); cx.globalCompositeOperation = 'source-over'; cx.globalAlpha = 1; cx.filter = 'none';
+  if (t < .5) cx.drawImage(G8, 0, 0);
+  else if (t < 1.5) setDown(ease((t - .5) / 1.0));
+  else if (t >= 2.03 && t < T_LOCK) apart(t);
+  else { pixels(t); if (t > 4.0) brush(t); }
+}
+// the bake runs after the page has loaded, so a busy machine slows the first frame and never
+// trips the loader's timeout
+window.__riso = { duration: DUR, ready: false, seek, hero: HERO, build: { end: BUILD_END } };
+addEventListener('load', () => setTimeout(() => { bake(); seek(HERO); window.__riso.ready = true; }, 0));
+</script>
+</body></html>

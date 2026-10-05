@@ -1,0 +1,990 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>16 specimen drawer</title>
+<style>html,body{margin:0;background:#2a2119}canvas{display:block;width:720px;height:900px}</style>
+</head><body><canvas id="c" width="1080" height="1350"></canvas>
+<script>
+// No fonts and no images: every letter is drawn in code, as a marking in a moth's scales.
+</script>
+<script>
+"use strict";
+const PHRASE_TO_RENDER = 'a little faith in impossible things';
+// A glazed entomology drawer seen from above. Six moths are pinned in white card unit trays in an
+// oak frame, and each carries one word of the phrase as a marking in its scales.
+const W = 1080, H = 1350, DUR = 6, HERO = 5.3; // the hero is the finished drawer, BUILD_END + 0.6
+const cv = document.getElementById('c'), X = cv.getContext('2d');
+
+// ---------- seeded randomness ----------
+function hash(s) { let h = 2166136261 >>> 0; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+function rngFor(key) {
+  let a = hash(key);
+  return () => { a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+function noiseFor(key) {
+  const r = rngFor(key), P = new Uint16Array(512), G = new Float32Array(512);
+  for (let i = 0; i < 256; i++) { P[i] = i; const a = r() * Math.PI * 2; G[2 * i] = Math.cos(a); G[2 * i + 1] = Math.sin(a); }
+  for (let i = 255; i > 0; i--) { const j = (r() * (i + 1)) | 0, t = P[i]; P[i] = P[j]; P[j] = t; }
+  for (let i = 0; i < 256; i++) P[i + 256] = P[i];
+  const g = (h, x, y) => G[2 * h] * x + G[2 * h + 1] * y;
+  return (x, y) => {
+    const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi, Xi = xi & 255, Yi = yi & 255;
+    const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+    const a = P[P[Xi] + Yi], b = P[P[Xi + 1] + Yi], c = P[P[Xi] + Yi + 1], d = P[P[Xi + 1] + Yi + 1];
+    const x1 = g(a, xf, yf) + (g(b, xf - 1, yf) - g(a, xf, yf)) * u;
+    const x2 = g(c, xf, yf - 1) + (g(d, xf - 1, yf - 1) - g(c, xf, yf - 1)) * u;
+    return (x1 + (x2 - x1) * v) * 1.4;
+  };
+}
+const _nz = {}; const nzc = k => _nz[k] || (_nz[k] = noiseFor(k));
+function fbm(n, x, y, oct = 4) { let s = 0, a = 0.5, f = 1, t = 0; for (let i = 0; i < oct; i++) { s += a * n(x * f, y * f); t += a; a *= 0.5; f *= 2.03; } return s / t; }
+const clamp = (v, a = 0, b = 1) => v < a ? a : v > b ? b : v, lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+const hex = c => [parseInt(c.slice(1, 3), 16), parseInt(c.slice(3, 5), 16), parseInt(c.slice(5, 7), 16)];
+const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+const shade = (c, k) => [c[0] * k, c[1] * k, c[2] * k];
+const rgba = (c, a = 1) => `rgba(${clamp(c[0], 0, 255) | 0},${clamp(c[1], 0, 255) | 0},${clamp(c[2], 0, 255) | 0},${a})`;
+function mk(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+const ease = t => { t = clamp(t); return 1 - Math.pow(1 - t, 3); };
+
+// ---------- palette: a decision, four families ----------
+// OAK: the drawer's quartersawn frame. LABEL: cream card and the typewriter's brown-black ribbon.
+// MOTH: umber, cinnamon and ochre, the scales of five species. BLUE: one species whose colour is
+// structural, so it shifts scale by scale and wing by wing with the light.
+const PAL = {
+  oakDark: hex('#3a2617'), oak: hex('#6b4628'), oakLight: hex('#9a6c40'),
+  floor: hex('#e2d8c2'), cork: hex('#a07a52'), card: hex('#efe6d0'), ink: hex('#2c231d'), iron: hex('#4a3322'),
+  umber: hex('#4b3020'), cinnamon: hex('#94592f'), ochre: hex('#c18d45'), buff: hex('#dcc196'),
+  blue: hex('#2a56c2'), blueDeep: hex('#14246e'), blueHi: hex('#4f8ee0'),
+};
+
+// ---------- light: one raking window, upper left ----------
+// Shadows fall down-right. A thing at height h (px) throws its shadow h*K away. The tray walls stand
+// close to the floor and throw sharp shadows; a specimen rides three centimetres up its pin and
+// throws a wide, soft one.
+const SH = { x: 0.56, y: 0.83 }, K = 1.1, SOFT = 0.03;
+const MM = 3.6; // px per millimetre across the whole drawer
+const HEIGHT = { moth: 32 * MM, trayWall: 12 * MM, drawerWall: 22 * MM }; // a specimen rides high on its pin, clear of the walls
+
+// ---------- wing geometry ----------
+// A wing is a closed Catmull-Rom outline in right-wing local px (origin: thorax centre, head up).
+// The left wing is the same outline mirrored, re-set a degree or two off: no setter is exact.
+function spline(pts, seg = 20) {
+  const out = [], n = pts.length;
+  for (let i = 0; i < n; i++) {
+    const p0 = pts[(i - 1 + n) % n], p1 = pts[i], p2 = pts[(i + 1) % n], p3 = pts[(i + 2) % n];
+    for (let k = 0; k < seg; k++) {
+      const t = k / seg, t2 = t * t, t3 = t2 * t, f = j => 0.5 * (2 * p1[j] + (-p0[j] + p2[j]) * t + (2 * p0[j] - 5 * p1[j] + 4 * p2[j] - p3[j]) * t2 + (-p0[j] + 3 * p1[j] - 3 * p2[j] + p3[j]) * t3);
+      out.push([f(0), f(1)]);
+    }
+  }
+  return out;
+}
+const NB = 1440;
+function makeWing(pts, base, hs, side, rot, scl = 1) {
+  const poly = spline(pts.map(p => [p[0] * hs * scl, p[1] * hs * scl])), b = [base[0] * hs * scl, base[1] * hs * scl];
+  const R = new Float32Array(NB);
+  for (let i = 0; i < NB; i++) {
+    const a = -Math.PI + (i + 0.5) / NB * Math.PI * 2, dx = Math.cos(a), dy = Math.sin(a);
+    let best = 0;
+    for (let k = 0; k < poly.length; k++) {
+      const p = poly[k], q = poly[(k + 1) % poly.length], ex = q[0] - p[0], ey = q[1] - p[1];
+      const den = dx * ey - dy * ex; if (Math.abs(den) < 1e-9) continue;
+      const wx = p[0] - b[0], wy = p[1] - b[1], t = (wx * ey - wy * ex) / den, u = (wx * dy - wy * dx) / den;
+      if (t > 0 && u >= 0 && u <= 1 && t > best) best = t;
+    }
+    R[i] = best;
+  }
+  let maxR = 0; for (const v of R) maxR = Math.max(maxR, v);
+  let amin = 9, amax = -9;
+  for (const p of poly) { const dx = p[0] - b[0], dy = p[1] - b[1]; if (Math.hypot(dx, dy) < 0.35 * maxR) continue; const a = Math.atan2(dy, dx); amin = Math.min(amin, a); amax = Math.max(amax, a); }
+  const c = Math.cos(rot), s = Math.sin(rot), q = [b[0] * side, b[1]];
+  const w = { poly, base: b, R, maxR, amin, amax, side, hs,
+    // local (right-wing) -> moth px
+    fwd: (x, y) => { const vx = (x - b[0]) * side, vy = y - b[1]; return [q[0] + vx * c - vy * s, q[1] + vx * s + vy * c]; },
+    inv: (x, y) => { const vx = x - q[0], vy = y - q[1]; return [b[0] + (vx * c + vy * s) * side, b[1] + (-vx * s + vy * c)]; },
+    setT: (ctx, ox, oy) => { ctx.setTransform(c * side, s * side, -s, c, ox + q[0] - (c * side * b[0] - s * b[1]), oy + q[1] - (s * side * b[0] + c * b[1])); },
+  };
+  w.polar = (x, y) => {
+    const dx = x - b[0], dy = y - b[1], d = Math.hypot(dx, dy), a = Math.atan2(dy, dx);
+    const i = clamp(Math.floor((a + Math.PI) / (Math.PI * 2) * NB), 0, NB - 1), Rr = R[i] || 1e-6;
+    return { d, a, r: d / Rr, fn: (a - amin) / (amax - amin), Rr };
+  };
+  return w;
+}
+// Veins radiate from the base: each runs from a trunk angle (near the base) to its end angle
+// at the margin, so the cell and the branching read without drawing a diagram.
+function veinDist(w, P, veins) {
+  let best = 1e9;
+  for (const v of veins) {
+    const t = smooth(v[2] ?? 0.12, v[3] ?? 0.55, P.r), fv = lerp(v[0], v[1], t);
+    if (P.r < (v[4] ?? 0)) continue;
+    const da = Math.abs(P.fn - fv) * (w.amax - w.amin) * P.d; if (da < best) best = da;
+  }
+  return best;
+}
+
+// ---------- wing pattern helpers ----------
+// Lines run as iso-lines of r (base-to-margin fraction), so they follow each wing's own shape the
+// way antemedial and postmedial lines do on a real wing.
+const AA = 0.9;
+function lineCov(P, r0, wpx) { const d = Math.abs(P.r - r0) * P.Rr, h = Math.max(wpx, 1.1) / 2; return 1 - smooth(h - AA, h + AA, d); }
+function ringCov(d, r0, r1) { return smooth(r0 - AA, r0 + AA, d) * (1 - smooth(r1 - AA, r1 + AA, d)); }
+function dSeg(x, y, ax, ay, bx, by) { const vx = bx - ax, vy = by - ay, t = clamp(((x - ax) * vx + (y - ay) * vy) / (vx * vx + vy * vy)); return Math.hypot(x - ax - vx * t, y - ay - vy * t); }
+function veinMod(w, P, veins, c, k, wpx) { const d = veinDist(w, P, veins), h = Math.max(wpx, 1) / 2; return mix(c, shade(c, k), 1 - smooth(h - 0.6, h + 0.8, d)); }
+
+// The letters: an "o" is an eyespot whose counter is a clear, scaleless window; the "b" is
+// drawn by the thorax fur. Both are slightly oval and share one baseline.
+const LET = { oRx: 30, oRy: 33, stroke: 16, cy: 24 };
+function ovalD(x, y, cx, cy, rx, ry) { const nx = (x - cx) / rx, ny = (y - cy) / ry, k = Math.hypot(nx, ny); return k * (rx + ry) / 2; }
+
+const SPECIES = {};
+SPECIES.obo = {
+  key: 'obo', hs: 430, name: 'Onebyonia singulatim',
+  fw: { base: [0.05, -0.05], pts: [[0.05, -0.095], [0.24, -0.17], [0.52, -0.232], [0.8, -0.27], [0.955, -0.268], [0.99, -0.236], [0.95, -0.15], [0.885, -0.02], [0.79, 0.12], [0.665, 0.235], [0.52, 0.235], [0.32, 0.175], [0.13, 0.095], [0.05, 0.03]] },
+  hw: { base: [0.04, 0.03], pts: [[0.05, -0.01], [0.3, 0.04], [0.55, 0.11], [0.69, 0.2], [0.735, 0.31], [0.7, 0.45], [0.585, 0.585], [0.43, 0.68], [0.27, 0.715], [0.14, 0.665], [0.065, 0.52], [0.045, 0.3]] },
+  body: { thW: 0.1, thL: 0.152, abL: 0.62, abW: 0.066, fur: [PAL.cinnamon, PAL.ochre], abFur: [PAL.cinnamon, PAL.buff] },
+  ant: { kind: 'feather', len: 0.36, ang: 0.5, comb: 0.05 },
+  eye: [186, 24],
+  fwVeins: [[0.05, 0.02], [0.1, 0.1], [0.16, 0.2], [0.2, 0.32], [0.28, 0.45], [0.36, 0.58], [0.45, 0.7], [0.56, 0.8], [0.7, 0.9]],
+  hwVeins: [[0.1, 0.08], [0.2, 0.2], [0.3, 0.34], [0.38, 0.48], [0.46, 0.62], [0.55, 0.76], [0.66, 0.88]],
+  paint(wn, w, x, y, P, nz) {
+    const fw = wn === 'fw', hs = this.hs, wig = nz(P.fn * 3.1 + (fw ? 0 : 9), 1.3 + w.side) * 0.018;
+    const mott = fbm(nz, x / hs * 9, y / hs * 9, 3), cloud = fbm(nz, x / hs * 3.2 + 11, y / hs * 3.2, 3);
+    const am = 0.3 + 0.028 * Math.sin(P.fn * 6.5) + wig + 0.012 * nz(P.fn * 14, 3);
+    const pm = (fw ? 0.68 : 0.6) + 0.022 * Math.sin(P.fn * 9 + (fw ? 0 : 2)) + wig + 0.01 * nz(P.fn * 17, 5);
+    // zones, base to margin: umber hair at the base, a cinnamon basal field, an ochre median
+    // clouded with cinnamon, the pale postmedial line, a rosy-umber submarginal band, buff margin
+    let c = mix(shade(PAL.umber, 1.1), PAL.cinnamon, smooth(0.04, 0.22, P.r));
+    c = mix(c, mix(PAL.ochre, PAL.cinnamon, 0.25), smooth(fw ? am - 0.03 : 0.22, fw ? am + 0.01 : 0.36, P.r));
+    c = mix(c, PAL.cinnamon, clamp(cloud * 1.6 + 0.15) * smooth(0.3, 0.4, P.r) * (1 - smooth(pm - 0.08, pm, P.r)) * 0.55);
+    c = mix(c, mix(hex('#8a5a40'), PAL.ochre, 0.35), smooth(pm + 0.02, pm + 0.06, P.r));
+    c = mix(c, mix(hex('#7a5038'), PAL.cinnamon, 0.3), smooth(0.86, 0.96, P.r) * 0.6);
+    c = shade(c, 1 + mott * 0.09 + (fw ? 0.03 - 0.06 * P.fn : -0.03 * P.r));
+    if (fw) {
+      c = mix(c, PAL.buff, lineCov(P, am - 0.02, 0.011 * hs) * 0.8);
+      c = mix(c, PAL.umber, lineCov(P, am, 0.01 * hs) * 0.9);
+      // apical mark: a soft dark wedge under a pale zigzag, as on Antheraea
+      const ad = dSeg(x, y, 0.79 * hs, -0.2 * hs, 0.94 * hs, -0.245 * hs);
+      c = mix(c, PAL.umber, (1 - smooth(0.006 * hs, 0.03 * hs, ad)) * 0.4);
+      c = mix(c, hex('#e8d6b4'), (1 - smooth(0.004 * hs, 0.016 * hs, Math.abs(ad - 0.034 * hs))) * 0.4);
+    }
+    c = mix(c, PAL.umber, lineCov(P, pm, 0.011 * hs) * 0.85);
+    c = mix(c, hex('#ead9b6'), lineCov(P, pm + 0.024, 0.013 * hs) * 0.85);
+    c = mix(c, shade(PAL.umber, 1.05), lineCov(P, (fw ? 0.875 : 0.85) + 0.02 * Math.sin(P.fn * 26) + wig, 0.007 * hs) * 0.6);
+    c = veinMod(w, P, fw ? this.fwVeins : this.hwVeins, c, 0.82, 0.006 * hs);
+    if (!fw) { // a small discal spot on the hindwing, no window
+      const dd = Math.hypot(x - 0.36 * hs, y - 0.33 * hs);
+      c = mix(c, PAL.umber, (1 - smooth(0.022 * hs, 0.03 * hs, dd)) * 0.55);
+    }
+    let win = 0;
+    if (fw && this.eye) {
+      const d = ovalD(x, y, this.eye[0], this.eye[1], LET.oRx, LET.oRy), s = LET.stroke;
+      const rIn = (LET.oRx + LET.oRy) / 2 - s;
+      win = 1 - smooth(rIn - 1.2, rIn + 0.6, d);
+      c = mix(c, PAL.umber, ringCov(d, rIn, rIn + s));
+      // the eyespot's outer rings stay quiet so the dark ring reads as one letter, not a target
+      c = mix(c, mix(PAL.ochre, hex('#dcae58'), 0.5), ringCov(d, rIn + s, rIn + s + 7.5));
+      c = mix(c, mix(PAL.cinnamon, PAL.umber, 0.3), ringCov(d, rIn + s + 7.5, rIn + s + 9.5) * 0.7);
+    }
+    return { c, win };
+  },
+};
+
+const V9 = [[0.04, 0.02], [0.1, 0.12], [0.16, 0.24], [0.22, 0.36], [0.3, 0.5], [0.4, 0.63], [0.5, 0.75], [0.62, 0.86], [0.74, 0.95]];
+const V7 = [[0.1, 0.06], [0.2, 0.2], [0.3, 0.36], [0.4, 0.52], [0.5, 0.66], [0.6, 0.8], [0.7, 0.92]];
+// c p: a hawkmoth, built to push. Narrow pointed forewings with the oblique apical streak.
+SPECIES.cp = {
+  key: 'cp', hs: 84, name: 'Commitia propulsa',
+  fw: { base: [0.06, -0.06], pts: [[0.06, -0.11], [0.4, -0.21], [0.74, -0.29], [0.985, -0.34], [0.975, -0.3], [0.8, -0.13], [0.62, 0.0], [0.48, 0.085], [0.3, 0.085], [0.13, 0.045], [0.06, 0.0]] },
+  hw: { base: [0.05, 0.02], pts: [[0.06, -0.01], [0.3, 0.03], [0.5, 0.08], [0.57, 0.15], [0.5, 0.25], [0.35, 0.32], [0.2, 0.33], [0.08, 0.25], [0.05, 0.12]] },
+  body: { thW: 0.115, thL: 0.15, abL: 0.74, abW: 0.1, fur: [hex('#6e6050'), hex('#8a7a66')], abFur: [hex('#6e6050'), PAL.ochre], bands: 1 },
+  ant: { kind: 'thread', len: 0.36, ang: 0.42, club: 1 },
+  paint(wn, w, x, y, P, nz) {
+    const hs = this.hs, mott = fbm(nz, x / hs * 7, y / hs * 7, 3);
+    let c;
+    if (wn === 'fw') {
+      c = shade(mix(hex('#857564'), PAL.buff, 0.18 + 0.2 * smooth(0.5, 1, P.r)), 1 + mott * 0.1);
+      const sd = dSeg(x, y, 0.95 * hs, -0.33 * hs, 0.32 * hs, 0.06 * hs);
+      c = mix(c, PAL.umber, (1 - smooth(0.018 * hs, 0.03 * hs, sd)) * 0.8);
+      c = mix(c, PAL.buff, (1 - smooth(0.006 * hs, 0.012 * hs, Math.abs(sd - 0.04 * hs))) * 0.7);
+      c = mix(c, PAL.umber, (1 - smooth(0.012 * hs, 0.02 * hs, Math.hypot(x - 0.38 * hs, y + 0.12 * hs))) * 0.9);
+      c = veinMod(w, P, V9, c, 0.86, 1);
+    } else {
+      c = mix(PAL.ochre, hex('#d3a24c'), 0.4 + mott * 0.3);
+      c = mix(c, PAL.umber, smooth(0.62, 0.7, P.r) * 0.92);
+      c = mix(c, PAL.umber, (1 - smooth(0.2, 0.32, P.r)) * 0.7);
+    }
+    return { c, win: 0 };
+  },
+};
+// oic: the one structural colour in the drawer. Its blue is not pigment, so the paint is a
+// field of indices; the scale pass turns them into blue by each scale's angle to the light.
+SPECIES.oic = {
+  key: 'oic', hs: 86, name: 'Chromia aperta', blue: true,
+  fw: { base: [0.05, -0.05], pts: [[0.05, -0.1], [0.4, -0.2], [0.75, -0.26], [0.95, -0.27], [0.97, -0.2], [0.9, -0.05], [0.78, 0.13], [0.62, 0.2], [0.4, 0.15], [0.16, 0.07], [0.05, 0.02]] },
+  hw: { base: [0.05, 0.02], pts: [[0.05, -0.01], [0.35, 0.05], [0.62, 0.14], [0.7, 0.26], [0.66, 0.4], [0.6, 0.5], [0.56, 0.72], [0.5, 0.74], [0.47, 0.56], [0.36, 0.58], [0.2, 0.52], [0.08, 0.38], [0.05, 0.2]] },
+  body: { thW: 0.09, thL: 0.13, abL: 0.56, abW: 0.07, fur: [hex('#2a2a3a'), hex('#3a3550')], abFur: [hex('#2a2a3a'), PAL.ochre], bands: 1 },
+  ant: { kind: 'thread', len: 0.42, ang: 0.36 },
+  paint(wn, w, x, y, P, nz) {
+    const hs = this.hs, mott = fbm(nz, x / hs * 6, y / hs * 6, 2);
+    let c = shade(hex('#2c2620'), 1 + mott * 0.08), blue = 0;
+    if (wn === 'fw') {
+      for (const b of [0.3, 0.55, 0.8]) blue = Math.max(blue, lineCov(P, b + 0.02 * Math.sin(P.fn * 5 + b * 9), 0.075 * hs));
+      { const q = w.fwd(x, y); blue *= 1 - 0.85 * bandNear(this, q[0] + this.wOx, q[1] + this.wOy); } // the stripes go quiet behind the word
+    } else {
+      blue = smooth(0.08, 0.2, P.r) * (1 - smooth(0.72, 0.8, P.r));
+      if (P.r > 0.85 && P.fn > 0.25 && P.fn < 0.55) c = mix(c, PAL.buff, 0.85);
+    }
+    c = veinMod(w, P, wn === 'fw' ? V9 : V7, c, 0.8, 1);
+    return { c, win: 0, blue };
+  },
+};
+// cmu: a geometrid, the oldest specimen in the drawer: faded, a piece of hindwing lost.
+SPECIES.cmu = {
+  key: 'cmu', hs: 84, name: 'Catchmeupia octo', old: true,
+  fw: { base: [0.05, -0.05], pts: [[0.05, -0.085], [0.4, -0.145], [0.76, -0.205], [0.94, -0.225], [0.905, -0.08], [0.81, 0.1], [0.7, 0.205], [0.42, 0.145], [0.16, 0.065], [0.06, 0.02]] },
+  hw: { base: [0.05, 0.03], pts: [[0.06, 0.0], [0.36, 0.08], [0.66, 0.17], [0.76, 0.29], [0.745, 0.4], [0.61, 0.53], [0.41, 0.6], [0.21, 0.56], [0.08, 0.41], [0.05, 0.2]] },
+  body: { thW: 0.075, thL: 0.12, abL: 0.52, abW: 0.055, fur: [hex('#a48a66'), PAL.buff], abFur: [hex('#a48a66'), PAL.buff] },
+  ant: { kind: 'thread', len: 0.38, ang: 0.44 },
+  paint(wn, w, x, y, P, nz) {
+    const hs = this.hs, mott = fbm(nz, x / hs * 6, y / hs * 6, 3), fw = wn === 'fw';
+    let c = shade(mix(hex('#e3d2b0'), PAL.buff, 0.4 + mott * 0.4), 1 + mott * 0.05);
+    const off = fw ? 0 : -0.05;
+    for (const [r0, k] of [[0.34, 0.75], [0.6, 0.85], [0.635, 0.55], [0.8, 0.5]]) {
+      c = mix(c, mix(PAL.cinnamon, PAL.umber, 0.25), lineCov(P, r0 + off + 0.025 * Math.sin(P.fn * 14 + r0 * 30) + 0.01 * Math.sin(P.fn * 41), 1.5) * k);
+    }
+    c = mix(c, mix(PAL.cinnamon, PAL.buff, 0.3), smooth(0.64, 0.8, P.r) * (1 - smooth(0.8, 0.84, P.r)) * 0.35);
+    c = mix(c, PAL.umber, (1 - smooth(1.2, 2.4, Math.hypot(x - (fw ? 0.42 : 0.33) * hs, y - (fw ? -0.06 : 0.3) * hs))) * 0.85);
+    c = veinMod(w, P, fw ? V9 : V7, c, 0.9, 1);
+    return { c, win: 0 };
+  },
+};
+// cyu: a tiger moth (Arctiinae). Chocolate forewings netted in cream; ochre hindwings with umber spots.
+SPECIES.cyu = {
+  key: 'cyu', hs: 82, name: 'Confirmia intellecta',
+  fw: { base: [0.05, -0.05], pts: [[0.05, -0.1], [0.4, -0.19], [0.72, -0.24], [0.9, -0.22], [0.965, -0.13], [0.92, 0.0], [0.8, 0.13], [0.6, 0.18], [0.35, 0.13], [0.14, 0.06], [0.06, 0.02]] },
+  hw: { base: [0.05, 0.03], pts: [[0.06, 0.0], [0.35, 0.06], [0.62, 0.14], [0.72, 0.26], [0.68, 0.4], [0.52, 0.52], [0.32, 0.55], [0.15, 0.47], [0.06, 0.3]] },
+  body: { thW: 0.12, thL: 0.15, abL: 0.6, abW: 0.1, fur: [hex('#4a2c1c'), hex('#6a4028')], abFur: [hex('#b8722e'), shade(PAL.umber, 0.8)], bands: 1 },
+  ant: { kind: 'thread', len: 0.36, ang: 0.42 },
+  paint(wn, w, x, y, P, nz) {
+    const hs = this.hs; let c;
+    if (wn === 'fw') {
+      c = shade(mix(hex('#4e2c1a'), hex('#6e4226'), clamp(0.5 + fbm(nz, x / hs * 6, y / hs * 6, 2))), 1);
+      const net = Math.abs(fbm(nz, x / hs * 4.2 + 3, y / hs * 4.2, 3)); // cream lines along the noise's zero set: a hand-drawn net
+      const q = w.fwd(x, y), band = bandNear(this, q[0] + this.wOx, q[1] + this.wOy);
+      c = mix(c, hex('#ece0c6'), (1 - smooth(0.035, 0.075, net)) * smooth(0.08, 0.2, P.r) * (1 - 0.9 * band));
+    } else {
+      c = mix(hex('#c27a34'), hex('#d08f40'), clamp(0.5 + nz(x * 0.1, y * 0.1)));
+      for (const [sx, sy, sr] of [[0.42, 0.16, 0.07], [0.6, 0.3, 0.075], [0.4, 0.4, 0.06], [0.24, 0.3, 0.05]]) {
+        const d = Math.hypot(x - sx * hs, y - sy * hs) / hs + nz(x * 0.3, y * 0.3) * 0.015;
+        c = mix(c, hex('#2e2118'), 1 - smooth(sr - 0.012, sr, d));
+      }
+      c = mix(c, shade(PAL.umber, 0.8), (1 - smooth(0.12, 0.26, P.r)) * 0.7);
+    }
+    return { c: veinMod(w, P, wn === 'fw' ? V9 : V7, c, 0.9, 1), win: 0 };
+  },
+};
+// oid: a plume moth (Pterophoridae). The forewing is cleft into two lobes, the hindwing into three
+// feathers, all fringe; long legs set out behind.
+SPECIES.oid = {
+  key: 'oid', hs: 92, name: 'Downloadia deposita', fringeAll: 1, legs: 1,
+  fw: { base: [0.04, -0.05], pts: [[0.04, -0.085], [0.3, -0.105], [0.55, -0.13], [0.8, -0.165], [0.99, -0.2], [0.985, -0.172], [0.8, -0.138], [0.6, -0.112], [0.5, -0.096], [0.7, -0.075], [0.92, -0.052], [0.91, -0.024], [0.7, -0.036], [0.5, -0.03], [0.25, -0.015], [0.07, 0.0]] },
+  hw: { base: [0.04, 0.02], pts: [[0.05, 0.0], [0.45, 0.04], [0.82, 0.07], [0.82, 0.095], [0.45, 0.07], [0.31, 0.075], [0.5, 0.15], [0.72, 0.23], [0.71, 0.255], [0.48, 0.18], [0.29, 0.125], [0.38, 0.27], [0.5, 0.39], [0.48, 0.41], [0.33, 0.3], [0.15, 0.15], [0.05, 0.06]] },
+  body: { thW: 0.06, thL: 0.1, abL: 0.58, abW: 0.045, fur: [hex('#b39670'), hex('#d8c09a')], abFur: [hex('#b39670'), hex('#e0cba6')] },
+  ant: { kind: 'thread', len: 0.42, ang: 0.4 },
+  paint(wn, w, x, y, P, nz) {
+    const hs = this.hs; let c = mix(hex('#c2a47a'), hex('#a8875e'), clamp(0.5 + nz(x * 0.12, y * 0.12) * 0.8));
+    if (wn === 'fw') {
+      c = mix(c, PAL.umber, (1 - smooth(0.012 * hs, 0.022 * hs, Math.hypot(x - 0.6 * hs, y + 0.085 * hs))) * 0.85);
+      c = mix(c, PAL.cinnamon, (1 - smooth(0.006 * hs, 0.012 * hs, Math.hypot(x - 0.36 * hs, y + 0.06 * hs))) * 0.8);
+    }
+    return { c, win: 0 };
+  },
+};
+
+// faith: an owlet (noctuid). Kidney and round stigmata outlined pale; an ochre underwing.
+SPECIES.noc = {
+  key: 'noc', hs: 170,
+  fw: { base: [0.06, -0.05], pts: [[0.06, -0.095], [0.45, -0.175], [0.84, -0.225], [0.975, -0.205], [0.93, -0.06], [0.83, 0.1], [0.56, 0.11], [0.26, 0.065], [0.08, 0.02]] },
+  hw: { base: [0.05, 0.03], pts: [[0.06, 0.0], [0.4, 0.06], [0.7, 0.13], [0.765, 0.23], [0.67, 0.39], [0.45, 0.49], [0.25, 0.49], [0.1, 0.38], [0.05, 0.2]] },
+  body: { thW: 0.1, thL: 0.14, abL: 0.6, abW: 0.08, fur: [PAL.umber, hex('#7a5a40')], abFur: [hex('#7a6248'), PAL.buff] },
+  ant: { kind: 'thread', len: 0.4, ang: 0.4 },
+  paint(wn, w, x, y, P, nz) {
+    const hs = this.hs, mott = fbm(nz, x / hs * 8, y / hs * 8, 3);
+    let c;
+    if (wn === 'fw') {
+      c = shade(mix(PAL.umber, PAL.cinnamon, 0.55 + mott * 0.35), 1 + mott * 0.12);
+      c = mix(c, PAL.buff, lineCov(P, 0.3 + 0.03 * Math.sin(P.fn * 8), 2) * 0.7);
+      c = mix(c, PAL.buff, lineCov(P, 0.66 + 0.03 * Math.sin(P.fn * 12), 2) * 0.7);
+      c = mix(c, PAL.ochre, lineCov(P, 0.87 + 0.03 * Math.sin(P.fn * 20), 1.6) * 0.8);
+      c = veinMod(w, P, V9, c, 0.85, 1);
+    } else {
+      c = mix(hex('#cf9a3c'), PAL.ochre, 0.5 + mott * 0.4);
+      c = mix(c, PAL.umber, lineCov(P, 0.78 + 0.02 * Math.sin(P.fn * 6), 0.14 * hs) * 0.95);
+      c = mix(c, PAL.umber, (1 - smooth(0.12, 0.3, P.r)) * 0.4);
+    }
+    return { c, win: 0 };
+  },
+};
+// a: an eggar (lasiocampid), round and furred, russet with a pale discal dot.
+SPECIES.egg = {
+  key: 'egg', hs: 84,
+  fw: { base: [0.05, -0.05], pts: [[0.05, -0.09], [0.4, -0.17], [0.74, -0.205], [0.885, -0.15], [0.915, 0.0], [0.82, 0.145], [0.65, 0.205], [0.4, 0.155], [0.15, 0.07], [0.06, 0.02]] },
+  hw: { base: [0.05, 0.03], pts: [[0.06, 0.0], [0.35, 0.08], [0.6, 0.16], [0.665, 0.27], [0.585, 0.39], [0.4, 0.46], [0.22, 0.45], [0.09, 0.35], [0.05, 0.18]] },
+  body: { thW: 0.12, thL: 0.15, abL: 0.55, abW: 0.095, fur: [hex('#7c4526'), hex('#9a5a32')], abFur: [hex('#7c4526'), hex('#a8683c')] },
+  ant: { kind: 'feather', len: 0.28, ang: 0.52, comb: 0.06 },
+  paint(wn, w, x, y, P, nz) {
+    const hs = this.hs, mott = fbm(nz, x / hs * 7, y / hs * 7, 3);
+    let c = shade(mix(hex('#8a4a28'), PAL.cinnamon, 0.5 + mott * 0.4), wn === 'fw' ? 1 : 0.86);
+    if (wn === 'fw') {
+      c = mix(c, PAL.buff, lineCov(P, 0.36 + 0.02 * Math.sin(P.fn * 5), 1.6) * 0.55);
+      c = mix(c, PAL.buff, lineCov(P, 0.7 + 0.02 * Math.sin(P.fn * 7), 2) * 0.6);
+      c = mix(c, hex('#efe0c0'), (1 - smooth(0.028 * hs, 0.042 * hs, Math.hypot(x - 0.47 * hs, y + 0.05 * hs))));
+    }
+    c = veinMod(w, P, wn === 'fw' ? V9 : V7, c, 0.88, 1);
+    return { c, win: 0 };
+  },
+};
+
+// ---------- moth renderer ----------
+// Each wing: fringe first (it grows from under the scales), then a per-pixel under-layer
+// (membrane plus ground scales), then the cover scales laid as overlapping lozenges along the
+// veins, distal rows first so each row shingles over the next.
+const LIGHT_A = Math.atan2(-SH.y, -SH.x); // direction toward the light, in screen space
+function wingSet(sp) {
+  // no two wings are the same: each side's outline is nudged, and the setter pinned them unevenly
+  const r = rngFor(sp.key + 'set'), hs = sp.hs, jit = () => (r() - 0.5) * 0.03, A = sp.setting || [];
+  const nudge = pts => pts.map((p, i) => i === 0 ? p : [p[0] + (r() - 0.5) * 0.014, p[1] + (r() - 0.5) * 0.014]);
+  return {
+    hwR: makeWing(nudge(sp.hw.pts), sp.hw.base, hs, 1, A[0] ?? jit() + 0.006, 1),
+    hwL: makeWing(nudge(sp.hw.pts), sp.hw.base, hs, -1, A[1] ?? jit() - 0.01, 0.992 + r() * 0.012),
+    fwR: makeWing(nudge(sp.fw.pts), sp.fw.base, hs, 1, A[2] ?? jit() - 0.004, 1),
+    fwL: makeWing(nudge(sp.fw.pts), sp.fw.base, hs, -1, A[3] ?? jit() + 0.016, 0.986 + r() * 0.01),
+  };
+}
+function outward(w, p, q) {
+  let nx = q[1] - p[1], ny = -(q[0] - p[0]); const l = Math.hypot(nx, ny) || 1; nx /= l; ny /= l;
+  const m = [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2], t = w.polar(m[0] + nx * 2, m[1] + ny * 2);
+  return t.r > 1 ? [nx, ny] : [-nx, -ny];
+}
+function holeAt(sp, wk, x, y) { // a lost piece of wing: torn or chipped, ragged-edged
+  if (!sp.holes) return 0; const n = nzc(sp.key + 'tear'), hs = sp.hs;
+  for (const [k, tx, ty, tr] of sp.holes) if (k === wk && Math.hypot(x - tx * hs, y - ty * hs) < tr * hs * (1 + 0.35 * n(x * 0.25 * 90 / hs, y * 0.25 * 90 / hs))) return 1;
+  return 0;
+}
+function drawFringe(ctx, sp, w, wk, ox, oy, veins) {
+  const hs = sp.hs, r = rngFor(sp.key + wk + 'fr'), L = sp.fringeAll ? hs * 0.048 : Math.max(hs * (hs > 200 ? 0.017 : 0.026), 2.2), step = sp.fringeAll ? 0.8 : hs > 200 ? 1.0 : 0.4;
+  w.setT(ctx, ox, oy); ctx.lineCap = 'round';
+  for (let k = 0; k < w.poly.length; k++) {
+    const p = w.poly[k], q = w.poly[(k + 1) % w.poly.length], P = w.polar(p[0], p[1]);
+    if (P.d < (sp.fringeAll ? 0.2 : 0.45) * w.maxR) continue;
+    const n = outward(w, p, q), rd = [(p[0] - w.base[0]) / P.d, (p[1] - w.base[1]) / P.d];
+    if (!sp.fringeAll && n[0] * rd[0] + n[1] * rd[1] < 0.42) continue;
+    if (sp.gaps && sp.gaps.some(g => g[0] === wk && P.fn > g[1] && P.fn < g[2])) continue;
+    const seg = Math.hypot(q[0] - p[0], q[1] - p[1]);
+    for (let s = 0; s < seg; s += step) {
+      const x = p[0] + (q[0] - p[0]) * s / seg, y = p[1] + (q[1] - p[1]) * s / seg;
+      if (holeAt(sp, wk, x, y)) continue;
+      const PP = w.polar(x, y), vd = veinDist(w, PP, veins), dark = vd < hs * 0.02 ? 1 : 0;
+      const base = sp.paint(wk[0] === 'f' ? 'fw' : 'hw', w, x, y, { ...PP, r: 0.97 }, nzc(sp.key + wk + 'n')).c;
+      // fringe hairs take the margin's colour, darker where a vein ends, paling to their tips
+      const col = shade(base, dark ? 0.86 : 0.97), tip = mix(col, PAL.buff, sp.key === 'obo' ? 0.18 : 0.4);
+      const len = L * (0.6 + 0.6 * r()), dx = n[0] * 0.75 + rd[0] * 0.25 + (r() - 0.5) * 0.45, dy = n[1] * 0.75 + rd[1] * 0.25 + (r() - 0.5) * 0.45;
+      ctx.lineWidth = hs > 200 ? 0.9 : 0.6;
+      const fa = sp.fringeAll ? 0.5 : 1;
+      ctx.strokeStyle = rgba(col, 0.8 * fa); ctx.beginPath(); ctx.moveTo(x - dx * 1.5, y - dy * 1.5); ctx.lineTo(x + dx * len * 0.6, y + dy * len * 0.6); ctx.stroke();
+      ctx.strokeStyle = rgba(tip, 0.6 * fa); ctx.beginPath(); ctx.moveTo(x + dx * len * 0.55, y + dy * len * 0.55); ctx.lineTo(x + dx * len, y + dy * len); ctx.stroke();
+    }
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+function wornAt(wv, l, hs) { const n = nzc('worn' + wv[0]); const d = Math.hypot(l[0] - wv[1] * hs, l[1] - wv[2] * hs) / (wv[3] * hs); return clamp((1.0 - d + 0.3 * n(l[0] * 0.06, l[1] * 0.06)) * 1.1); }
+const BLUE_RAMP = [[-1, hex('#140b24')], [-0.45, hex('#2a1f78')], [0.05, hex('#2a4fbf')], [0.55, hex('#2f8fd2')], [1, hex('#4cc8dc')]];
+function blueRamp(f) { for (let i = 1; i < BLUE_RAMP.length; i++) if (f <= BLUE_RAMP[i][0]) { const [a, ca] = BLUE_RAMP[i - 1], [b, cb] = BLUE_RAMP[i]; return mix(ca, cb, (f - a) / (b - a)); } return BLUE_RAMP[BLUE_RAMP.length - 1][1]; }
+function renderWing(ctx, sp, w, wk, ox, oy) {
+  const hs = sp.hs, wn = wk[0] === 'f' ? 'fw' : 'hw', nz = nzc(sp.key + wk + 'n'), r = rngFor(sp.key + wk + 'sc');
+  const veins = wn === 'fw' ? (sp.fwVeins || V9) : (sp.hwVeins || V7), worn = sp.worn && sp.worn[0] === wk ? sp.worn : null;
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9, lx0 = 1e9, ly0 = 1e9, lx1 = -1e9, ly1 = -1e9;
+  for (const p of w.poly) {
+    const q = w.fwd(p[0], p[1]); x0 = Math.min(x0, q[0]); y0 = Math.min(y0, q[1]); x1 = Math.max(x1, q[0]); y1 = Math.max(y1, q[1]);
+    lx0 = Math.min(lx0, p[0]); ly0 = Math.min(ly0, p[1]); lx1 = Math.max(lx1, p[0]); ly1 = Math.max(ly1, p[1]);
+  }
+  x0 = Math.floor(x0 + ox) - 2; y0 = Math.floor(y0 + oy) - 2; x1 = Math.ceil(x1 + ox) + 2; y1 = Math.ceil(y1 + oy) + 2;
+  const bw = x1 - x0, bh = y1 - y0, tmp = mk(bw, bh), tc = tmp.getContext('2d'), img = tc.createImageData(bw, bh), D = img.data, jn = nzc(sp.key + wk + 'jit');
+  for (let j = 0; j < bh; j++) for (let i = 0; i < bw; i++) {
+    const l = w.inv(x0 + i + 0.5 - ox, y0 + j + 0.5 - oy), P = w.polar(l[0], l[1]);
+    const cov = clamp(P.Rr - P.d + 0.5); if (cov <= 0 || holeAt(sp, wk, l[0], l[1])) continue;
+    // the ground layer is sampled a scale's width off, so even under the cover scales no edge is clean
+    const sj = hs > 200 ? 3.4 : 1.4, jx = l[0] + jn(l[0] * 0.5, l[1] * 0.5) * sj, jy = l[1] + jn(l[0] * 0.5 + 9, l[1] * 0.5) * sj;
+    const res = sp.paint(wn, w, jx, jy, w.polar(jx, jy), nz), res0 = sp.paint(wn, w, l[0], l[1], P, nz);
+    res.win = res0.win;
+    { const q = w.fwd(jx, jy); res.c = applyWord(sp, res.c, q[0] + ox, q[1] + oy, 0, () => veinDist(w, P, veins)); }
+    if (sp.dotWin) for (const d of sp.wDots) res.win = Math.max(res.win, 1 - smooth(d[2] * 0.8 - 0.8, d[2] * 0.8 + 0.6, Math.hypot(x0 + i + 0.5 - d[0], y0 + j + 0.5 - d[1])));
+    let c = shade(res.c, 0.74), a = 1;
+    if (res.blue) c = mix(c, shade(PAL.blueDeep, 0.85), res.blue * 0.8);
+    const wv = worn ? wornAt(worn, l, hs) : 0;
+    if (wv > 0) { // scales rubbed off: thin brown membrane, the veins standing out
+      c = mix(c, mix(hex('#9a8160'), res.c, 0.55), wv); a = 1 - wv * 0.35;
+      c = mix(c, shade(PAL.umber, 0.9), (1 - smooth(0.6, 1.6, veinDist(w, P, veins))) * wv * 0.85);
+    }
+    // the window: a thin amber membrane, so the floor shows through it tinted, a vein still crossing
+    if (res.win) { c = mix(c, hex('#c08f45'), res.win * 0.8); a = lerp(a, 0.42, res.win); }
+    const k = (j * bw + i) * 4; D[k] = c[0]; D[k + 1] = c[1]; D[k + 2] = c[2]; D[k + 3] = 255 * a * cov;
+  }
+  tc.putImageData(img, 0, 0);
+  drawFringe(ctx, sp, w, wk, ox, oy, veins);
+  ctx.drawImage(tmp, x0, y0);
+  // cover scales
+  const s = hs > 200 ? 3.4 : 1.5, list = [], toL = [-SH.x, -SH.y];
+  for (let y = ly0; y < ly1; y += s * 0.82) for (let x = lx0; x < lx1; x += s * 0.92) {
+    const px = x + (r() - 0.5) * s * 0.7, py = y + (r() - 0.5) * s * 0.7, P = w.polar(px, py);
+    if (P.r > 0.985 || P.d < 1) continue; list.push([px, py, P.r, r()]);
+  }
+  list.sort((a, b) => b[2] - a[2]);
+  const rn = nzc(sp.key + wk + 'rows');
+  for (const [px, py, , rr] of list) {
+    if (holeAt(sp, wk, px, py)) continue;
+    const P = w.polar(px, py), res = sp.paint(wn, w, px, py, P, nz);
+    if (res.win > 0.4) continue;
+    const q = w.fwd(px, py), mx = q[0] + ox, my = q[1] + oy;
+    if (sp.dotWin && sp.wDots.some(d => Math.hypot(mx - d[0], my - d[1]) < d[2] * 0.8)) continue;
+    if (worn && rr < wornAt(worn, [px, py], hs) * 0.97) continue;
+    const ang = P.a + (rn(px * 0.08, py * 0.08) * 0.25) + (rr - 0.5) * 0.18, L = s * 1.0, Wd = s * 0.62;
+    const ux = Math.cos(ang), uy = Math.sin(ang), vx = -uy, vy = ux;
+    const sd = [ux * w.side, uy]; // approximate screen direction of the scale (mirror only)
+    const tilt = -(sd[0] * toL[0] + sd[1] * toL[1]);
+    let c = shade(res.c, 0.93 + rr * 0.15 + tilt * 0.05 + rn(px * 0.3, py * 0.3) * 0.05);
+    const sp2 = (rr * 7919) % 1; // irroration: the odd dark or pale scale scattered through every field
+    const irr = 0.06 * smooth(-0.05, 0.45, rn(px / hs * 4 + 20, py / hs * 4));
+    if (sp2 < irr) c = mix(c, PAL.umber, 0.5); else if (sp2 > 0.996) c = mix(c, hex('#efe2c6'), 0.4);
+    if (res.blue) {
+      // structural colour: no pigment, so the hue is set by each scale's angle to the window. It runs
+      // violet-black to cyan across each wing, the right side (tilted to the light) further along
+      const f = clamp((P.r - 0.45) * 1.5 + (w.side > 0 ? 0.3 : -0.35) + tilt * 0.5 + rn(px * 0.11, py * 0.11) * 0.4 + (rr - 0.5) * 0.3, -1, 1);
+      const b = blueRamp(f);
+      c = mix(c, b, res.blue);
+    }
+    c = applyWord(sp, c, mx, my, (rr - 0.5) * 0.14, () => veinDist(w, P, veins), true);
+    const pts = [[px - ux * L, py - uy * L], [px + vx * Wd, py + vy * Wd], [px + ux * L, py + uy * L], [px - vx * Wd, py - vy * Wd]].map(p => w.fwd(p[0], p[1]));
+    ctx.fillStyle = rgba(c, 1);
+    ctx.beginPath(); ctx.moveTo(pts[0][0] + ox, pts[0][1] + oy);
+    for (let i = 1; i < 4; i++) ctx.lineTo(pts[i][0] + ox, pts[i][1] + oy);
+    ctx.fill();
+  }
+}
+
+// ---------- body: fur, head, antennae ----------
+function thoraxScales(ctx, sp, ox, oy, thW, thL, se, r, nz) {
+  const list = [];
+  for (let i = 0; i < thW * thL * 1.5; i++) { const x = (r() * 2 - 1) * thW, y = (r() * 2 - 1) * thL; if (se(x, y) <= 1.04) list.push([x, y, r(), r()]); }
+  list.sort((a, b) => b[1] - a[1]);
+  for (const [x, y, q, z] of list) {
+    const u = x / thW;
+    let col = applyWord(sp, mix(mix(PAL.ochre, PAL.cinnamon, 0.3 + q * 0.4), PAL.buff, z * 0.3), ox + x + (q - 0.5) * 3, oy + y + (z - 0.5) * 3, 0, null, true);
+    col = shade(col, 0.82 + 0.26 * Math.sqrt(clamp(1 - u * u)) - 0.12 * u - 0.06 * (y / thL) + (q - 0.5) * 0.1);
+    let dx = x * 0.55, dy = y + thL * 1.1; const l = Math.hypot(dx, dy) || 1; dx /= l; dy /= l;
+    const L = 3.6 + z * 1.6, Wd = 1.7, vx = -dy, vy = dx;
+    ctx.fillStyle = rgba(col); ctx.beginPath();
+    ctx.moveTo(ox + x - dx * L * 0.3, oy + y - dy * L * 0.3); ctx.lineTo(ox + x + vx * Wd, oy + y + vy * Wd);
+    ctx.lineTo(ox + x + dx * L, oy + y + dy * L); ctx.lineTo(ox + x - vx * Wd, oy + y - vy * Wd); ctx.fill();
+  }
+  for (let i = 0; i < 500; i++) { // a little loose hair at the rim of the thorax
+    const a = r() * Math.PI * 2, x = Math.cos(a) * thW * (0.85 + 0.15 * r()), y = Math.sin(a) * thL * (0.85 + 0.15 * r());
+    hair(ctx, ox + x, oy + y, x / thW * 0.6, 0.8, 5 + r() * 5, 1, shade(mix(PAL.ochre, PAL.cinnamon, r() * 0.6), 0.95), 0.4);
+  }
+}
+function hair(ctx, x, y, dx, dy, len, w, col, a) { ctx.strokeStyle = rgba(col, a); ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(x, y); ctx.quadraticCurveTo(x + dx * len * 0.5 + dy * len * 0.08, y + dy * len * 0.5 - dx * len * 0.08, x + dx * len, y + dy * len); ctx.stroke(); }
+function renderBody(ctx, sp, ox, oy) {
+  const hs = sp.hs, b = sp.body, r = rngFor(sp.key + 'body'), nz = nzc(sp.key + 'bodyn'), big = hs > 200;
+  const thW = b.thW * hs, thL = b.thL * hs, ab0 = thL * 0.5, ab1 = b.abL * hs, abW = b.abW * hs;
+  const hL = Math.max(hs * 0.028, 2.4), hw = big ? 1.5 : 0.7;
+  ctx.lineCap = 'round';
+  const prof = t => abW * Math.pow(Math.sin(Math.PI * (0.1 + t * 0.88)), 0.5) * (1 - 0.3 * t);
+  ctx.fillStyle = rgba(shade(b.abFur[0], 0.6));
+  ctx.beginPath();
+  for (let i = 0; i <= 40; i++) { const t = i / 40; ctx.lineTo(ox - prof(t), oy + ab0 + t * (ab1 - ab0)); }
+  for (let i = 40; i >= 0; i--) { const t = i / 40; ctx.lineTo(ox + prof(t), oy + ab0 + t * (ab1 - ab0)); }
+  ctx.fill();
+  const NA = Math.floor(abW * (ab1 - ab0) * (big ? 1.6 : 3.2)), hairs = [];
+  for (let i = 0; i < NA; i++) hairs.push([r(), r() * 2 - 1, r(), r()]);
+  hairs.sort((a, b) => b[0] - a[0]);
+  for (const [t, u, q, z] of hairs) {
+    const seg = (t * 7 + 0.15 + nz(t * 9, u * 2) * 0.22 + 1) % 1, y = oy + ab0 + t * (ab1 - ab0), x = ox + u * prof(t) * 0.92;
+    let col = mix(b.abFur[0], b.abFur[1], smooth(0.45, 0.95, seg) * 0.42 + z * 0.2);
+    if (b.bands && Math.abs(u) > 0.4) col = seg < 0.5 ? b.abFur[1] : shade(b.abFur[0], 0.7);
+    const k = 0.78 + 0.3 * Math.sqrt(1 - u * u) - 0.14 * u + nz(x * 0.2, y * 0.2) * 0.06;
+    hair(ctx, x, y, u * 0.55, 1, hL * (0.8 + 0.9 * q), hw, shade(col, k), 0.8);
+  }
+  if (sp.legs) for (const sd of [-1, 1]) for (const [y0, ang, len] of [[-0.06, -0.55, 0.22], [0.0, 0.3, 0.32], [0.05, 0.8, 0.52]]) {
+    // long, spurred legs set out from under the thorax
+    let x = ox + sd * thW * 0.5, y = oy + y0 * hs, a = ang; ctx.strokeStyle = rgba(hex('#9c8060'), 0.9); ctx.lineWidth = 0.9; ctx.beginPath(); ctx.moveTo(x, y);
+    for (const [f, bend] of [[0.42, 0.3], [0.58, 0.15]]) {
+      x += sd * Math.cos(a) * len * f * hs; y += Math.sin(a) * len * f * hs; ctx.lineTo(x, y); a += bend;
+      ctx.moveTo(x, y); ctx.lineTo(x + sd * Math.cos(a + 0.9) * 3, y + Math.sin(a + 0.9) * 3); ctx.moveTo(x, y);
+    }
+    ctx.stroke();
+  }
+  // pile: long hair lying over the wing roots and along the hindwings' inner margins
+  const pile = big ? 1400 : 90, pc = sp.pile || b.fur;
+  for (let i = 0; i < pile; i++) {
+    const sd = r() < 0.5 ? -1 : 1, fore = r() < 0.55, t = r();
+    const x = sd * (thW * (0.6 + 0.3 * r()) + (fore ? 0 : abW * 0.4 * t)), y = fore ? (r() - 0.6) * thL : thL * 0.4 + t * (ab1 - thL) * 0.55;
+    const dx = fore ? sd * 1 : sd * 0.75, dy = fore ? 0.25 + r() * 0.3 : 0.6;
+    hair(ctx, ox + x, oy + y, dx, dy, hs * (fore ? 0.07 : 0.06) * (0.5 + r()), hw * 0.8, shade(mix(pc[0], pc[1], r()), sd < 0 ? 1.02 : 0.92), 0.45);
+  }
+  // thorax
+  // the thorax is squarer than an ellipse from above: a superellipse
+  const se = (x, y) => Math.pow(Math.abs(x / thW), 2.6) + Math.pow(Math.abs(y / thL), 2.6);
+  ctx.fillStyle = rgba(shade(b.fur[0], 0.55)); ctx.beginPath();
+  for (let i = 0; i < 64; i++) { const a = i / 64 * Math.PI * 2, c = Math.cos(a), s = Math.sin(a); ctx.lineTo(ox + thW * Math.sign(c) * Math.pow(Math.abs(c), 2 / 2.6), oy + thL * Math.sign(s) * Math.pow(Math.abs(s), 2 / 2.6)); }
+  ctx.fill();
+  if (sp.key === 'obo') thoraxScales(ctx, sp, ox, oy, thW, thL, se, r, nz);
+  else {
+    const NT = Math.floor(thW * thL * 4);
+    for (let i = 0; i < NT; i++) {
+      const x = (r() * 2 - 1) * thW, y = (r() * 2 - 1) * thL; if (se(x, y) > 1) continue;
+      let dx = x * 0.6, dy = y + thL * 0.9; const l = Math.hypot(dx, dy) || 1; dx /= l; dy /= l;
+      const u = x / thW, col = mix(b.fur[0], b.fur[1], clamp(0.5 + nz(x * 0.12, y * 0.12) * 0.9));
+      const k = 0.8 + 0.28 * Math.sqrt(clamp(1 - u * u)) - 0.12 * u - 0.08 * (y / thL);
+      hair(ctx, ox + x, oy + y, dx, dy, hL * (0.5 + 0.4 * r()), hw, shade(col, k), 0.9);
+    }
+  }
+  // tegulae: shoulder tufts swept back over the wing bases
+  for (const sd of [-1, 1]) for (let i = 0; i < (big ? 700 : 60); i++) {
+    const x = sd * thW * (0.55 + 0.4 * r()), y = -thL * (0.55 - r() * 0.9);
+    hair(ctx, ox + x, oy + y, sd * 0.35, 1, hL * (0.8 + 0.6 * r()), hw, shade(sp.key === 'obo' ? mix(PAL.ochre, PAL.cinnamon, r() * 0.5) : mix(b.fur[0], b.fur[1], 0.6 + r() * 0.4), sd < 0 ? 1.04 : 0.9), 0.8);
+  }
+  // where the word crosses the body its scales lie flat, so the letter keeps its edge through the fur
+  if (sp.wCore) {
+    const reach = thW + 0.11 * hs, x0 = Math.max(0, Math.floor(ox - reach)), x1 = Math.min(sp.wW, Math.ceil(ox + reach));
+    const img = ctx.getImageData(x0, 0, x1 - x0, sp.wH).data, sc = [], st = big ? 2.1 : 1.5;
+    for (let y = 0; y < sp.wH; y += st) for (let x = x0; x < x1; x += st) {
+      const jx = x + (r() - 0.5) * st, jy = y + (r() - 0.5) * st; if (bandAt(sp, jx, jy) < 0.3) continue;
+      const k = (Math.round(clamp(jy, 0, sp.wH - 1)) * (x1 - x0) + Math.round(clamp(jx - x0, 0, x1 - x0 - 1))) * 4; if (img[k + 3] < 200) continue;
+      sc.push([jx, jy, [img[k], img[k + 1], img[k + 2]], r()]);
+    }
+    sc.sort((p, q) => q[1] - p[1]);
+    for (const [x, y, c0, q] of sc) {
+      const cw = applyWord(sp, c0, x, y, 0, null, true); if (cw === c0) continue;
+      const col = shade(cw, 0.94 + q * 0.12), L = (big ? 3.4 : 2.4) * (0.85 + q * 0.3), Wd = big ? 1.5 : 1.05, dx = (x - ox) / reach * 0.35, l = Math.hypot(dx, 1), ux = dx / l, uy = 1 / l;
+      ctx.fillStyle = rgba(col); ctx.beginPath();
+      ctx.moveTo(x - ux * L * 0.3, y - uy * L * 0.3); ctx.lineTo(x - uy * Wd, y + ux * Wd); ctx.lineTo(x + ux * L, y + uy * L); ctx.lineTo(x + uy * Wd, y - ux * Wd); ctx.fill();
+    }
+  }
+  // head, eyes, antennae
+  const hy = oy - thL - 0.03 * hs, hr = thW * 0.5;
+  ctx.fillStyle = rgba(shade(b.fur[0], 0.75)); ctx.beginPath(); ctx.ellipse(ox, hy, hr, 0.04 * hs, 0, 0, Math.PI * 2); ctx.fill();
+  for (let i = 0; i < (big ? 260 : 24); i++) { const x = (r() - 0.5) * hr * 1.6, y = (r() - 0.5) * 0.06 * hs; hair(ctx, ox + x, hy + y, x * 0.02, 0.6, hL * 0.6, hw, shade(mix(b.fur[0], b.fur[1], r()), 0.9), 0.85); }
+  for (const sd of [-1, 1]) {
+    // compound eyes: dull, dark brown, half under the head's scales
+    const ex = ox + sd * hr * 1.0, er = Math.max(0.017 * hs, 1.3);
+    ctx.fillStyle = rgba(hex('#3a2a1e')); ctx.beginPath(); ctx.ellipse(ex, hy + er * 0.2, er, er * 1.15, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = rgba(hex('#7a6a58'), 0.35); ctx.beginPath(); ctx.arc(ex - er * 0.3, hy - er * 0.3, er * 0.35, 0, Math.PI * 2); ctx.fill();
+    for (let i = 0; i < (big ? 50 : 6); i++) { const yy = hy + (r() - 0.5) * er * 2; hair(ctx, ox + sd * hr * (0.55 + r() * 0.3), yy, sd * 0.6, 0.5, er * 1.1, hw, shade(mix(b.fur[0], b.fur[1], r()), 0.95), 0.8); }
+    antenna(ctx, sp, ox + sd * hr * 0.35, hy - 0.025 * hs, sd, r);
+  }
+}
+function antenna(ctx, sp, x, y, sd, r) {
+  const hs = sp.hs, a = sp.ant, big = hs > 200, broken = sp.key === 'obo' && sd < 0;
+  const len = a.len * hs * (0.97 + r() * 0.06), ang = a.ang + (r() - 0.5) * 0.08;
+  const ex = x + sd * Math.sin(ang) * len, ey = y - Math.cos(ang) * len;
+  const cx = x + sd * Math.sin(ang * 0.45) * len * 0.5, cy = y - Math.cos(ang * 0.45) * len * 0.62;
+  const P = t => [(1 - t) * (1 - t) * x + 2 * (1 - t) * t * cx + t * t * ex, (1 - t) * (1 - t) * y + 2 * (1 - t) * t * cy + t * t * ey];
+  const T = t => { const dx = 2 * (1 - t) * (cx - x) + 2 * t * (ex - cx), dy = 2 * (1 - t) * (cy - y) + 2 * t * (ey - cy), l = Math.hypot(dx, dy); return [dx / l, dy / l]; };
+  const col = mix(sp.body.fur[0], PAL.umber, 0.35), tEnd = broken ? 0.84 : 1;
+  ctx.lineCap = 'round';
+  if (a.kind === 'feather') {
+    const N = Math.floor(len / (big ? 2.1 : 1.6));
+    for (let i = 0; i < N; i++) {
+      const t = i / N; if (t > tEnd) break;
+      const p = P(t), d = T(t), n = [-d[1], d[0]], bl = a.comb * hs * Math.pow(Math.sin(Math.PI * clamp(0.08 + t * 0.95)), 0.8) * (1 - 0.35 * t);
+      for (const s of [-1, 1]) {
+        const bx = d[0] * 0.55 + n[0] * s * 0.83, by = d[1] * 0.55 + n[1] * s * 0.83;
+        ctx.strokeStyle = rgba(shade(col, 0.9 + r() * 0.25), 0.85); ctx.lineWidth = big ? 0.9 : 0.5;
+        ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(p[0] + bx * bl, p[1] + by * bl); ctx.stroke();
+      }
+    }
+  }
+  ctx.strokeStyle = rgba(shade(col, 0.8)); ctx.lineWidth = big ? 2.2 : 0.85;
+  ctx.beginPath(); for (let i = 0; i <= 30; i++) { const t = i / 30 * tEnd, p = P(t); i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]); } ctx.stroke();
+  if (a.club) { const p = P(0.93); ctx.lineWidth = 1.7; ctx.beginPath(); ctx.moveTo(...P(0.8)); ctx.lineTo(p[0], p[1]); ctx.stroke(); }
+}
+function renderMoth(sp) {
+  const hs = sp.hs, { cw, ch, ox, oy } = mothFrame(sp);
+  const c = mk(cw, ch), ctx = c.getContext('2d'), ws = wingSet(sp);
+  renderWing(ctx, sp, ws.hwL, 'hwL', ox, oy); renderWing(ctx, sp, ws.hwR, 'hwR', ox, oy);
+  // the forewings sit a hair above the hindwings and shade them where they overlap
+  const fl = mk(cw, ch), fc = fl.getContext('2d');
+  renderWing(fc, sp, ws.fwL, 'fwL', ox, oy); renderWing(fc, sp, ws.fwR, 'fwR', ox, oy);
+  const fs = shadowOf(fl), off = Math.max(1, hs * 0.008);
+  ctx.save(); ctx.globalCompositeOperation = 'source-atop'; ctx.filter = `blur(${(off * 1.2).toFixed(1)}px)`; ctx.globalAlpha = 0.35;
+  ctx.drawImage(fs, off * SH.x * 1.6, off * SH.y * 1.6); ctx.restore();
+  ctx.drawImage(fl, 0, 0);
+  if (sp.dotWin) for (const d of sp.wDots) { // each i's dot is a clear window with one catch of light
+    const g = ctx.createRadialGradient(d[0] - 2, d[1] - 2.5, 0, d[0] - 2, d[1] - 2.5, d[2]); g.addColorStop(0, 'rgba(255,250,238,0.4)'); g.addColorStop(1, 'rgba(255,250,238,0)'); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(d[0] - 2, d[1] - 2.5, d[2], 0, 7); ctx.fill();
+  }
+  if (sp.eye) for (const w of [ws.fwL, ws.fwR]) { // the clear window is glossy membrane: one small soft catch of the window light
+    const e = w.fwd(sp.eye[0], sp.eye[1]), hx = ox + e[0] - 5, hy = oy + e[1] - 6, g = ctx.createRadialGradient(hx, hy, 0, hx, hy, 9);
+    g.addColorStop(0, 'rgba(255,250,238,0.32)'); g.addColorStop(1, 'rgba(255,250,238,0)'); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(hx, hy, 9, 0, 7); ctx.fill();
+  }
+  renderBody(ctx, sp, ox, oy);
+  return { c, ox, oy };
+}
+SPECIES.obo.worn = ['hwL', 0.5, 0.53, 0.065];
+SPECIES.obo.gaps = [['fwR', 0.4, 0.46], ['hwR', 0.22, 0.38], ['fwL', 0.12, 0.17], ['hwL', 0.55, 0.6], ['hwL', 0.7, 0.73]];
+SPECIES.obo.holes = [['fwL', 0.975, -0.25, 0.065]];
+SPECIES.obo.setting = [0.02, -0.014, -0.008, 0.042];
+SPECIES.cmu.holes = [['hwL', 0.55, 0.47, 0.13]];
+// the phrase, one word to a moth
+SPECIES.egg.hs = 90; SPECIES.egg.word = { text: PHRASE_TO_RENDER.split(' ')[0], xh: 42, wy: 0.52, th: 12, ph: 4, bw: 0.7, band: '#dfc496' };
+SPECIES.cmu.hs = 185; SPECIES.cmu.word = { text: PHRASE_TO_RENDER.split(' ')[1], xh: 36, wy: 0.22, th: 9, ph: 5, bw: 0.74, band: '#e9dbb9', edge: '#6e4a2e', ink: '#2e2116' };
+SPECIES.noc.word = { text: PHRASE_TO_RENDER.split(' ')[2], xh: 36, wy: 0.23, th: 11, ph: 6, bw: 0.8, band: '#dccaa2' };
+SPECIES.oic.hs = 126; SPECIES.oic.word = { text: PHRASE_TO_RENDER.split(' ')[3], xh: 44, wy: 0.37, th: 8, ph: 4, bw: 0.72, band: '#d0d2b8', edge: '#1c1a20', ink: '#1a1712' };
+SPECIES.obo.hs = 320; SPECIES.obo.eye = null; SPECIES.obo.dotWin = 1; SPECIES.obo.word = { text: PHRASE_TO_RENDER.split(' ')[4], xh: 40, wy: 0.14, th: 10, ph: 5, bw: 0.76, band: '#e2cb9c', edge: '#5a3a22' };
+SPECIES.cyu.hs = 215; SPECIES.cyu.word = { text: PHRASE_TO_RENDER.split(' ')[5], xh: 38, wy: 0.2, th: 13, ph: 6, bw: 0.84, band: '#e3d2ae', edge: '#2a1a10' };
+
+// ---------- the drawer interior: white card unit trays on the drawer floor ----------
+// The camera sits above the drawer's centre, so the inner walls of the drawer and of each tray
+// show their faces toward the centre, foreshortened. The raking light from the upper left throws
+// the walls' shadows across the tray floors; faces turned from the light go dark.
+const RIM = 40, FRONT = 40, WALLV = 24;
+const FX0 = RIM + WALLV, FY0 = RIM + WALLV, FX1 = W - RIM - WALLV, FY1 = H - FRONT - WALLV;
+const CXO = W / 2, CYO = (FY0 + FY1) / 2, TWALL = 3, TG = 4;
+// Three rows of unit trays, read like the phrase: a | little | faith, then in | impossible, then
+// things in the middle of the front row, its two neighbours left empty.
+const R1 = [FY0 + 2, 338], R2 = [342, 872], R3 = [876, FY1 - 2];
+const TRAYS = [[FX0 + 2, R1[0], 256, R1[1]], [260, R1[0], 660, R1[1]], [664, R1[0], FX1 - 2, R1[1]],
+  [FX0 + 2, R2[0], 336, R2[1]], [340, R2[0], FX1 - 2, R2[1]],
+  [FX0 + 2, R3[0], 314, R3[1]], [318, R3[0], 762, R3[1]], [766, R3[0], FX1 - 2, R3[1]]];
+const faceW = d => d > 0 ? 0.0158 * d : 0; // visible width of a wall face at distance d from the optical centre
+function renderInterior() {
+  const c = mk(W, H), ctx = c.getContext('2d'), img = ctx.createImageData(W, H), D = img.data;
+  const n1 = nzc('foam1'), n2 = nzc('foam2'), n3 = nzc('cork');
+  const lsT = HEIGHT.trayWall * K, lsD = HEIGHT.drawerWall * K;
+  // hard light, so a sharp edge; the fill from the room lifts the shadow a little away from the wall
+  const shadowBand = (d, len) => d < 0 ? 0 : (1 - smooth(len * 0.8, len * 1.1, d)) * (1 - 0.32 * clamp(d / len));
+  for (let y = FY0; y < FY1; y++) for (let x = FX0; x < FX1; x++) {
+    const k = (y * W + x) * 4; let col = null;
+    for (const t of TRAYS) {
+      if (x < t[0] || x >= t[2] || y < t[1] || y >= t[3]) continue;
+      const e = Math.min(x - t[0], t[2] - 1 - x, y - t[1], t[3] - 1 - y);
+      if (e < TWALL) { col = shade(hex('#f1ece0'), e < 1 ? 0.8 : 1); break; } // the card wall's cut top edge
+      const ix0 = t[0] + TWALL, iy0 = t[1] + TWALL, ix1 = t[2] - TWALL, iy1 = t[3] - TWALL;
+      const fl = faceW(CXO - t[0]), fr = faceW(t[2] - CXO), ft = faceW(CYO - t[1]), fb = faceW(t[3] - CYO);
+      if (x - ix0 < fl) { col = shade(hex('#cfc6b6'), 0.66 + 0.1 * (x - ix0) / Math.max(fl, 1)); break; }
+      if (ix1 - x < fr) { col = shade(hex('#f4efe4'), 0.98); break; }
+      if (y - iy0 < ft) { col = shade(hex('#cfc6b6'), 0.7 + 0.1 * (y - iy0) / Math.max(ft, 1)); break; }
+      if (iy1 - y < fb) { col = shade(hex('#f4efe4'), 0.95); break; }
+      // tray floor: white closed-cell foam under paper, a little grain, the odd old pin hole
+      const g = n1(x * 0.55, y * 0.55) * 0.5 + n2(x * 0.08, y * 0.08) * 0.5;
+      col = shade(mix(hex('#ede7da'), hex('#e2d9c7'), clamp(0.4 + g * 0.8)), 1 + n2(x * 1.7, y * 1.7) * 0.012);
+      const fx0 = ix0 + fl, fy0 = iy0 + ft;
+      let s = Math.max(shadowBand(y - fy0, lsT * SH.y), shadowBand(x - fx0, lsT * SH.x));
+      s = Math.max(s, shadowBand(y - FY0, lsD * SH.y), shadowBand(x - FX0, lsD * SH.x));
+      const ao = (1 - smooth(0, 9, Math.min(x - fx0, y - fy0, ix1 - fr - x, iy1 - fb - y))) * 0.14;
+      col = mix(shade(col, 1 - ao), shade([col[0] * 0.86, col[1] * 0.78, col[2] * 0.68], 0.84 - ao), s);
+      break;
+    }
+    if (!col) { const g = n3(x * 0.4, y * 0.4); col = shade(mix(hex('#3a2a1d'), hex('#5a4030'), clamp(0.4 + g)), 0.8); } // the deep slots between trays
+    D[k] = col[0]; D[k + 1] = col[1]; D[k + 2] = col[2]; D[k + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  const r = rngFor('holes');
+  for (let i = 0; i < 46; i++) {
+    const t = TRAYS[i % TRAYS.length], x = t[0] + 14 + r() * (t[2] - t[0] - 28), y = t[1] + 14 + r() * (t[3] - t[1] - 28);
+    ctx.fillStyle = 'rgba(70,58,46,0.7)'; ctx.beginPath(); ctx.arc(x, y, 0.9, 0, 7); ctx.fill();
+  }
+  return c;
+}
+
+// ---------- the drawer: oak rails and inner walls in depth ----------
+function oakAt(n1, n2, n3, u, v, piece) {
+  const wv = v + 6 * fbm(n1, u * 0.004 + piece, piece, 3) + 1.5 * n2(u * 0.02, piece);
+  const stripe = 0.5 + 0.5 * Math.sin(wv * 1.9 + 3 * n2(wv * 0.08, u * 0.003 + piece));
+  let col = mix(PAL.oakDark, PAL.oak, clamp(0.42 + fbm(n2, wv * 0.05 + piece, u * 0.006, 3) * 0.9 + stripe * 0.16));
+  const fleck = smooth(0.38, 0.62, n3(u * 0.045 + piece, wv * 0.32)) * smooth(0.05, 0.35, n1(u * 0.012 + piece, wv * 0.05));
+  return shade(mix(col, PAL.oakLight, fleck * 0.55), 1 + fleck * 0.04);
+}
+function renderFrame() {
+  const c = mk(W, H), ctx = c.getContext('2d'), img = ctx.createImageData(W, H), D = img.data;
+  const n1 = nzc('oak1'), n2 = nzc('oak2'), n3 = nzc('oak3');
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (x >= FX0 && x < FX1 && y >= FY0 && y < FY1) continue;
+    const k = (y * W + x) * 4; let col;
+    if (x >= RIM && x < W - RIM && y >= RIM && y < H - FRONT) {
+      // an inner wall face: t runs from the rim (0) down to the floor (1)
+      const tl = (x - RIM) / WALLV, tr = (W - RIM - 1 - x) / WALLV, tt = (y - RIM) / WALLV, tb = (H - FRONT - 1 - y) / WALLV;
+      const m = Math.min(tl, tr, tt, tb), side = m === tt ? 0 : m === tb ? 1 : m === tl ? 2 : 3, horiz = side < 2;
+      col = oakAt(n1, n2, n3, horiz ? x : y, m * 9 + side * 40, 300 + side * 71);
+      const lit = side === 3 ? 1.0 : side === 1 ? 0.92 : side === 2 ? 0.46 : 0.4; // faces turned from the window go dark
+      col = shade(col, lit * (1 - 0.3 * smooth(0.6, 1, m)) * (1 - 0.12 * (1 - smooth(0, 0.15, m))));
+    } else {
+      const dt = (RIM - y) / RIM, db = (y - (H - FRONT)) / FRONT, dl = (RIM - x) / RIM, dr = (x - (W - RIM)) / RIM;
+      const m = Math.max(dt, db, dl, dr), side = m === dt ? 0 : m === db ? 1 : m === dl ? 2 : 3, horiz = side < 2;
+      col = oakAt(n1, n2, n3, horiz ? x : y, horiz ? y : x, side * 97.3);
+      const sheen = Math.exp(-Math.pow((x * 0.55 + y * 0.83 - 300) / 560, 2)) * 0.09;
+      col = shade(col, 1 + sheen);
+      const ins = side === 0 ? RIM - y : side === 1 ? y - (H - FRONT) + 1 : side === 2 ? RIM - x : x - (W - RIM) + 1;
+      if (ins <= 3) col = shade(mix(col, hex('#6f7a62'), 0.4), 0.8); // the glass edge, green in its thickness
+      const mt = [Math.abs(dt - dl), Math.abs(dt - dr), Math.abs(db - dl), Math.abs(db - dr)];
+      if (Math.min(...mt) * Math.min(RIM, FRONT) < 0.7 && m > 0) col = shade(col, 0.55);
+    }
+    D[k] = col[0]; D[k + 1] = col[1]; D[k + 2] = col[2]; D[k + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  return c;
+}
+
+// Catmull-Rom through a pen's points, end points held
+function openCR(pts, seg) {
+  const P = [pts[0], ...pts, pts[pts.length - 1]], out = [];
+  for (let i = 1; i < P.length - 2; i++) for (let k = 0; k < seg; k++) {
+    const t = k / seg, t2 = t * t, t3 = t2 * t, p0 = P[i - 1], p1 = P[i], p2 = P[i + 1], p3 = P[i + 2];
+    const f = j => 0.5 * (2 * p1[j] + (-p0[j] + p2[j]) * t + (2 * p0[j] - 5 * p1[j] + 4 * p2[j] - p3[j]) * t2 + (-p0[j] + 3 * p1[j] - 3 * p2[j] + p3[j]) * t3);
+    out.push([f(0), f(1)]);
+  }
+  out.push(pts[pts.length - 1]); return out;
+}
+
+// ---------- the phrase: one word in each moth's scales ----------
+// Letters are pen centre-lines drawn here, laid in the moth's own frame so a word runs unmirrored
+// across both wings and the furred body as one pattern.
+const gL = (x0, y0, x1, y1) => ({ p: [[x0, y0], [x1, y1]] });
+const gE = (cx, cy, rx, ry, a0 = 0, a1 = 360) => ({ e: [cx, cy, rx, ry, a0, a1] });
+const gP = (...p) => ({ s: 1, p });
+const ML = { // centre-lines in x-height units, y up from the baseline: [advance, strokes]
+  a: [0.95, [gP([0.08, 0.7], [0.16, 0.9], [0.36, 1.02], [0.6, 0.98], [0.75, 0.82], [0.77, 0.6], [0.77, 0.0]), gE(0.43, 0.27, 0.34, 0.27)]], // two-storey, its hook swung well left: at moth size a one-storey a reads as d or u
+  b: [1.0, [gL(0.12, 1.5, 0.12, 0.0), gE(0.47, 0.5, 0.35, 0.5)]],
+  e: [0.95, [gL(0.1, 0.52, 0.8, 0.52), gE(0.45, 0.5, 0.36, 0.5, 0, 318)]],
+  f: [0.72, [gP([0.66, 1.4], [0.5, 1.5], [0.36, 1.42], [0.31, 1.2]), gL(0.31, 1.2, 0.31, 0.0), gL(0.06, 1.0, 0.62, 1.0)]],
+  g: [1.05, [gE(0.42, 0.52, 0.35, 0.48), gL(0.78, 1.0, 0.78, -0.15), gP([0.78, -0.15], [0.66, -0.43], [0.38, -0.5], [0.14, -0.38])]],
+  h: [0.95, [gL(0.12, 1.5, 0.12, 0.0), gP([0.12, 0.65], [0.3, 0.95], [0.5, 1.0], [0.7, 0.86], [0.77, 0.6]), gL(0.77, 0.6, 0.77, 0.0)]],
+  i: [0.45, [gL(0.22, 1.0, 0.22, 0.0)], [0.22, 1.38]],
+  l: [0.45, [gL(0.22, 1.5, 0.22, 0.0)]],
+  m: [1.25, [gL(0.1, 1.0, 0.1, 0.0), gP([0.1, 0.65], [0.24, 0.95], [0.4, 1.0], [0.55, 0.85], [0.6, 0.6]), gL(0.6, 0.6, 0.6, 0.0), gP([0.6, 0.65], [0.74, 0.95], [0.9, 1.0], [1.05, 0.85], [1.1, 0.6]), gL(1.1, 0.6, 1.1, 0.0)]],
+  n: [0.95, [gL(0.12, 1.0, 0.12, 0.0), gP([0.12, 0.65], [0.3, 0.95], [0.5, 1.0], [0.7, 0.86], [0.77, 0.6]), gL(0.77, 0.6, 0.77, 0.0)]],
+  o: [1.0, [gE(0.47, 0.5, 0.38, 0.5)]],
+  p: [1.0, [gL(0.12, 1.0, 0.12, -0.5), gE(0.47, 0.5, 0.35, 0.5)]],
+  s: [0.85, [gP([0.72, 0.86], [0.55, 1.0], [0.3, 0.98], [0.13, 0.82], [0.18, 0.62], [0.45, 0.5], [0.7, 0.38], [0.75, 0.17], [0.58, 0.0], [0.3, 0.0], [0.1, 0.15])]],
+  t: [0.78, [gP([0.32, 1.35], [0.32, 0.25], [0.4, 0.04], [0.56, 0.0], [0.72, 0.06]), gL(0.06, 1.0, 0.64, 1.0)]],
+};
+const LSP = 0.24; // letter spacing, in x-heights
+function mothFrame(sp) {
+  const hs = sp.hs, padX = hs * 0.08 + 12, cw = Math.ceil(2 * hs + 2 * padX), top = Math.ceil(hs * 0.6 + 12), ch = Math.ceil(top + hs * 0.84 + 16);
+  return { cw, ch, ox: cw / 2, oy: top };
+}
+// The word is set into a pale crossband in the moth's darkest scales. The band runs the whole span,
+// level under the word and sweeping back toward the wing tips; it is lined in dark scales and its
+// edge steps out along each vein, as a real fascia's does. Veins darken across the band and run
+// paler through the letters, and in the scale pass each scale is wholly letter or wholly band, so a
+// letter's edge is the scallop of the scale rows.
+function buildWord(sp) {
+  const f = mothFrame(sp), wd = sp.word, xh = wd.xh, n = nzc(sp.key + 'wordn');
+  let adv = 0, top = 0, bot = 0;
+  for (const c of wd.text) {
+    const [a, strokes, dot] = ML[c]; adv += a;
+    for (const s of strokes) { const ys = s.e ? [s.e[1] - s.e[3], s.e[1] + s.e[3]] : s.p.map(p => p[1]); top = Math.max(top, ...ys); bot = Math.min(bot, ...ys); }
+    if (dot) top = Math.max(top, dot[1] + 0.12);
+  }
+  adv += LSP * (wd.text.length - 1);
+  let x = f.ox - adv * xh / 2; const base = f.oy + wd.wy * sp.hs, sw = 0.19 * xh;
+  const tp = Math.tan(wd.ph * Math.PI / 180), kk = 0.3 * xh, sa = dx => Math.sqrt(dx * dx + kk * kk) - kk; // the baseline bends back each side of the thorax
+  const L = mk(f.cw, f.ch), g = L.getContext('2d'), T = mk(f.cw, f.ch), tg = T.getContext('2d'), dots = [];
+  for (const c of [g, tg]) { c.strokeStyle = c.fillStyle = '#000'; c.lineCap = c.lineJoin = 'round'; }
+  g.lineWidth = sw; tg.lineWidth = sw + 0.5 * xh; // T: the letters thickened, for the band's teeth
+  const P = (gx, gy) => { const X0 = x + gx * xh, Y0 = base - gy * xh + tp * sa(X0 - f.ox); return [X0 + n(X0 * 0.06, Y0 * 0.06) * 0.05 * xh, Y0 + n(X0 * 0.06 + 9, Y0 * 0.06) * 0.05 * xh]; };
+  for (const ch of wd.text) {
+    const [a, strokes, dot] = ML[ch];
+    for (const s of strokes) {
+      let pts;
+      if (s.e) { const [cx, cy, rx, ry, a0, a1] = s.e; pts = []; for (let k = 0; k <= 48; k++) { const t = (a0 + (a1 - a0) * k / 48) * Math.PI / 180; pts.push([cx + rx * Math.cos(t), cy + ry * Math.sin(t)]); } }
+      else pts = s.s ? openCR(s.p, 10) : s.p;
+      for (const c of [g, tg]) { c.beginPath(); pts.forEach((p, i) => { const q = P(p[0], p[1]); i ? c.lineTo(q[0], q[1]) : c.moveTo(q[0], q[1]); }); c.stroke(); }
+    }
+    if (dot) { const q = P(dot[0], dot[1]); g.beginPath(); g.arc(q[0], q[1], sw * 0.8, 0, 7); g.fill(); tg.beginPath(); tg.arc(q[0], q[1], sw * 0.8 + 0.25 * xh, 0, 7); tg.fill(); dots.push([q[0], q[1], sw * 0.8]); }
+    x += (a + LSP) * xh;
+  }
+  const d = g.getImageData(0, 0, f.cw, f.ch).data, o = new Float32Array(f.cw * f.ch); for (let i = 0; i < o.length; i++) o[i] = d[i * 4 + 3] / 255;
+  sp.wCore = o; sp.wW = f.cw; sp.wH = f.ch; sp.wDots = dots; sp.wOx = f.ox; sp.wOy = f.oy;
+  sp.band = { cx: f.ox, yMid: base - 0.5 * xh, hh0: wd.bw * xh, Wh: adv * xh / 2, xh, tp, tt: Math.tan(wd.th * Math.PI / 180), sa, n: nzc(sp.key + 'band') };
+  // The band holds the x-height; where an ascender, a descender or a dot runs out of it the band
+  // grows a tooth around the stroke, and a blur melts the teeth into the band's edge.
+  const A = mk(f.cw, f.ch), ac = A.getContext('2d'), im = ac.createImageData(f.cw, f.ch);
+  for (let j = 0; j < f.ch; j++) for (let i = 0; i < f.cw; i++) im.data[(j * f.cw + i) * 4 + 3] = 255 * (1 - smooth(-0.5, 0.5, bandD(sp, i, j)));
+  ac.putImageData(im, 0, 0); ac.drawImage(T, 0, 0);
+  const U = mk(f.cw, f.ch), uc = U.getContext('2d'); uc.filter = `blur(${(0.1 * xh).toFixed(1)}px)`; uc.drawImage(A, 0, 0);
+  const ud = uc.getImageData(0, 0, f.cw, f.ch).data, uo = new Float32Array(f.cw * f.ch); for (let i = 0; i < uo.length; i++) uo[i] = ud[i * 4 + 3] / 255;
+  sp.wBand = uo;
+  const V = mk(f.cw, f.ch), vc = V.getContext('2d'); vc.filter = `blur(${(0.1 * xh).toFixed(1)}px)`; vc.drawImage(T, 0, 0); // the teeth alone, for the body
+  const vd = vc.getImageData(0, 0, f.cw, f.ch).data, vo = new Float32Array(f.cw * f.ch); for (let i = 0; i < vo.length; i++) vo[i] = vd[i * 4 + 3] / 255;
+  sp.wTooth = vo;
+  sp.wc = { band: hex(wd.band || '#ecdfc2'), edge: hex(wd.edge || '#3c2818'), ink: hex(wd.ink || '#22170f') };
+}
+function wordAt(sp, mx, my) {
+  const i = Math.round(mx), j = Math.round(my);
+  return i < 0 || j < 0 || i >= sp.wW || j >= sp.wH ? 0 : sp.wCore[j * sp.wW + i];
+}
+function bandD(sp, mx, my) { // signed distance in px from the band's edge (negative inside), before the vein steps
+  // A shallow chevron: it kinks at the thorax, runs under the word at the baseline's angle, then
+  // sweeps back more steeply toward each wing tip, narrowing as it goes.
+  const B = sp.band, hs = sp.hs, ax = Math.abs(mx - B.cx), out = Math.max(0, ax - B.Wh * 0.9);
+  const yc = B.yMid + B.tp * B.sa(ax) + (B.tt - B.tp) * out * smooth(0, B.xh, out);
+  return Math.abs(my - yc) - B.hh0 * (1 - 0.35 * smooth(B.Wh, hs, ax)) - B.n(mx * 0.04, my * 0.04) * 0.07 * B.xh;
+}
+function bodyIn(sp, mx, my) { // 1 on the body's silhouette, 0 clear of it
+  const b = sp.body, hs = sp.hs, dx = Math.abs(mx - sp.wOx), y = my - sp.wOy, thW = b.thW * hs, thL = b.thL * hs, ab0 = thL * 0.5, ab1 = b.abL * hs;
+  let hw = 0;
+  if (Math.abs(y) < thL) hw = thW * Math.pow(1 - Math.pow(Math.abs(y / thL), 2.6), 1 / 2.6);
+  if (y > ab0 && y < ab1) { const t = (y - ab0) / (ab1 - ab0); hw = Math.max(hw, b.abW * hs * Math.pow(Math.sin(Math.PI * (0.1 + t * 0.88)), 0.5) * (1 - 0.3 * t)); }
+  return 1 - smooth(hw - 1, hw + 2.5, dx);
+}
+const bandNear = (sp, mx, my) => sp.band ? 1 - smooth(0, 1.4 * sp.band.xh, bandD(sp, mx, my)) : 0;
+const bandAt = (sp, mx, my) => { const i = Math.round(mx), j = Math.round(my); return i < 0 || j < 0 || i >= sp.wW || j >= sp.wH ? 0 : sp.wBand[j * sp.wW + i]; };
+const toothAt = (sp, mx, my) => { const i = Math.round(mx), j = Math.round(my); return i < 0 || j < 0 || i >= sp.wW || j >= sp.wH ? 0 : sp.wTooth[j * sp.wW + i]; };
+function applyWord(sp, c, mx, my, vary = 0, vdf = null, crisp = false) {
+  if (!sp.band) return c;
+  let u = bandAt(sp, mx, my); if (u < 0.3) return c;
+  const W = sp.wc, vd = vdf ? vdf() : 1e9, h = Math.max(1.1, 0.006 * sp.hs) / 2, vein = 1 - smooth(h - 0.6, h + 0.8, vd);
+  u += 0.16 * (1 - smooth(0, 0.03 * sp.hs, vd)); // the edge steps out along each vein
+  // the band breaks across the body; there the letters cross on pale tufts of their own
+  const brk = bodyIn(sp, mx, my), cov = mix1(smooth(0.46, 0.54, u), smooth(0.46, 0.54, toothAt(sp, mx, my)), brk);
+  const edge = smooth(0.5, 0.56, u) * (1 - smooth(0.68, 0.76, u)) * (1 - brk); if (cov <= 0) return c;
+  let k = wordAt(sp, mx, my); if (crisp) k = k > 0.5 ? 1 : 0;
+  c = mix(c, W.band, cov * 0.88); c = mix(c, W.edge, edge * 0.85 * (1 - k));
+  c = mix(c, shade(c, 0.72), vein * cov * (1 - k)); // a vein darkens across the band
+  c = mix(c, W.ink, k); c = mix(c, W.band, vein * k * 0.35); // and runs paler through the letter
+  return vary ? shade(c, 1 + vary * cov) : c;
+}
+const mix1 = (a, b, t) => a + (b - a) * t;
+
+// ---------- composition ----------
+// Museum grid: five unit trays along the front, ordered by how often each shortcut is used. The
+// hero breaks the grid with scale: one moth in a tray as wide as the drawer.
+let INTERIOR, FRAME, M = {}, SHADB = {}, MOTHL;
+// Shadows multiply a warm brown into whatever they fall on, so they stay warm and never go grey.
+const SHC = 'rgb(150,112,82)';
+function shadowOf(c, col = SHC) {
+  const s = mk(c.width, c.height), sc = s.getContext('2d'); sc.drawImage(c, 0, 0); sc.globalCompositeOperation = 'source-in'; sc.fillStyle = col; sc.fillRect(0, 0, s.width, s.height);
+  const id = sc.getImageData(0, 0, s.width, s.height), d = id.data; // solid parts cast a hard shadow, hair a faint one
+  for (let j = 3; j < d.length; j += 4) d[j] = d[j] > 150 ? 255 : d[j] * 0.22;
+  sc.putImageData(id, 0, 0); return s;
+}
+function place() { // landed thorax centres; each row's words share one baseline (y 240, 632, 1113)
+  const out = [['egg', 161, 190], ['cmu', 460, 199], ['noc', 839, 201], ['oic', 201, 585], ['obo', 677, 587], ['cyu', 540, 1070]];
+  return out.map(([k, x, y]) => { const sp = SPECIES[k]; return { k, x, y, pin: [sp.hs * 0.012, -sp.body.thL * sp.hs * 0.4], pr: k === 'obo' ? 5.5 : 4.5, h: HEIGHT.moth * (0.97 + rngFor(k + 'ht')() * 0.08) }; });
+}
+function pinHeadDraw(ctx, x, y, rad, alpha = 1) { // black enamelled head, one catch of the window
+  ctx.save(); ctx.globalAlpha = alpha; ctx.fillStyle = rgba(hex('#1c1714')); ctx.beginPath(); ctx.arc(x, y, rad, 0, 7); ctx.fill();
+  ctx.fillStyle = 'rgba(205,198,186,0.9)'; ctx.beginPath(); ctx.arc(x - rad * 0.38, y - rad * 0.4, rad * 0.3, 0, 7); ctx.fill(); ctx.restore();
+}
+function glass(t) {
+  // one soft reflection band across the lid, strongest high on the right; dust on the glass. The
+  // glass catches the window early in the build, the band sliding in from the right as it brightens;
+  // once the drawer is full the light only breathes.
+  const e = ease5((t - 0.35) / 1.05), breath = 1 + 0.06 * Math.sin((t - BUILD_END) * Math.PI * 2 / 1.4) * smooth(BUILD_END, BUILD_END + 0.4, t);
+  const lit = (0.1 + 0.9 * e) * breath;
+  X.save(); X.beginPath(); X.rect(RIM, RIM, W - 2 * RIM, H - FRONT - RIM); X.clip(); // the glass sits inside the rails
+  X.translate(948 + (1 - e) * 150, RIM - 10); X.rotate(0.17);
+  const g = X.createLinearGradient(-95, 0, 95, 0); g.addColorStop(0, 'rgba(232,238,244,0)'); g.addColorStop(0.25, `rgba(236,242,248,${0.32 * lit})`); g.addColorStop(0.6, `rgba(236,242,248,${0.24 * lit})`); g.addColorStop(1, 'rgba(232,238,244,0)');
+  const f = X.createLinearGradient(0, -200, 0, 1250); f.addColorStop(0, 'rgba(0,0,0,1)'); f.addColorStop(0.6, 'rgba(0,0,0,0.85)'); f.addColorStop(0.95, 'rgba(0,0,0,0.8)'); f.addColorStop(1, 'rgba(0,0,0,0.5)');
+  const b = mk(200, 1450), bc = b.getContext('2d'); bc.fillStyle = g; bc.translate(100, 200); bc.fillRect(-100, -200, 200, 1450); bc.globalCompositeOperation = 'destination-in'; bc.fillStyle = f; bc.fillRect(-100, -200, 200, 1450);
+  // over the white trays a bright reflection all but vanishes; there the band reads by the dimmer
+  // room it also reflects, a cool grey veil that is darker than the paper
+  const v = mk(200, 1450), vc = v.getContext('2d'), gv = vc.createLinearGradient(0, 0, 200, 0);
+  gv.addColorStop(0, 'rgba(200,204,212,0)'); gv.addColorStop(0.12, `rgba(176,184,200,${0.95 * lit})`); gv.addColorStop(0.82, `rgba(182,189,204,${0.85 * lit})`); gv.addColorStop(1, 'rgba(200,204,212,0)');
+  vc.fillStyle = gv; vc.fillRect(0, 0, 200, 1450); vc.globalCompositeOperation = 'destination-in'; vc.translate(100, 200); vc.fillStyle = f; vc.fillRect(-100, -200, 200, 1450);
+  X.filter = 'blur(2.5px)'; X.globalCompositeOperation = 'multiply'; X.globalAlpha = 1; X.drawImage(v, -100, -200);
+  X.globalCompositeOperation = 'source-over'; X.globalAlpha = 1; X.filter = 'blur(4px)'; X.drawImage(b, -100, -200); X.restore();
+  const r = rngFor('dust');
+  for (let i = 0; i < 70; i++) { const x = r() * W, y = r() * H, s = 0.5 + r() * 1.1; X.fillStyle = `rgba(232,228,218,${0.22 + r() * 0.3})`; X.beginPath(); X.arc(x, y, s, 0, 7); X.fill(); }
+  X.strokeStyle = 'rgba(232,228,218,0.32)'; X.lineWidth = 0.7;
+  for (let i = 0; i < 3; i++) { let x = r() * W, y = r() * H; X.beginPath(); X.moveTo(x, y); for (let k = 0; k < 6; k++) { x += (r() - 0.5) * 9; y += (r() - 0.3) * 7; X.lineTo(x, y); } X.stroke(); }
+}
+// The build: the drawer stands empty under its glass; the glass catches the window; then the
+// curator lowers each specimen onto its pin, front trays first, so the top left fills last. Each
+// moth comes down from above the drawer: larger and with a far, soft shadow, settling to its pin
+// height as the shadow closes in and sharpens.
+const BUILD_END = 4.7, CAM = 400 * MM, PIN_UP = 12 * MM, LIFT = 54 * MM, SHB = 16;
+// "faith in impossible things" builds forward from the right; "a little", under the caption, lands
+// last, 0.38 s apart. Neither enters the caption (x 60 to 640, y 60 to 330) before 3.9, so those two pin quicker.
+const ORDER = [['noc', 1.0, 0.46], ['oic', 1.7, 0.46], ['obo', 2.4, 0.46], ['cyu', 3.1, 0.46], ['egg', 3.9, 0.42], ['cmu', 4.28, 0.42]];
+const ease5 = s => { s = clamp(s); return s * s * s * (s * (s * 6 - 15) + 10); };
+const persp = z => CAM / (CAM - z); // a point z above the floor shows this much further from the centre of view
+function put(ctx, rot, img, ax, ay, x, y, s) { // img drawn with its anchor (ax, ay) at (x, y), turned and scaled
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.drawImage(img, -ax * s, -ay * s, img.width * s, img.height * s); ctx.restore();
+}
+function seek(t) {
+  t = clamp(t, 0, DUR);
+  X.setTransform(1, 0, 0, 1, 0, 0); X.filter = 'none'; X.globalAlpha = 1; X.globalCompositeOperation = 'source-over';
+  X.drawImage(INTERIOR, 0, 0);
+  // Each specimen is lowered straight onto its place on a long pin. Held high it is nearer the
+  // camera, so it shows larger, further from the centre of view and out of focus; it turns a little
+  // in the fingers and squares up as the pin goes into the tray floor.
+  const PL = [];
+  for (const p of place()) {
+    const [, t0, dur] = ORDER.find(o => o[0] === p.k), lin = (t - t0) / dur, u = ease5(lin); if (lin <= 0) continue;
+    const z = p.h + (1 - u) * LIFT, rot = (1 - u) * (rngFor(p.k + 'rot')() - 0.5) * 0.18, fh = persp(p.h);
+    const wx = CXO + (p.x - CXO) / fh, wy = CYO + (p.y - CYO) / fh, c = Math.cos(rot), n = Math.sin(rot); // floor point under the thorax
+    const px = wx + (p.pin[0] * c - p.pin[1] * n) / fh, py = wy + (p.pin[0] * n + p.pin[1] * c) / fh; // floor point under the pin
+    const at = (x, y, zz) => [CXO + (x - CXO) * persp(zz), CYO + (y - CYO) * persp(zz)];
+    PL.push({ ...p, z, rot, fh, wx, wy, px, py, at, a: smooth(0, 0.1, lin), dof: (z - p.h) / LIFT * 5, s: persp(z) / fh, m: M[p.k] });
+  }
+  for (const q of PL) { // the shadow lies on the floor along the light: wide and soft, wider still while the moth is high
+    const o = q.z * K, b = SHB * q.z / q.h, sb = SHADB[q.k];
+    X.save(); X.globalCompositeOperation = 'multiply'; X.globalAlpha = 0.5 * q.a; X.filter = b > SHB + 0.5 ? `blur(${Math.sqrt(b * b - SHB * SHB).toFixed(1)}px)` : 'none';
+    put(X, q.rot, sb, q.m.ox + sb.pad, q.m.oy + sb.pad, q.wx + SH.x * o, q.wy + SH.y * o, 1 / q.fh); X.restore();
+  }
+  for (const q of PL) { // the pin's shadow: its foot reaches the pin's own foot as the pin goes in, and it
+    // softens up its length as the moth's does, sharp where the pin meets the floor
+    const zf = q.z - q.h, zh = q.z + PIN_UP, pb = zz => 0.6 + 0.4 * SHB * zz / HEIGHT.moth, N = 8;
+    X.save(); X.globalCompositeOperation = 'multiply'; X.globalAlpha = q.a; X.lineWidth = 3; X.lineCap = 'butt'; X.strokeStyle = 'rgba(60,42,28,0.85)';
+    for (let i = 0; i < N; i++) {
+      const za = lerp(zf, zh, i / N), zb = lerp(zf, zh, (i + 1) / N);
+      X.filter = `blur(${pb((za + zb) / 2).toFixed(1)}px)`; X.beginPath();
+      X.moveTo(q.px + SH.x * za * K, q.py + SH.y * za * K); X.lineTo(q.px + SH.x * zb * K, q.py + SH.y * zb * K); X.stroke();
+    }
+    X.filter = `blur(${pb(zh).toFixed(1)}px)`; X.fillStyle = 'rgba(60,42,28,0.7)'; X.beginPath();
+    X.ellipse(q.px + SH.x * zh * K, q.py + SH.y * zh * K, q.pr * 1.2, q.pr * 1.7, Math.atan2(SH.y, SH.x) - Math.PI / 2, 0, 7); X.fill(); X.restore();
+  }
+  const ml = MOTHL.getContext('2d'); ml.setTransform(1, 0, 0, 1, 0, 0); ml.globalCompositeOperation = 'source-over'; ml.clearRect(0, 0, W, H);
+  for (const q of PL) { // out of focus until it nears the floor
+    const [x, y] = q.at(q.wx, q.wy, q.z); ml.globalAlpha = q.a; ml.filter = q.dof > 0.05 ? `blur(${q.dof.toFixed(2)}px)` : 'none';
+    put(ml, q.rot, q.m.c, q.m.ox, q.m.oy, x, y, q.s);
+  }
+  ml.filter = 'none'; ml.globalAlpha = 1; ml.globalCompositeOperation = 'source-atop';
+  for (const q of PL) { // the pin's head shades the moth's own back
+    const [x0, y0] = q.at(q.px, q.py, q.z), [x1, y1] = q.at(q.px + SH.x * PIN_UP * K, q.py + SH.y * PIN_UP * K, q.z);
+    ml.filter = 'blur(2px)'; ml.strokeStyle = `rgba(36,24,14,${0.5 * q.a})`; ml.fillStyle = `rgba(36,24,14,${0.45 * q.a})`; ml.lineWidth = 2.4;
+    ml.beginPath(); ml.moveTo(x0, y0); ml.lineTo(x1, y1); ml.stroke(); ml.beginPath(); ml.arc(x1, y1, q.pr * 1.15, 0, 7); ml.fill();
+  }
+  ml.filter = 'none'; ml.globalCompositeOperation = 'source-over';
+  X.drawImage(FRAME, 0, 0); // a moth held above the drawer passes over the rails, so the rails go down first
+  X.drawImage(MOTHL, 0, 0);
+  for (const q of PL) { // the pin above the moth, steel, and its black head
+    const [x0, y0] = q.at(q.px, q.py, q.z), [x1, y1] = q.at(q.px, q.py, q.z + PIN_UP);
+    X.filter = q.dof > 0.05 ? `blur(${q.dof.toFixed(2)}px)` : 'none'; X.globalAlpha = q.a;
+    X.strokeStyle = 'rgb(70,66,60)'; X.lineWidth = 1.6; X.beginPath(); X.moveTo(x0, y0); X.lineTo(x1, y1); X.stroke();
+    pinHeadDraw(X, x1, y1, q.pr * persp(q.z + PIN_UP) / q.fh, q.a);
+  }
+  X.filter = 'none'; X.globalAlpha = 1;
+  // one window, upper left: the drawer falls off from bright to dark across its width
+  X.globalCompositeOperation = 'multiply';
+  const fall = X.createLinearGradient(40, 300, 1060, 700); fall.addColorStop(0, 'rgb(255,254,250)'); fall.addColorStop(0.45, 'rgb(228,219,206)'); fall.addColorStop(1, 'rgb(170,156,138)');
+  X.fillStyle = fall; X.fillRect(0, 0, W, H);
+  const fv = X.createLinearGradient(0, 0, 0, H); fv.addColorStop(0, 'rgb(255,255,255)'); fv.addColorStop(1, 'rgb(236,230,222)');
+  X.fillStyle = fv; X.fillRect(0, 0, W, H); X.globalCompositeOperation = 'source-over';
+  glass(t);
+}
+async function init() {
+  INTERIOR = renderInterior(); FRAME = renderFrame(); MOTHL = mk(W, H);
+  for (const k of ORDER.map(o => o[0])) {
+    buildWord(SPECIES[k]); M[k] = renderMoth(SPECIES[k]);
+    const sh = shadowOf(M[k].c, 'rgb(44,30,20)'), pad = SHB * 3, c = mk(sh.width + 2 * pad, sh.height + 2 * pad), g = c.getContext('2d');
+    g.filter = `blur(${SHB}px)`; g.drawImage(sh, pad, pad); c.pad = pad; SHADB[k] = c;
+  }
+  seek(HERO);
+  window.__riso.ready = true;
+}
+window.__riso = { duration: DUR, ready: false, seek, hero: HERO, build: { end: BUILD_END } };
+init();
+</script>
+</body></html>

@@ -1,0 +1,555 @@
+<!doctype html><meta charset="utf-8"><title>03 banknote: a little faith in impossible things</title>
+<style>html,body{margin:0;background:#20231f;display:grid;place-items:center;min-height:100%}canvas{width:720px;height:900px;display:block}</style>
+<canvas id="c" width="1080" height="1350"></canvas>
+<script>
+'use strict';
+// A banknote whose only legend is "a little faith in impossible things", in macro under one
+// raking lamp. The lathe turns the seal, the graver cuts the legend round it, then the lamp drops
+// and the ink stands up off the paper. Every layer is a coverage buffer drawn in code.
+const PHRASE_TO_RENDER = 'a little faith in impossible things';
+const W = 1080, H = 1350, N = W * H, DURATION = 6, BUILD_END = 4.6, HERO = 5.2;
+const cv = document.getElementById('c'), out = cv.getContext('2d');
+
+// ---------- seeded randomness ----------
+function hash(str) { let h = 2166136261 >>> 0; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+function rng(key) { let a = hash(key); return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function lattice(key, gw, gh) { const r = rng(key), g = new Float32Array(gw * gh); for (let i = 0; i < g.length; i++) g[i] = r(); return g; }
+// value noise sampled on a lattice of cell size s, returns Float32 field in -1..1
+function noiseField(key, s, octaves = 1, gain = 0.5) {
+  const f = new Float32Array(N); let amp = 1, tot = 0;
+  for (let o = 0; o < octaves; o++) {
+    const cs = s / (1 << o), gw = Math.ceil(W / cs) + 2, gh = Math.ceil(H / cs) + 2, g = lattice(key + o, gw, gh);
+    for (let y = 0; y < H; y++) {
+      const fy = y / cs, iy = fy | 0, ty = fy - iy, sy = ty * ty * (3 - 2 * ty);
+      for (let x = 0; x < W; x++) {
+        const fx = x / cs, ix = fx | 0, tx = fx - ix, sx = tx * tx * (3 - 2 * tx), k = iy * gw + ix;
+        const a = g[k] + (g[k + 1] - g[k]) * sx, b = g[k + gw] + (g[k + gw + 1] - g[k + gw]) * sx;
+        f[y * W + x] += amp * ((a + (b - a) * sy) * 2 - 1);
+      }
+    }
+    tot += amp; amp *= gain;
+  }
+  for (let i = 0; i < N; i++) f[i] /= tot;
+  return f;
+}
+
+// ---------- buffers ----------
+function layer() { const c = document.createElement('canvas'); c.width = W; c.height = H; const x = c.getContext('2d'); x.fillStyle = '#fff'; x.strokeStyle = '#fff'; return x; }
+function alphaOf(ctx) { const d = ctx.getImageData(0, 0, W, H).data, f = new Float32Array(N); for (let i = 0; i < N; i++) f[i] = d[i * 4 + 3] / 255; return f; }
+// separable box blur, three passes approximates a gaussian of the given sigma
+function blur(src, sigma) {
+  const r = Math.max(1, Math.round(Math.sqrt(12 * sigma * sigma / 3 + 1) / 2 - 0.5));
+  let a = Float32Array.from(src), b = new Float32Array(N);
+  for (let pass = 0; pass < 3; pass++) {
+    for (let y = 0; y < H; y++) { const o = y * W; let s = 0; for (let x = -r; x <= r; x++) s += a[o + Math.min(W - 1, Math.max(0, x))];
+      for (let x = 0; x < W; x++) { b[o + x] = s / (2 * r + 1); s += a[o + Math.min(W - 1, x + r + 1)] - a[o + Math.max(0, x - r)]; } }
+    for (let x = 0; x < W; x++) { let s = 0; for (let y = -r; y <= r; y++) s += b[Math.min(H - 1, Math.max(0, y)) * W + x];
+      for (let y = 0; y < H; y++) { a[y * W + x] = s / (2 * r + 1); s += b[Math.min(H - 1, y + r + 1) * W + x] - b[Math.max(0, y - r) * W + x]; } }
+  }
+  return a;
+}
+const clamp = (v, a = 0, b = 1) => v < a ? a : v > b ? b : v;
+const smooth = (a, b, v) => { const t = clamp((v - a) / (b - a)); return t * t * (3 - 2 * t); };
+const TAU = Math.PI * 2;
+// exact small gaussian for relief work (box passes are too coarse below sigma 2)
+function gauss(src, sigma) {
+  const r = Math.ceil(sigma * 3), k = []; let s = 0;
+  for (let i = -r; i <= r; i++) { const v = Math.exp(-i * i / (2 * sigma * sigma)); k.push(v); s += v; }
+  for (let i = 0; i < k.length; i++) k[i] /= s;
+  const a = new Float32Array(N), b = new Float32Array(N);
+  for (let y = 0; y < H; y++) { const o = y * W; for (let x = 0; x < W; x++) { let v = 0; for (let i = -r; i <= r; i++) v += k[i + r] * src[o + Math.min(W - 1, Math.max(0, x + i))]; a[o + x] = v; } }
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { let v = 0; for (let i = -r; i <= r; i++) v += k[i + r] * a[Math.min(H - 1, Math.max(0, y + i)) * W + x]; b[y * W + x] = v; }
+  return b;
+}
+
+// ---------- engraved roman ----------
+// arcs are sampled ellipses: angles in degrees, y down, so 90 is the bottom
+function arc(cx, cy, rx, ry, a0, a1, n = 40) { const p = []; for (let i = 0; i <= n; i++) { const a = (a0 + (a1 - a0) * i / n) * Math.PI / 180; p.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)]); } return p; }
+const cat = (...ps) => ps.flat();
+// Capitals cut the way a banknote engraver cuts them: thick and thin by stroke role, round
+// strokes stressed vertically, ends cut flat on the cap line and baseline, bracketed hairline
+// serifs. Units: cap height 1, y down. Kinds: T thick, t thin, C stressed curve, S curve with a
+// heavy spine, V hairline beak, D dot, F free hairline (not cut to the cap band).
+const RT = 0.19, Rt = 0.055, RH = 0.045;
+function bez(p0, p1, p2, p3, n = 22) { const o = []; for (let i = 0; i <= n; i++) { const s = i / n, u = 1 - s;
+  o.push([u * u * u * p0[0] + 3 * u * u * s * p1[0] + 3 * u * s * s * p2[0] + s * s * s * p3[0], u * u * u * p0[1] + 3 * u * u * s * p1[1] + 3 * u * s * s * p2[1] + s * s * s * p3[1]]); } return o; }
+function chain(...segs) { const o = []; for (const s of segs) for (const p of s) { const l = o[o.length - 1]; if (!l || Math.hypot(l[0] - p[0], l[1] - p[1]) > 1e-6) o.push(p); } return o; }
+const Ln = (a, b, c, d) => [[a, b], [c, d]];
+// the face for hairline weight t: bars sit t / 2 inside the cap line and baseline, so they land flush
+function cutRoman(t) { const hb = t / 2, rh = RH * (t / Rt); return {
+  A: [['t', Ln(0.07, 1, 0.385, 0)], ['T', Ln(0.385, 0, 0.71, 1)], ['t', Ln(0.19, 0.67, 0.6, 0.67)], ['s', 0.07, 1, 'b', 0.07], ['s', 0.71, 1, 'b', 0.2]],
+  B: [['T', Ln(0.11, 0, 0.11, 1)], ['C', chain([[0.11, hb], [0.36, hb]], arc(0.36, 0.245, 0.2, 0.245 - hb, -90, 90, 30), [[0.36, 0.49], [0.11, 0.49]])],
+      ['C', chain([[0.11, 0.49], [0.4, 0.49]], arc(0.4, 0.745, 0.23, 0.255 - hb, -90, 90, 30), [[0.4, 1 - hb], [0.11, 1 - hb]])], ['s', 0.11, 0, 'tl', RT], ['s', 0.11, 1, 'bl', RT]],
+  C: [['C', arc(0.43, 0.5, 0.4, 0.515, -48, -312, 64)], ['V', Ln(0.698, 0.03, 0.698, 0.3)], ['V', Ln(0.698, 0.76, 0.698, 0.96)]],
+  D: [['T', Ln(0.11, 0, 0.11, 1)], ['C', chain([[0.11, hb], [0.36, hb]], arc(0.36, 0.5, 0.38, 0.5 - hb, -90, 90, 44), [[0.36, 1 - hb], [0.11, 1 - hb]])], ['s', 0.11, 0, 'tl', RT], ['s', 0.11, 1, 'bl', RT]],
+  E: [['T', Ln(0.11, 0, 0.11, 1)], ['t', Ln(0.11, hb, 0.6, hb)], ['t', Ln(0.11, 0.49, 0.52, 0.49)], ['t', Ln(0.11, 1 - hb, 0.64, 1 - hb)],
+      ['V', Ln(0.6, 0, 0.6, 0.19)], ['V', Ln(0.52, 0.41, 0.52, 0.57)], ['V', Ln(0.64, 0.79, 0.64, 1)], ['s', 0.11, 0, 'tl', RT], ['s', 0.11, 1, 'bl', RT]],
+  G: [['C', arc(0.43, 0.5, 0.4, 0.515, -48, -318, 64)], ['V', Ln(0.698, 0.03, 0.698, 0.3)], ['T', Ln(0.79, 0.56, 0.79, 0.97)], ['t', Ln(0.64, 0.56 + rh / 2, 0.93, 0.56 + rh / 2)]],
+  H: [['T', Ln(0.11, 0, 0.11, 1)], ['T', Ln(0.75, 0, 0.75, 1)], ['t', Ln(0.11, 0.49, 0.75, 0.49)], ['s', 0.11, 0, 't', RT], ['s', 0.11, 1, 'b', RT], ['s', 0.75, 0, 't', RT], ['s', 0.75, 1, 'b', RT]],
+  F: [['T', Ln(0.11, 0, 0.11, 1)], ['t', Ln(0.11, hb, 0.58, hb)], ['t', Ln(0.11, 0.5, 0.48, 0.5)], ['V', Ln(0.58, 0, 0.58, 0.2)], ['V', Ln(0.48, 0.42, 0.48, 0.58)],
+      ['s', 0.11, 0, 'tl', RT], ['s', 0.11, 1, 'b', RT]],
+  I: [['T', Ln(0.11, 0, 0.11, 1)], ['s', 0.11, 0, 't', RT], ['s', 0.11, 1, 'b', RT]],
+  L: [['T', Ln(0.11, 0, 0.11, 1)], ['t', Ln(0.11, 1 - hb, 0.58, 1 - hb)], ['V', Ln(0.58, 0.78, 0.58, 1)], ['s', 0.11, 0, 't', RT], ['s', 0.11, 1, 'bl', RT]],
+  P: [['T', Ln(0.11, 0, 0.11, 1)], ['C', chain([[0.11, hb], [0.37, hb]], arc(0.37, 0.27, 0.23, 0.27 - hb, -90, 90, 30), [[0.37, 0.54], [0.11, 0.54]])], ['s', 0.11, 0, 'tl', RT], ['s', 0.11, 1, 'b', RT]],
+  K: [['T', Ln(0.11, 0, 0.11, 1)], ['t', Ln(0.13, 0.62, 0.68, 0)], ['T', Ln(0.31, 0.42, 0.74, 1)], ['s', 0.11, 0, 't', RT], ['s', 0.11, 1, 'b', RT], ['s', 0.68, 0, 't', 0.07, 0.09], ['s', 0.74, 1, 'b', 0.21, 0.07]],
+  M: [['t', Ln(0.09, 1, 0.11, 0)], ['T', Ln(0.11, 0, 0.48, 1)], ['t', Ln(0.48, 1, 0.85, 0)], ['T', Ln(0.86, 0, 0.86, 1)],
+      ['s', 0.09, 1, 'b', 0.06], ['s', 0.11, 0, 'tl', 0.06], ['s', 0.86, 0, 'tr', RT], ['s', 0.86, 1, 'b', RT]],
+  N: [['t', Ln(0.11, 0, 0.11, 1)], ['T', Ln(0.11, 0, 0.75, 1)], ['t', Ln(0.75, 0, 0.75, 1)], ['s', 0.11, 0, 'tl', 0.06], ['s', 0.11, 1, 'b', 0.06], ['s', 0.75, 0, 't', 0.06]],
+  O: [['C', arc(0.44, 0.5, 0.42, 0.515, -90, 270, 96)]],
+  R: [['T', Ln(0.11, 0, 0.11, 1)], ['C', chain([[0.11, hb], [0.38, hb]], arc(0.38, 0.255, 0.21, 0.255 - hb, -90, 90, 30), [[0.38, 0.51], [0.11, 0.51]])],
+      ['T', Ln(0.36, 0.51, 0.72, 1)], ['s', 0.11, 0, 'tl', RT], ['s', 0.11, 1, 'b', RT], ['s', 0.72, 1, 'br', 0.21]],
+  S: [['S', chain(bez([0.63, 0.12], [0.57, 0.03], [0.47, hb], [0.36, hb]), bez([0.36, hb], [0.2, hb], [0.1, 0.1], [0.1, 0.25]), bez([0.1, 0.25], [0.1, 0.4], [0.25, 0.45], [0.38, 0.5]),
+      bez([0.38, 0.5], [0.52, 0.55], [0.66, 0.6], [0.66, 0.76]), bez([0.66, 0.76], [0.66, 0.9], [0.54, 1 - hb], [0.37, 1 - hb]), bez([0.37, 1 - hb], [0.22, 1 - hb], [0.1, 0.93], [0.06, 0.85]))],
+      ['V', Ln(0.63, 0.03, 0.63, 0.27)], ['V', Ln(0.06, 0.73, 0.06, 0.97)]],
+  T: [['t', Ln(0.02, hb, 0.74, hb)], ['T', Ln(0.38, 0, 0.38, 1)], ['V', Ln(0.04, 0, 0.04, 0.19)], ['V', Ln(0.72, 0, 0.72, 0.19)], ['s', 0.38, 1, 'b', RT]],
+  V: [['T', Ln(0.04, 0, 0.39, 1)], ['t', Ln(0.39, 1, 0.74, 0)], ['s', 0.04, 0, 't', 0.2], ['s', 0.74, 0, 't', 0.06]],
+  Y: [['T', Ln(0.04, 0, 0.39, 0.53)], ['t', Ln(0.74, 0, 0.39, 0.53)], ['T', Ln(0.39, 0.5, 0.39, 1)], ['s', 0.04, 0, 't', 0.2], ['s', 0.74, 0, 't', 0.06], ['s', 0.39, 1, 'b', RT]],
+  2: [['C', chain(bez([0.09, 0.2], [0.11, 0.07], [0.2, hb], [0.34, hb]), bez([0.34, hb], [0.5, hb], [0.6, 0.1], [0.6, 0.26]), bez([0.6, 0.26], [0.6, 0.46], [0.36, 0.62], [0.03, 1 - hb]))],
+      ['t', Ln(0.03, 1 - hb, 0.64, 1 - hb)], ['V', Ln(0.64, 0.82, 0.64, 1)], ['D', [0.12, 0.21], 0.075]],
+  3: [['C', chain(bez([0.08, 0.17], [0.13, 0.05], [0.24, hb], [0.34, hb]), bez([0.34, hb], [0.5, hb], [0.57, 0.1], [0.57, 0.23]), bez([0.57, 0.23], [0.57, 0.37], [0.46, 0.46], [0.27, 0.46]))],
+      ['C', chain(bez([0.27, 0.46], [0.5, 0.46], [0.62, 0.57], [0.62, 0.72]), bez([0.62, 0.72], [0.62, 0.89], [0.49, 1 - hb], [0.32, 1 - hb]), bez([0.32, 1 - hb], [0.18, 1 - hb], [0.08, 0.94], [0.04, 0.85]))],
+      ['D', [0.11, 0.2], 0.07], ['D', [0.08, 0.84], 0.07]],
+  4: [['t', Ln(0.5, 0, 0.03, 0.7)], ['T', Ln(0.53, 0, 0.53, 1)], ['t', Ln(0.03, 0.7 + hb, 0.72, 0.7 + hb)], ['V', Ln(0.72, 0.62, 0.72, 0.8)], ['s', 0.53, 1, 'b', RT, 0.14]],
+  6: [['C', chain(bez([0.55, 0.09], [0.5, 0.03], [0.43, hb], [0.36, hb]), bez([0.36, hb], [0.15, hb], [0.06, 0.24], [0.06, 0.58]), bez([0.06, 0.58], [0.06, 0.88], [0.18, 1 - hb], [0.35, 1 - hb]),
+      bez([0.35, 1 - hb], [0.53, 1 - hb], [0.63, 0.86], [0.63, 0.69]), bez([0.63, 0.69], [0.63, 0.5], [0.5, 0.39], [0.35, 0.39]), bez([0.35, 0.39], [0.2, 0.39], [0.1, 0.48], [0.07, 0.58]))], ['D', [0.53, 0.12], 0.065]],
+  ',': [['D', [0.06, 0.93], 0.068], ['F', Ln(0.11, 0.95, 0.01, 1.17)]],
+}; }
+function quad(p0, c, p1, n = 6) { const o = []; for (let i = 0; i <= n; i++) { const s = i / n, u = 1 - s; o.push([u * u * p0[0] + 2 * u * s * c[0] + s * s * p1[0], u * u * p0[1] + 2 * u * s * c[1] + s * s * p1[1]]); } return o; }
+function ribbon(pts, wf) {
+  const L = [], R = [];
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[Math.max(0, i - 1)], b = pts[Math.min(pts.length - 1, i + 1)];
+    let dx = b[0] - a[0], dy = b[1] - a[1]; const d = Math.hypot(dx, dy) || 1; dx /= d; dy /= d;
+    const w = wf(i / (pts.length - 1), Math.atan2(dy, dx)) / 2;
+    L.push([pts[i][0] - dy * w, pts[i][1] + dx * w]); R.push([pts[i][0] + dy * w, pts[i][1] - dx * w]);
+  }
+  return L.concat(R.reverse());
+}
+const stress = th => Math.pow(Math.abs(Math.sin(th)), 1.7);
+function serifPoly(x, y, mode, sw, len = 0.12, rh = RH) {
+  const s = y < 0.5 ? 1 : -1, yb = y + s * rh, b = 0.05;
+  const L = mode.length === 1 || mode.endsWith('l'), R = mode.length === 1 || mode.endsWith('r');
+  const p = [[x - sw / 2 - (L ? len : 0), y], [x + sw / 2 + (R ? len : 0), y], [x + sw / 2 + (R ? len : 0), yb]];
+  if (R) p.push(...quad([x + sw / 2 + b, yb], [x + sw / 2, yb], [x + sw / 2, yb + s * b])); else p.push([x + sw / 2, yb + s * b]);
+  if (L) p.push(...quad([x - sw / 2, yb + s * b], [x - sw / 2, yb], [x - sw / 2 - b, yb])); else p.push([x - sw / 2, yb + s * b]);
+  p.push([x - sw / 2 - (L ? len : 0), yb]);
+  return p;
+}
+// one glyph as polygons in unit space, each with the band it is cut to. Only strokes run past the
+// band are cut to it; a bar already lies flush, and clipping it again thins its outer pixel row.
+function romanGlyph(spec, t) {
+  const out = [], rh = RH * (t / Rt);
+  for (const [k, a, b, c, d, e] of spec) {
+    if (k === 's') { out.push({ poly: serifPoly(a, b, c, d, e, rh), band: null, k }); continue; }
+    if (k === 'D') { const p = []; for (let i = 0; i < 24; i++) p.push([a[0] + b * Math.cos(i / 24 * TAU), a[1] + b * Math.sin(i / 24 * TAU)]); out.push({ poly: p, band: null, k }); continue; }
+    let pts = a.map(q => q.slice()), run = false;
+    if (k === 'T' || k === 't') {           // run straight strokes past the cap band so the cut is flat
+      const [p0, p1] = pts, dx = p1[0] - p0[0], dy = p1[1] - p0[1], l = Math.hypot(dx, dy);
+      if (Math.abs(dy) > 0.3 * l) { for (const [p, sg] of [[p0, -1], [p1, 1]]) if (p[1] < 0.001 || p[1] > 0.999) { p[0] += sg * dx / l * 0.12; p[1] += sg * dy / l * 0.12; run = true; } }
+    }
+    const wf = k === 'T' ? () => RT : k === 't' ? () => t : k === 'V' ? () => rh * 1.3 : k === 'F' ? () => t * 1.1
+      : k === 'S' ? (s, th) => t + (RT - t) * Math.max(stress(th), Math.exp(-(((s - 0.5) / 0.15) ** 2))) : (s, th) => t + (RT - t) * stress(th);
+    // n: the ribbon is n left points then n right points reversed, so the graver can cut it part way
+    out.push({ poly: ribbon(pts, wf), n: pts.length, band: run ? [0, 1] : k === 'C' || k === 'S' ? [-0.025, 1.025] : null, k });
+  }
+  return out;
+}
+// Left and right profile of a glyph at 24 heights, so letters can be spaced by eye: the gap
+// between neighbours is averaged across their height (capped where the counter opens), the
+// way a punchcutter fits V beside A, rather than measured box to box.
+const LEVELS = [0.012, 0.03].concat(Array.from({ length: 24 }, (_, i) => 0.06 + i * 0.88 / 23), [0.97, 0.988]), SERIF_ROW = k => k < 2 || k >= LEVELS.length - 2;
+function profile(gl) {
+  const l = LEVELS.map(() => 1e9), r = LEVELS.map(() => -1e9);
+  for (const p of gl) { const q = p.poly; for (let j = 0; j < q.length; j++) { const a = q[j], b = q[(j + 1) % q.length];
+    LEVELS.forEach((y, k) => { if ((a[1] - y) * (b[1] - y) <= 0 && a[1] !== b[1]) { const x = a[0] + (b[0] - a[0]) * (y - a[1]) / (b[1] - a[1]); l[k] = Math.min(l[k], x); r[k] = Math.max(r[k], x); } }); } }
+  return { l, r };
+}
+// The face is cut per size. A hairline has to hold about two pixels: the plate sits 1.1 degrees
+// off square, so along a line of type a thinner bar drifts from one pixel row onto two, and where
+// it splits, the ink threshold loses it (both baseline bars in MESSAGES). Below a 36 px cap the
+// hairlines, beaks and serif plates are cut heavier, the way small sizes always have been.
+const HAIR_PX = 2, FACES = {};
+function face(cap) {
+  const t = Math.max(Rt, HAIR_PX / cap);
+  if (!FACES[t]) { const spec = cutRoman(t), gl = {}, pr = {}; for (const ch in spec) { gl[ch] = romanGlyph(spec[ch], t); pr[ch] = profile(gl[ch]); } FACES[t] = { gl, pr }; }
+  return FACES[t];
+}
+function fit(A, B, track) {   // offset of B's origin from A's origin
+  const gap = d => { let s2 = 0, n = 0, mn = 1e9; LEVELS.forEach((_, k) => { if (A.r[k] < -1e8 || B.l[k] > 1e8) return; const gk = d + B.l[k] - A.r[k]; mn = Math.min(mn, gk);
+    if (!SERIF_ROW(k)) { s2 += Math.min(gk, track * 2.4); n++; } }); return { avg: n ? s2 / n : 1e9, mn }; };
+  let lo = -1, hi = 3; for (let it = 0; it < 40; it++) { const m = (lo + hi) / 2, q = gap(m); (q.avg > track && q.mn > 0.1) ? hi = m : lo = m; }
+  return hi;
+}
+// set a line of roman capitals at the origin, cap height 1: each part keeps its letter's index and
+// its word, so the graver can cut letter by letter. open adds letterspace, in caps.
+function setRoman(str, cap, open = 0) {
+  const { gl, pr } = face(cap), parts = []; let ox = null, prev = null, wordGap = 0, right = 0, letter = -1, word = 0;
+  for (const ch of str) {
+    if (!gl[ch]) { wordGap += 0.48; word++; continue; }
+    const P2 = pr[ch];
+    if (prev === null) ox = -Math.min(...P2.l); else ox += fit(pr[prev], P2, 0.1) + wordGap + open;
+    letter++;
+    for (const p of gl[ch]) parts.push({ ...p, poly: p.poly.map(([u, v]) => [ox + u, v]), letter, word });
+    right = ox + Math.max(...P2.r); prev = ch; wordGap = 0;
+  }
+  return { parts, width: right, letters: letter + 1 };
+}
+// ---------- plate geometry ----------
+// Note space is the flat note; each pass maps it to the frame with its own small error,
+// because the offset and intaglio passes are registered separately on the press.
+const ROT = -1.1 * Math.PI / 180;
+function passMatrix(dx, dy, drot) { const a = ROT + drot, c = Math.cos(a), s = Math.sin(a), ox = W / 2, oy = H / 2;
+  return [c, s, -s, c, ox + dx - c * ox + s * oy, oy + dy - s * ox - c * oy]; }
+const M_INT = passMatrix(0, 0, 0), M_OFF = passMatrix(2.8, -2.0, 0.0005);
+const apply = (m, x, y) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+// every pass prints only inside the border; restore() lifts that limit for the border itself
+function pass(m) { const x = layer(); x.setTransform(...m); x.__m = m; x.save(); x.beginPath(); x.rect(-2000, -2000, 2000 + PRINT[0], 2000 + PRINT[1]); x.clip(); return x; }
+// sample a tone buffer (frame space) at a note-space point, bilinear
+function sampler(buf, m) { return (x, y) => { const [u, v] = apply(m, x, y); const i = u | 0, j = v | 0; if (i < 0 || j < 0 || i >= W - 1 || j >= H - 1) return 0;
+  const fx = u - i, fy = v - j, k = j * W + i; return (buf[k] * (1 - fx) + buf[k + 1] * fx) * (1 - fy) + (buf[k + W] * (1 - fx) + buf[k + W + 1] * fx) * fy; }; }
+
+// A lathe-turned curve: radius as a function of angle, drawn from the start angle a0 round to the
+// cutter's reach, clockwise on screen.
+function polar(ctx, cx, cy, rf, reach, width, n = 2400, a0 = 0) {
+  if (reach <= 0) return;
+  ctx.lineWidth = width; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.beginPath();
+  const end = Math.max(1, Math.round(n * Math.min(1, reach)));
+  for (let i = 0; i <= end; i++) { const a = a0 + i / n * TAU, r = rf(a); const x = cx + r * Math.cos(a), y = cy + r * Math.sin(a); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+  ctx.stroke();
+}
+function circle(ctx, cx, cy, r, width) { ctx.lineWidth = width; ctx.beginPath(); ctx.arc(cx, cy, r, 0, TAU); ctx.stroke(); }
+
+// ---------- the note ----------
+// The seal: a lathe-turned rose, a dark ring with a white-line braid, the legend round it, and an
+// offset corona outside. The phrase is the legend: 17 characters a line, so it splits evenly round
+// the seal, the first line over the top and the second under the foot.
+const CX = 522, CY = 752;                         // seal centre, note space
+const R_ROSE = 262, R_DARK = [276, 320], R_LEG = [334, 406], R_OUT = 418, R_COR = 425;
+const CAP = R_LEG[1] - R_LEG[0], RM = (R_LEG[0] + R_LEG[1]) / 2;
+// the sheet: printed area inside an engraved border, then the blank margin, then the cut edge
+const PRINT = [1004, 1282], EDGE = [1046, 1324];
+const A_SEAL = Math.PI, A_COR = -Math.PI / 3;     // where each lathe pass starts: seal at 9 o'clock, corona top right
+// the legend is the phrase in capitals, split at the space nearest its middle: 17 characters a line
+const LEGEND = (() => { const s = PHRASE_TO_RENDER.toUpperCase(), mid = s.length / 2; let m = -1;
+  for (let i = 0; i < s.length; i++) if (s[i] === ' ' && (m < 0 || Math.abs(i - mid) < Math.abs(m - mid))) m = i;
+  return [s.slice(0, m), s.slice(m + 1)]; })();
+
+// ---------- the build ----------
+// The lathe turns the rose curve by curve, then the dark ring; the graver cuts the legend letter by
+// letter; the offset corona and tint field come last and reach the top left from 4 s; then the lamp
+// drops and the ink stands up. BUILD_END is when the last line lands.
+const sweep = (t, a, d) => smooth(a, a + d, t);
+const LEG_T0 = 1.85, LEG_DT = 0.056, LEG_DUR = 0.4, WORD_GAP = 0.05, LINE_GAP = 0.14;
+const lift = t => smooth(3.3, BUILD_END, t);       // the lamp drops and the ink stands up
+
+// The legend is set straight, then bent onto the band. The top line reads clockwise with its feet on
+// the inner rule; the bottom line reads anticlockwise with its feet on the outer rule; so both read
+// left to right, the way a coin's legend does. The top line is opened to the bottom line's length
+// so the two gaps sit level at 3 and 9 o'clock.
+const LEG = (() => {
+  const top0 = setRoman(LEGEND[0], CAP), bot = setRoman(LEGEND[1], CAP);
+  const top = setRoman(LEGEND[0], CAP, (bot.width - top0.width) / (top0.letters - 1));
+  const k = CAP / RM, parts = [];
+  const bend = (line, w, sgn) => ([u, v]) => { const a = sgn * (-Math.PI / 2) + sgn * (u - w / 2) * k, r = sgn > 0 ? R_LEG[0] + (1 - v) * CAP : R_LEG[0] + v * CAP;
+    return [CX + r * Math.cos(a), CY + r * Math.sin(a)]; };
+  let T = LEG_T0, idx = 0;
+  [[top, 1], [bot, -1]].forEach(([line, sgn], li) => {
+    const f = bend(line, line.width, sgn); let lastWord = 0, letter = -1;
+    for (const p of line.parts) {
+      if (p.letter !== letter) { if (letter >= 0) T += LEG_DT; if (p.word !== lastWord) { T += WORD_GAP; lastWord = p.word; } letter = p.letter; idx++; }
+      const band = p.band && (sgn > 0 ? [R_LEG[0] + (1 - p.band[1]) * CAP, R_LEG[0] + (1 - p.band[0]) * CAP] : [R_LEG[0] + p.band[0] * CAP, R_LEG[0] + p.band[1] * CAP]);
+      parts.push({ poly: p.poly.map(f), n: p.n, k: p.k, band, letter: idx, t0: T, dir: sgn });
+    }
+    T += LINE_GAP;
+  });
+  // each part's angular extent round the seal, and its letter's, for the sweeps below
+  for (const p of parts) { const as = p.poly.map(q => Math.atan2(q[1] - CY, q[0] - CX)); p.a0 = Math.min(...as); p.a1 = Math.max(...as); }
+  // within a letter the strokes are cut one after another in the order the face draws them, then
+  // the serifs and beaks are swept in together
+  const byLetter = {};
+  for (const p of parts) (byLetter[p.letter] = byLetter[p.letter] || []).push(p);
+  for (const ps of Object.values(byLetter)) {
+    const strokes = ps.filter(p => p.n), n = strokes.length;
+    strokes.forEach((p, i) => { p.s = p.t0 + LEG_DUR * 0.7 * i / n; p.e = p.s + LEG_DUR * 0.7 / n * 1.35; });
+    ps.filter(p => !p.n).forEach(p => { p.s = p.t0 + LEG_DUR * 0.62; p.e = p.t0 + LEG_DUR; });
+    const la0 = Math.min(...ps.map(p => p.a0)), la1 = Math.max(...ps.map(p => p.a1));
+    for (const p of ps) { p.tintS = p.t0 - 0.16; p.tintE = p.t0 + 0.06; p.la0 = la0; p.la1 = la1; }
+  }
+  return { parts, end: Math.max(...parts.map(p => p.e)) };
+})();
+// a stroke cut part way: the ribbon's left and right edges up to a fraction of its centre length
+function cutPoly(p, f) {
+  if (!p.n || f >= 1) return p.poly;
+  const n = p.n, L = p.poly.slice(0, n), R = p.poly.slice(n).reverse(), cum = [0];
+  for (let i = 1; i < n; i++) cum.push(cum[i - 1] + Math.hypot((L[i][0] + R[i][0] - L[i - 1][0] - R[i - 1][0]) / 2, (L[i][1] + R[i][1] - L[i - 1][1] - R[i - 1][1]) / 2));
+  const want = f * cum[n - 1]; let i = 0; while (i < n - 2 && cum[i + 1] < want) i++;
+  const g = clamp((want - cum[i]) / Math.max(1e-6, cum[i + 1] - cum[i])), lerp = (a, b) => [a[0] + (b[0] - a[0]) * g, a[1] + (b[1] - a[1]) * g];
+  return L.slice(0, i + 1).concat([lerp(L[i], L[i + 1]), lerp(R[i], R[i + 1])], R.slice(0, i + 1).reverse());
+}
+// clip to the wedge a cut has swept: from the leading edge of [a0, a1] in reading order, f of the way
+function sweepClip(ctx, a0, a1, dir, f) {
+  const pad = 0.004, span = (a1 - a0 + 2 * pad) * f, s = dir > 0 ? a0 - pad : a1 + pad;
+  ctx.beginPath(); ctx.moveTo(CX, CY); ctx.arc(CX, CY, 2000, s, s + dir * span, dir < 0); ctx.closePath(); ctx.clip();
+}
+// Strokes are cut along their length; serifs, beaks and each letter's offset tint are swept across
+// in reading order, so nothing in the legend fades in.
+function drawLegend(ctx, t, tint = false) {
+  for (const p of LEG.parts) {
+    const f = tint ? smooth(p.tintS, p.tintE, t) : smooth(p.s, p.e, t); if (f <= 0) continue;
+    const poly = tint ? p.poly : cutPoly(p, f);
+    ctx.save();
+    if (f < 1 && (tint || !p.n)) sweepClip(ctx, tint ? p.la0 : p.a0, tint ? p.la1 : p.a1, p.dir, f);
+    if (p.band) { ctx.beginPath(); ctx.arc(CX, CY, p.band[1], 0, TAU); ctx.arc(CX, CY, p.band[0], 0, TAU, true); ctx.clip(); }
+    ctx.beginPath(); ctx.moveTo(poly[0][0], poly[0][1]); for (const q of poly) ctx.lineTo(q[0], q[1]); ctx.closePath(); ctx.fill(); ctx.restore();
+  }
+}
+// Ruled cuts that follow the seal: concentric lines whose width follows a tone map, swelling into
+// the darks and tapering to nothing, with a little pressure change per line and along it.
+function ringRule(ctx, tone, r0, r1, pitch, wmax, key, minW = 0.4) {
+  const rr = rng(key);
+  for (let r = r0; r <= r1; r += pitch) {
+    const jit = 1 + (rr() - 0.5) * 0.14, f1 = 0.01 + rr() * 0.02, ph = rr() * TAU, n = Math.ceil(TAU * r);
+    let L = [], R = [];
+    const flush = () => { if (L.length > 2) { ctx.beginPath(); ctx.moveTo(L[0][0], L[0][1]); for (const q of L) ctx.lineTo(q[0], q[1]);
+      for (let i = R.length - 1; i >= 0; i--) ctx.lineTo(R[i][0], R[i][1]); ctx.closePath(); ctx.fill(); } L = []; R = []; };
+    for (let i = 0; i <= n; i++) {
+      const a = i / n * TAU, c = Math.cos(a), s = Math.sin(a), px = CX + r * c, py = CY + r * s;
+      const w = wmax * tone(px, py) * jit * (1 + 0.06 * Math.sin(i * f1 + ph));
+      if (w < minW) { flush(); continue; }
+      L.push([px + c * w / 2, py + s * w / 2]); R.push([px - c * w / 2, py - s * w / 2]);
+    }
+    flush();
+  }
+}
+// Engraved legend: a hairline contour cut round each letter, then concentric cuts inside the thick
+// strokes that swell toward the middle and taper as they near the contour. Hairlines and serifs are
+// too narrow to hold that and print as one solid cut. Once every letter is cut it is kept.
+let LEG_DONE = null;
+function engraveLegend(ty, t) {
+  let cov, tone;
+  if (LEG_DONE && t >= LEG.end) ({ cov, tone } = LEG_DONE);
+  else {
+    const m = pass(M_INT); drawLegend(m, t);
+    const Mk = alphaOf(m), B = gauss(Mk, 1.25), B2 = gauss(Mk, 4.2); cov = new Float32Array(N); tone = new Float32Array(N);
+    for (let i = 0; i < N; i++) { const solid = 1 - smooth(0.68, 0.84, B2[i]);
+      cov[i] = Mk[i] * Math.max(solid, 1 - smooth(0.78, 0.9, B[i])); tone[i] = (1 - solid) * smooth(0.9, 0.985, B[i]); }
+    if (t >= LEG.end) LEG_DONE = { cov, tone };
+  }
+  const c = document.createElement('canvas'); c.width = W; c.height = H; const cc = c.getContext('2d'), id = cc.createImageData(W, H);
+  for (let i = 0; i < N; i++) { id.data[i * 4] = id.data[i * 4 + 1] = id.data[i * 4 + 2] = 255; id.data[i * 4 + 3] = cov[i] * 255; }
+  cc.putImageData(id, 0, 0); ty.save(); ty.setTransform(1, 0, 0, 1, 0, 0); ty.drawImage(c, 0, 0); ty.restore();
+  ringRule(ty, sampler(tone, M_INT), R_LEG[0] - 4, R_LEG[1] + 4, 2.6, 2.6 * 0.74, 'legend-rule');
+}
+// Intaglio pass, part one: the rose. Two families of twelve-lobed curves, stepped outward with the
+// lobes growing toward the middle of the band and the phase drifting a little each step, so their
+// crossings knit a net of white lenses. The lathe turns them one after another from 9 o'clock.
+function rose(x, t) {
+  for (let j = 0; j < 12; j++) polar(x, CX, CY, a => 10 + 2.6 * j + 1.4 * Math.sin(10 * a + j * 0.7), sweep(t, 0.5 + 0.015 * j, 0.75), 1.25, 1600, A_SEAL);
+  const NJ = 44;
+  for (const fam of [1, -1]) for (let j = 0; j < NJ; j++) {
+    const u = j / (NJ - 1), R0 = 50 + j * 4.7, A = 2 + 16.5 * Math.pow(Math.sin(Math.PI * u), 1.4);
+    // the graver bites deeper through the middle of the band, so the petals carry the most ink
+    polar(x, CX, CY, a => R0 + A * Math.cos(12 * a + fam * j * 0.15), sweep(t, 0.5 + 0.006 * j + (fam < 0 ? 0.1 : 0), 1.2), 0.85 + 0.55 * Math.sin(Math.PI * u), 3000, A_SEAL);
+  }
+  // a white-line rose left uncut through the net: twelve petals and a ring, so the rose reads as
+  // white lace on the dark petals
+  x.save(); x.globalCompositeOperation = 'destination-out';
+  for (const [w, o] of [[2.6, 0], [1.6, Math.PI / 12]]) polar(x, CX, CY, a => 58 + 150 * Math.pow(Math.abs(Math.cos(6 * a + o)), 0.75), 1, w, 3000);
+  circle(x, CX, CY, 52, 2.2);
+  x.restore();
+  polar(x, CX, CY, () => R_ROSE + 4, sweep(t, 1.2, 0.8), 2.2, 2400, A_SEAL);
+}
+// Intaglio pass, part two: the dark ring. It is dense concentric cuts with a white-line braid left
+// uncut, the way a geometric lathe works a plate; the cutter's sweep limits how much is cut.
+function darkRing(x, t) {
+  const [ri, ro] = R_DARK, rm = (ri + ro) / 2, reach = sweep(t, 1.25, 1.2);
+  if (reach > 0) {
+    x.save();
+    x.beginPath(); x.arc(CX, CY, ro, 0, TAU); x.arc(CX, CY, ri, 0, TAU, true); x.clip();
+    if (reach < 1) { x.beginPath(); x.moveTo(CX, CY); x.arc(CX, CY, ro + 20, A_SEAL, A_SEAL + reach * TAU); x.closePath(); x.clip(); }
+    for (let r = ri + 1; r < ro; r += 3.0) circle(x, CX, CY, r, 2.3);
+    x.globalCompositeOperation = 'destination-out';
+    for (let j = 0; j < 4; j++) polar(x, CX, CY, a => rm + 15 * Math.sin(20 * a + j * TAU / 4), 1, 2.3, 3000);
+    for (let j = 0; j < 2; j++) polar(x, CX, CY, a => rm + 5 * Math.sin(54 * a + j * Math.PI), 1, 1.5, 3000);
+    x.restore();
+  }
+  polar(x, CX, CY, () => ri - 4, sweep(t, 1.1, 1.0), 1.4, 2400, A_SEAL); polar(x, CX, CY, () => ro + 4, sweep(t, 1.2, 1.0), 2.4, 2400, A_SEAL);
+  polar(x, CX, CY, () => R_LEG[0] - 6, sweep(t, 1.3, 1.0), 1.4, 2400, A_SEAL);
+  polar(x, CX, CY, () => R_OUT - 5, sweep(t, 1.4, 1.0), 2.4, 2400, A_SEAL); polar(x, CX, CY, () => R_OUT, sweep(t, 1.45, 1.0), 1.3, 2400, A_SEAL);
+}
+// the stops in the legend's two gaps: a six-petal turned rose in a ring, between two dots
+function stops(x, t) {
+  for (const [a, t0] of [[Math.PI, 1.6], [0, 2.75]]) {
+    const ox = CX + RM * Math.cos(a), oy = CY + RM * Math.sin(a), f = sweep(t, t0, 0.5);
+    polar(x, ox, oy, b => 2.5 + 15 * Math.pow(Math.abs(Math.cos(3 * (b - a))), 0.8), f, 1.7, 900, a + Math.PI);
+    polar(x, ox, oy, b => 5 + 8 * Math.pow(Math.abs(Math.sin(3 * (b - a))), 0.8), f, 1.1, 900, a + Math.PI);
+    polar(x, ox, oy, () => 21, f, 1.4, 600, a + Math.PI);
+    if (f > 0) for (const s of [-1, 1]) { const b = a + s * 38 / RM, dx = CX + RM * Math.cos(b), dy = CY + RM * Math.sin(b);
+      x.beginPath(); x.moveTo(dx, dy); x.arc(dx, dy, 3.6, a + Math.PI, a + Math.PI + f * TAU); x.closePath(); x.fill(); }
+  }
+}
+// Offset pass: flat, fine, transparent lines from a simultan press, so its inks print in exact
+// register with each other: the iris-fed fountain for the field, the seal's ground and the tint;
+// the same fountain run greyer for the corona; and a second ink, slate teal, for its woven ring.
+function buildOffset(t) {
+  const x = pass(M_OFF), xc = pass(M_OFF), xs = pass(M_OFF);
+  x.lineCap = 'round';
+  // The tint field: split-fountain offset in two crossing wave families, half a wave apart, so they
+  // knit into chains of lenses whose size swells and shrinks across the sheet. A straight-line
+  // engine rules them one by one from the foot of the sheet up, each pass running right to left,
+  // so the top left is the last ground to be laid.
+  for (const ph of [0, Math.PI]) for (let y0 = -80; y0 < H + 80; y0 += 6.6) {
+    const go = sweep(t, 1.9 + 1.9 * smooth(1350, 200, y0) + (ph ? 0.05 : 0), 0.8); if (go <= 0) continue;
+    const pts = [];
+    for (let xx = W + 40; xx >= -40; xx -= 2.5) { const A = 5.8 + 3.2 * Math.sin(xx / 160 + y0 / 120); pts.push([xx, y0 + A * Math.sin(xx / 21 + ph)]); }
+    // the cut deepens away from the seal, so the corners the corona leaves bare are worked as fully
+    const end = Math.round((pts.length - 1) * go);
+    for (let i = 0; i + 4 <= end; i += 4) {
+      const m = pts[i + 2]; x.lineWidth = 0.66 + 0.36 * smooth(R_COR + 200, R_COR + 420, Math.hypot(m[0] - CX, m[1] - CY));
+      x.beginPath(); x.moveTo(pts[i][0], pts[i][1]); for (let k = 1; k <= 4; k++) x.lineTo(pts[i + k][0], pts[i + k][1]); x.stroke();
+    }
+  }
+  // the seal's own ground: inside the rose, fine concentric waves; the legend band stays clean paper
+  x.save(); x.globalCompositeOperation = 'destination-out'; x.beginPath(); x.arc(CX, CY, R_OUT + 3, 0, TAU); x.fill(); x.restore();
+  for (let r = 30, j = 0; r < R_ROSE; r += 4.4, j++) polar(x, CX, CY, a => r + 1.4 * Math.sin(12 * a + r / 9), sweep(t, 0.55 + 0.006 * j, 1.0), 0.6, 1400, A_SEAL);
+  // The corona, three lathe bands ruled close enough that they read as tone: a seamed lace of 84
+  // curves at under 2 px pitch, whose two phases cross into a moire of lenses; a woven ring of 20
+  // in the second ink; and a rim of small loops. Its pass starts at 1 o'clock and turns clockwise,
+  // so the arc over the top left is cut last.
+  for (const c of [xc, xs]) c.lineCap = 'round';
+  for (let k = 0; k < 42; k++) for (const ph of [0, Math.PI]) {
+    const R0 = R_COR - 4 + k * 1.87, A = 2 + k * 1.14;
+    polar(xc, CX, CY, a => R0 + A * Math.cos(24 * a + ph), sweep(t, 2.5 + 0.008 * k, 1.75), 0.72, 4000, A_COR);
+  }
+  for (let j = 0; j < 20; j++) polar(xs, CX, CY, a => R_COR + 148 + 34 * Math.sin(8 * a + j * TAU / 20), sweep(t, 2.62 + 0.008 * j, 1.82), 0.8, 4000, A_COR);
+  for (let j = 0; j < 8; j++) polar(xc, CX, CY, a => R_COR + 220 + 13 * Math.sin(60 * a + j * TAU / 8), sweep(t, 2.75, 1.85), 0.75, 4000, A_COR);
+  polar(xs, CX, CY, () => R_COR + 196, sweep(t, 2.7, 1.88), 1.2, 2400, A_COR); polar(xs, CX, CY, () => R_COR + 244, sweep(t, 2.72, 1.88), 1.2, 2400, A_COR);
+  polar(xc, CX, CY, a => R_COR + 1.5 * Math.cos(60 * a), sweep(t, 2.4, 1.7), 1.4, 2400, A_COR);
+  // the legend's tint: the offset lays fine concentric rules inside each letter just before the
+  // graver reaches it, and the intaglio has to land on it, so the press's register error shows
+  const tint = pass(M_OFF); drawLegend(tint, t, true);
+  const rule = pass(M_OFF); for (let r = R_LEG[0] - 8; r < R_LEG[1] + 8; r += 2.6) circle(rule, CX, CY, r, 1.3);
+  tint.globalCompositeOperation = 'destination-in'; tint.setTransform(1, 0, 0, 1, 0, 0); tint.drawImage(rule.canvas, 0, 0);
+  x.save(); x.setTransform(1, 0, 0, 1, 0, 0); x.drawImage(tint.canvas, 0, 0); x.restore();
+  return { x, xc, xs };
+}
+function buildIntaglio(t) {
+  const x = pass(M_INT), ty = pass(M_INT);
+  rose(x, t); darkRing(x, t); stops(x, t); engraveLegend(ty, t);
+  x.restore();
+  // the border is ruled outward from its corner block
+  const f = sweep(t, 0.9, 1.7);
+  if (f > 0) { x.save(); x.beginPath(); x.arc(PRINT[0] + 11, PRINT[1] + 11, 30 + f * 1700, 0, TAU); x.clip(); border(x); x.restore(); }
+  return { x, ty };
+}
+// The printed area ends in an engraved border: two cut rules with a four-strand braid between
+// them, meeting in a corner block. Outside it is blank margin, then the cut edge of the sheet.
+function border(x) {
+  const [px, py] = PRINT, a0 = px + 2, a1 = px + 20, b0 = py + 2, b1 = py + 20, am = (a0 + a1) / 2, bm = (b0 + b1) / 2;
+  x.lineCap = 'butt'; x.lineWidth = 1.8;
+  for (const [u, v] of [[a0, b0], [a1, b1]]) { x.beginPath(); x.moveTo(u, -200); x.lineTo(u, v); x.lineTo(-200, v); x.stroke(); }
+  x.lineWidth = 1.3; x.lineCap = 'round';
+  for (let j = 0; j < 4; j++) {
+    x.beginPath(); for (let y = -200; y <= b0 - 3; y += 1) { const u = am + 6.2 * Math.sin(y / 5.2 + j * TAU / 4); y > -200 ? x.lineTo(u, y) : x.moveTo(u, y); } x.stroke();
+    x.beginPath(); for (let u = -200; u <= a0 - 3; u += 1) { const v = bm + 6.2 * Math.sin(u / 5.2 + j * TAU / 4); u > -200 ? x.lineTo(u, v) : x.moveTo(u, v); } x.stroke();
+  }
+  x.lineWidth = 1.6; x.strokeRect(a0, b0, a1 - a0, b1 - b0);
+  for (let j = 0; j < 6; j++) polar(x, am, bm, a => 4.6 + 2.4 * Math.sin(6 * a + j * TAU / 6), 1, 0.9, 400);
+}
+
+// ---------- paper ----------
+// Cotton security paper: cloudy formation, a felted surface that shows in raking light, a gentle
+// cockle from the intaglio press, and a scatter of red and blue security fibres in the pulp.
+let PAPER = null;
+function buildPaper() {
+  const form = noiseField('formation', 70, 4, 0.55), grain = noiseField('grain', 2.4, 2, 0.6), cockle = noiseField('cockle', 320, 2, 0.4);
+  const fib = layer(), r = rng('felt'); fib.lineCap = 'round';
+  for (let i = 0; i < 16000; i++) { const x = r() * W, y = r() * H, a = r() * TAU, l = 4 + r() * 13, b = (r() - 0.5) * 0.8;
+    fib.globalAlpha = 0.25 + r() * 0.4; fib.lineWidth = 0.6 + r() * 0.7; fib.beginPath(); fib.moveTo(x, y);
+    fib.quadraticCurveTo(x + Math.cos(a + b) * l / 2, y + Math.sin(a + b) * l / 2, x + Math.cos(a) * l, y + Math.sin(a) * l); fib.stroke(); }
+  const felt = gauss(alphaOf(fib), 0.6);
+  const sec = layer(), rs = rng('security-fibres'); sec.lineCap = 'round';
+  for (let i = 0; i < 46; i++) { let x = rs() * W, y = rs() * H, a = rs() * TAU; const n = 9 + (rs() * 12 | 0), col = rs() < 0.55 ? '178,52,62' : '58,84,170';
+    sec.lineWidth = 0.55 + rs() * 0.35;
+    for (let k = 0; k < n; k++) { const nx = x + Math.cos(a) * 3.4, ny = y + Math.sin(a) * 3.4; a += (rs() - 0.5) * 0.7;
+      sec.strokeStyle = `rgba(${col},${(0.25 + 0.75 * Math.abs(Math.sin(k * 0.45 + i))).toFixed(3)})`; sec.beginPath(); sec.moveTo(x, y); sec.lineTo(nx, ny); sec.stroke(); x = nx; y = ny; } }
+  const sd = sec.getImageData(0, 0, W, H).data;
+  const h = new Float32Array(N), alb = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++) {
+    const px = i % W, py = (i / W) | 0;
+    // the note is not flat: one broad, soft curl across the sheet from the wallet it lived in
+    h[i] = 0.05 * grain[i] + 0.07 * felt[i] + 5 * cockle[i] + 6 * Math.sin(Math.PI * (px * 0.62 + py * 0.78) / 1300 + 0.5);
+    const f = 1 + 0.018 * form[i], sa = sd[i * 4 + 3] / 255 * 0.75;
+    alb[i * 3] = (238 * f) * (1 - sa) + sd[i * 4] * sa; alb[i * 3 + 1] = (234 * f) * (1 - sa) + sd[i * 4 + 1] * sa; alb[i * 3 + 2] = (220 * f) * (1 - sa) + sd[i * 4 + 2] * sa;
+  }
+  PAPER = { h, alb, edge: noiseField('ink-edge', 1.4, 2, 0.5), voids: noiseField('ink-voids', 4, 2, 0.5), woodA: noiseField('wood-figure', 110, 2, 0.5), woodB: noiseField('wood-pores', 3, 1) };
+}
+
+// ---------- one lamp ----------
+// A single low lamp at the upper left. Intaglio ink stands proud of the sheet, so each line gets
+// a lit shoulder, a short cast shadow and a direction-dependent sheen; the press embosses the
+// paper around heavy work; the letterpress serial sits in a shallow dent with ink squeezed to its rim.
+const INK = [21, 45, 37], SIM = [92, 134, 138], LAMP = [1.0, 0.975, 0.93];
+const IRIS = [[0, 98, 86, 184], [0.4, 132, 80, 176], [0.64, 182, 88, 150], [0.9, 206, 140, 66], [1, 206, 140, 66]];
+function iris(u) { for (let k = 1; k < IRIS.length; k++) if (u <= IRIS[k][0]) { const a = IRIS[k - 1], b = IRIS[k], f = (u - a[0]) / (b[0] - a[0]); return [a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f, a[3] + (b[3] - a[3]) * f]; } return IRIS[IRIS.length - 1].slice(1); }
+function compose(t) {
+  const I = buildIntaglio(t), icM = alphaOf(I.x), icT = alphaOf(I.ty);
+  const O = buildOffset(t), off = alphaOf(O.x), offC = alphaOf(O.xc), offS = alphaOf(O.xs), ic = new Float32Array(N), embSrc = new Float32Array(N);
+  for (let i = 0; i < N; i++) { ic[i] = Math.min(1, icM[i] + icT[i]); embSrc[i] = icM[i] + 0.6 * icT[i]; }
+  const inkH = gauss(ic, 0.8), hM = gauss(icM, 0.8), hT = gauss(icT, 0.8), emb = blur(embSrc, 20), P = PAPER;
+  // hp is the sheet's own surface; h adds the ink standing on it. Type stands a little lower than
+  // the plate work. Paper is shaded from hp only, so ink never lights a rim. Until the lamp drops
+  // the ink lies nearly flat; then it stands up to its full height and the paper takes the press's
+  // emboss round the heavy work.
+  const up = lift(t), kh = 0.15 + 0.85 * up;
+  const h = new Float32Array(N), hp = new Float32Array(N);
+  for (let i = 0; i < N; i++) { hp[i] = P.h[i] + 0.8 * kh * emb[i]; h[i] = hp[i] + kh * (1.5 * hM[i] + 0.9 * hT[i]); }
+  // one lamp at the upper left: it starts high, drops to 14 degrees as the build lands, then breathes
+  const az = (225 + 9 * Math.sin((t - HERO) * 0.9)) * Math.PI / 180, el = (14 + 36 * (1 - up)) * Math.PI / 180;
+  const Lx = Math.cos(el) * Math.cos(az), Ly = Math.cos(el) * Math.sin(az), Lz = Math.sin(el), tanEl = Math.tan(el);
+  const hl = Math.hypot(Lx, Ly, Lz + 1), Hx = Lx / hl, Hy = Ly / hl, Hz = (Lz + 1) / hl;
+  const sdx = Math.cos(az), sdy = Math.sin(az), flatSpec = Math.pow(Hz, 14);
+  const img = out.createImageData(W, H), d = img.data, mi = M_INT;   // rotation part inverts by transpose: u = a du + b dv, v = c du + d dv
+  for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+    const i = y * W + x;
+    // albedo: paper, then offset (transparent) and intaglio (opaque)
+    let r = P.alb[i * 3], g2 = P.alb[i * 3 + 1], b = P.alb[i * 3 + 2];
+    // transparent inks multiply where they overprint; the corona runs the fountain 30% greyer
+    const oc = off[i] * 0.88, ocr = offC[i] * 0.88, os = offS[i] * 0.86;
+    if (oc > 0 || ocr > 0) { const c = iris(clamp(y / H * 0.82 + x / W * 0.18)), l = 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
+      if (oc > 0) { r *= 1 - oc * (1 - c[0] / 255); g2 *= 1 - oc * (1 - c[1] / 255); b *= 1 - oc * (1 - c[2] / 255); }
+      if (ocr > 0) { r *= 1 - ocr * (1 - (l + 0.7 * (c[0] - l)) / 255); g2 *= 1 - ocr * (1 - (l + 0.7 * (c[1] - l)) / 255); b *= 1 - ocr * (1 - (l + 0.7 * (c[2] - l)) / 255); } }
+    if (os > 0) { r *= 1 - os * (1 - SIM[0] / 255); g2 *= 1 - os * (1 - SIM[1] / 255); b *= 1 - os * (1 - SIM[2] / 255); }
+    const ih = inkH[i] + 0.11 * P.edge[i], cov = smooth(0.2, 0.6, ih), io = cov * (0.62 + 0.38 * smooth(0.45, 0.92, inkH[i])) * (1 - 0.18 * smooth(0.55, 0.85, P.voids[i]) * smooth(0.8, 1, inkH[i]));
+    if (io > 0) { r += (INK[0] - r) * io; g2 += (INK[1] - g2) * io; b += (INK[2] - b) * io; }
+    // relief
+    const wi = clamp(io * 1.6), hx = ((h[i + 1] - h[i - 1]) * wi + (hp[i + 1] - hp[i - 1]) * (1 - wi)) / 2, hy = ((h[i + W] - h[i - W]) * wi + (hp[i + W] - hp[i - W]) * (1 - wi)) / 2, nz = 1 / Math.sqrt(hx * hx + hy * hy + 1), nx = -hx * nz, ny = -hy * nz;
+    const ndl = nx * Lx + ny * Ly + nz * Lz; let shade = 0.42 + 0.58 * Math.max(0, ndl) / Lz;
+    let occ = 0; for (let s = 1; s <= 7; s++) { const u = Math.round(x + sdx * s), v = Math.round(y + sdy * s); if (u < 0 || v < 0 || u >= W || v >= H) break; occ = Math.max(occ, h[v * W + u] - h[i] - s * tanEl); }
+    shade *= 1 - 0.3 * smooth(0, 0.4, occ);
+    const fall = 1.08 - 0.17 * Math.pow(x / W * 0.5 + y / H * 0.5, 1.3);
+    const spec = 0.34 * io * Math.max(0, Math.pow(Math.max(0, nx * Hx + ny * Hy + nz * Hz), 14) - flatSpec);
+    const o = i * 4;
+    d[o] = r * shade * fall * LAMP[0] + 255 * spec * LAMP[0]; d[o + 1] = g2 * shade * fall * LAMP[1] + 255 * spec * LAMP[1]; d[o + 2] = b * shade * fall * LAMP[2] + 255 * spec * LAMP[2]; d[o + 3] = 255;
+    // the sheet's cut edge and the table under it: walnut, its figure running with the grain,
+    // with the note's soft shadow thrown away from the lamp along the right and bottom edges
+    const du = x - mi[4], dv = y - mi[5], u = mi[0] * du + mi[1] * dv, v = mi[2] * du + mi[3] * dv;
+    const din = Math.min(EDGE[0] - u, EDGE[1] - v), cover = clamp(din + 0.5 + 0.45 * P.edge[i]);
+    if (din < 3) { const k = 0.8 + 0.2 * smooth(0, 2.4, din); d[o] *= k; d[o + 1] *= k; d[o + 2] *= k; }
+    if (cover < 1) {
+      const eo = Math.hypot(Math.max(0, u - EDGE[0]), Math.max(0, v - EDGE[1])), ac = -x * 0.14 + y * 0.99;
+      const grain = 0.8 + 0.1 * Math.sin(ac * 0.42 + 3.2 * P.woodA[i]) + 0.05 * Math.sin(ac * 1.9 + 1.4 * P.woodA[i] + 1) - 0.07 * smooth(0.5, 0.9, P.woodB[i]);
+      const tf = grain * fall * (1 - 0.6 * (1 - smooth(1, 30, eo)));
+      d[o] = d[o] * cover + 76 * tf * (1 - cover); d[o + 1] = d[o + 1] * cover + 52 * tf * (1 - cover); d[o + 2] = d[o + 2] * cover + 37 * tf * (1 - cover);
+    }
+  }
+  for (let x = 0; x < W; x++) for (const y of [0, H - 1]) { const o = (y * W + x) * 4, q = ((y ? H - 2 : 1) * W + x) * 4; d[o] = d[q]; d[o + 1] = d[q + 1]; d[o + 2] = d[q + 2]; d[o + 3] = 255; }
+  for (let y = 0; y < H; y++) for (const x of [0, W - 1]) { const o = (y * W + x) * 4, q = (y * W + (x ? W - 2 : 1)) * 4; d[o] = d[q]; d[o + 1] = d[q + 1]; d[o + 2] = d[q + 2]; d[o + 3] = 255; }
+  out.putImageData(img, 0, 0);
+}
+
+buildPaper();
+window.__riso = { duration: DURATION, hero: HERO, ready: true, build: { end: BUILD_END }, seek(t) { compose(clamp(t, 0, DURATION)); } };
+// draw the hero for a person opening the file; the render harness seeks for itself
+if (!navigator.webdriver) setTimeout(() => window.__riso.seek(HERO), 0);
+</script>

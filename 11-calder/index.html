@@ -1,0 +1,712 @@
+<!doctype html><meta charset="utf-8"><title>11 calder · a little faith in impossible things</title>
+<style>html,body{margin:0;height:100%;background:#d9d5cd;display:grid;place-items:center}canvas{height:96vh;width:auto;max-width:96vw}</style>
+<canvas id="c" width="1080" height="1350"></canvas>
+<script>
+/* A Calder mobile under one gallery spotlight, made of one phrase: "a little faith in impossible
+   things". Six enamelled sheet-steel paddles, one per word, each cut to an area proportional to
+   its word's letter count. Each word is bent as one continuous line of matte black wire, of the
+   rods' own gauge, read line by line down the mobile: a little / faith in / impossible things.
+   Each arm hangs 150 px or more to one side of the arm above, so the spine zigzags, and every
+   pivot sits exactly over the centre of mass of everything it carries (steel, lettering wire and
+   rod all weighed): one length per arm is computed, never placed. seek(t) builds it from the
+   top down: the hanging wire is let down onto the bare wall, each arm is bent out from its eye,
+   its words bent along it and its paddles hooked on, and the next arm is let down on its link.
+   Each load tips the mobile and it swings back, damped. The tiny red "a" goes on last, at the
+   end of the longest bare rod, and levels the top arm. */
+'use strict';
+const PHRASE_TO_RENDER = 'a little faith in impossible things';
+const W = 1080, H = 1350, DUR = 6, BUILD_END = 4.6, HERO = 5.2;
+const cv = document.getElementById('c'), cx = cv.getContext('2d');
+
+// ---------- seeded randomness (no Math.random anywhere) ----------
+function hstr(s) { let h = 2166136261 >>> 0; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+function rng(key) { let a = hstr(key); return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+function hash2(x, y, s) { let h = Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul(s | 0, 1442695041); h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; }
+const smooth = t => t * t * (3 - 2 * t);
+function vnoise(x, y, s) {
+  const xi = Math.floor(x), yi = Math.floor(y), u = smooth(x - xi), v = smooth(y - yi);
+  const a = hash2(xi, yi, s), b = hash2(xi + 1, yi, s), c = hash2(xi, yi + 1, s), d = hash2(xi + 1, yi + 1, s);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function fbm(x, y, s, oct) { let t = 0, amp = 0.5, f = 1, n = 0; for (let o = 0; o < oct; o++) { t += amp * vnoise(x * f, y * f, s + o * 31); n += amp; amp *= 0.5; f *= 2.03; } return t / n; }
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const DEG = Math.PI / 180;
+const v3 = (x, y, z) => ({ x, y, z });
+const dot3 = (a, b) => a.x * b.x + a.y * b.y + a.z * b.z;
+const norm3 = a => { const l = Math.hypot(a.x, a.y, a.z); return v3(a.x / l, a.y / l, a.z / l); };
+const cross3 = (a, b) => v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+
+// ---------- palette: a decision, five colours ----------
+
+// ---------- palette: a decision, five colours ----------
+// Wall white (warm gallery matte), Calder red (his orange-leaning vermilion), iron black (warm,
+// never #000), one chrome yellow, one cobalt blue. Red is spent big once, on "impossible".
+const PAL = {
+  wall: [238, 234, 226], red: [204, 52, 28], black: [37, 34, 32], yellow: [232, 176, 32],
+  blue: [30, 72, 148], white: [236, 232, 222], steel: [128, 124, 118], steelCut: [176, 171, 162],
+  wire: [40, 37, 35],
+};
+
+// ---------- the room: one long lens, one hard spotlight ----------
+// Screen axes: x right, y down, z out of the wall toward the lens (px). The wall is z = 0.
+const CAM = v3(560, 620, 3400);            // lens across the room; the wall is drawn at scale 1
+const SPOT = v3(-450, -1700, 6000);        // one spotlight, high and to the left in front: the shadow falls down and right
+const LAMP_R = 275;                         // radius of the lamp's lens: sets every penumbra
+const proj = q => { const f = CAM.z / (CAM.z - q.z); return [CAM.x + (q.x - CAM.x) * f, CAM.y + (q.y - CAM.y) * f, f]; };
+const onWall = q => { const t = SPOT.z / (SPOT.z - q.z); return [SPOT.x + (q.x - SPOT.x) * t, SPOT.y + (q.y - SPOT.y) * t, t]; };
+const penumbra = z => LAMP_R * Math.max(z, 0) / (SPOT.z - z);  // width of a shadow's soft edge
+const toSpot = q => norm3(v3(SPOT.x - q.x, SPOT.y - q.y, SPOT.z - q.z));
+
+// ---------- Catmull-Rom sampling ----------
+function crPoint(p0, p1, p2, p3, t) {
+  const t2 = t * t, t3 = t2 * t;
+  return [0.5 * (2 * p1[0] + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3),
+          0.5 * (2 * p1[1] + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3)];
+}
+// Dense polyline through pts; step in the pts' own units.
+function spline(pts, step, closed) {
+  const n = pts.length, out = [];
+  const P = i => closed ? pts[(i + n) % n] : pts[clamp(i, 0, n - 1)];
+  const segs = closed ? n : n - 1;
+  for (let i = 0; i < segs; i++) {
+    const a = P(i), b = P(i + 1), len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    const k = Math.max(2, Math.ceil(len / step));
+    for (let j = 0; j < k; j++) out.push(crPoint(P(i - 1), a, b, P(i + 2), j / k));
+  }
+  if (!closed) out.push(pts[n - 1].slice()); else out.push(out[0].slice());
+  return out;
+}
+function polyLen(p) { let L = 0; for (let i = 1; i < p.length; i++) L += Math.hypot(p[i][0] - p[i - 1][0], p[i][1] - p[i - 1][1]); return L; }
+function polyArea(p) { let A = 0; for (let i = 0, j = p.length - 1; i < p.length; j = i++) A += (p[j][0] + p[i][0]) * (p[j][1] - p[i][1]); return Math.abs(A) / 2; }
+function polyCentroid(p) {
+  let A = 0, X = 0, Y = 0;
+  for (let i = 0, j = p.length - 1; i < p.length; j = i++) { const c = p[j][0] * p[i][1] - p[i][0] * p[j][1]; A += c; X += (p[j][0] + p[i][0]) * c; Y += (p[j][1] + p[i][1]) * c; }
+  return [X / (3 * A), Y / (3 * A)];
+}
+function inPoly(p, x, y) { let c = false; for (let i = 0, j = p.length - 1; i < p.length; j = i++) { if (((p[i][1] > y) !== (p[j][1] > y)) && (x < (p[j][0] - p[i][0]) * (y - p[i][1]) / (p[j][1] - p[i][1]) + p[i][0])) c = !c; } return c; }
+
+// ---------- wire lettering: each word is one continuous length of wire ----------
+// Bent the way Calder drew in wire: a joined hand of uneven height, and wherever the wire has to
+// turn back on itself it is bent round a small loop instead of folded flat. A t's crossbar is a
+// short second piece twisted on, one bar across a double t. Units: x-height 1, baseline 0, y up.
+// The word stands on its arm rod and is bound to it where it touches.
+// in: entry points dropped when a word starts with the glyph; inHi: dropped after a glyph that
+// leaves the wire high (o, b, p). bar: a t's crossbar [x0, x1, y]. dot: where the i's disc sits.
+const WG = {
+  a: { w: 1.1, in: 3, pts: [[0, 0.18], [0.18, 0.68], [0.44, 0.98], [0.7, 0.92], [0.5, 0.98], [0.26, 0.9], [0.09, 0.64], [0.06, 0.3], [0.2, 0.04], [0.42, 0.0], [0.6, 0.16], [0.7, 0.5], [0.73, 0.88], [0.77, 1.03], [0.83, 0.97], [0.8, 0.6], [0.8, 0.22], [0.86, 0.03], [0.98, 0.0], [1.1, 0.14]] },
+  l: { w: 0.6, in: 1, pts: [[0, 0.12], [0.2, 0.5], [0.36, 1.1], [0.44, 1.6], [0.38, 1.8], [0.27, 1.72], [0.25, 1.3], [0.28, 0.6], [0.32, 0.1], [0.44, 0.0], [0.6, 0.12]] },
+  i: { w: 0.58, in: 1, dot: [0.29, 1.42], pts: [[0, 0.12], [0.16, 0.56], [0.24, 0.96], [0.3, 1.04], [0.34, 0.96], [0.3, 0.7], [0.28, 0.3], [0.32, 0.06], [0.44, 0.0], [0.58, 0.12]] },
+  t: { w: 0.58, in: 1, bar: [0.0, 0.56, 0.98], pts: [[0, 0.12], [0.18, 0.56], [0.28, 1.1], [0.33, 1.46], [0.29, 1.54], [0.24, 1.44], [0.24, 1.0], [0.26, 0.5], [0.3, 0.08], [0.42, 0.0], [0.58, 0.12]] },
+  e: { w: 0.76, in: 1, pts: [[0, 0.12], [0.28, 0.32], [0.5, 0.56], [0.56, 0.82], [0.44, 0.98], [0.26, 0.9], [0.16, 0.6], [0.2, 0.2], [0.38, 0.0], [0.6, 0.04], [0.76, 0.2]] },
+  f: { w: 0.56, in: 1, pts: [[0, 0.12], [0.2, 0.62], [0.34, 1.2], [0.42, 1.62], [0.36, 1.82], [0.26, 1.74], [0.24, 1.3], [0.24, 0.6], [0.22, -0.1], [0.2, -0.6], [0.14, -0.84], [0.06, -0.78], [0.1, -0.5], [0.24, -0.16], [0.4, 0.08], [0.56, 0.26]] },
+  h: { w: 1.02, in: 1, pts: [[0, 0.12], [0.2, 0.6], [0.34, 1.2], [0.42, 1.62], [0.36, 1.82], [0.26, 1.74], [0.24, 1.3], [0.24, 0.6], [0.23, 0.02], [0.26, 0.3], [0.34, 0.74], [0.5, 0.98], [0.66, 0.92], [0.72, 0.6], [0.72, 0.2], [0.78, 0.03], [0.9, 0.0], [1.02, 0.14]] },
+  n: { w: 1.02, in: 1, pts: [[0, 0.12], [0.14, 0.6], [0.2, 0.96], [0.26, 1.02], [0.28, 0.9], [0.25, 0.4], [0.23, 0.02], [0.26, 0.3], [0.34, 0.72], [0.5, 0.98], [0.66, 0.92], [0.72, 0.6], [0.72, 0.2], [0.78, 0.03], [0.9, 0.0], [1.02, 0.14]] },
+  m: { w: 1.34, in: 1, pts: [[0, 0.12], [0.14, 0.6], [0.2, 0.96], [0.26, 1.02], [0.28, 0.9], [0.25, 0.4], [0.23, 0.02], [0.26, 0.3], [0.32, 0.7], [0.44, 0.96], [0.58, 0.94], [0.64, 0.6], [0.64, 0.02], [0.67, 0.3], [0.73, 0.7], [0.85, 0.96], [0.99, 0.94], [1.05, 0.6], [1.05, 0.2], [1.1, 0.03], [1.22, 0.0], [1.34, 0.14]] },
+  p: { w: 0.94, in: 1, hi: 1, pts: [[0, 0.12], [0.14, 0.6], [0.2, 0.96], [0.26, 1.04], [0.29, 0.92], [0.27, 0.3], [0.25, -0.4], [0.22, -0.82], [0.16, -0.9], [0.12, -0.8], [0.17, -0.5], [0.24, 0.0], [0.3, 0.12], [0.46, 0.0], [0.7, 0.06], [0.84, 0.4], [0.78, 0.82], [0.56, 1.0], [0.36, 0.92], [0.3, 0.72], [0.36, 0.82], [0.52, 1.05], [0.76, 1.04], [0.94, 0.96]] },
+  o: { w: 0.92, in: 2, hi: 1, pts: [[0, 0.14], [0.32, 0.66], [0.62, 0.94], [0.44, 1.02], [0.2, 0.9], [0.06, 0.56], [0.1, 0.18], [0.32, 0.0], [0.58, 0.06], [0.74, 0.36], [0.72, 0.74], [0.6, 0.96], [0.72, 1.04], [0.92, 0.98]] },
+  s: { w: 0.94, in: 1, inHi: 3, pts: [[0, 0.1], [0.1, 0.5], [0.22, 0.92], [0.3, 1.12], [0.42, 0.98], [0.62, 0.76], [0.7, 0.52], [0.62, 0.34], [0.46, 0.3], [0.36, 0.34], [0.33, 0.18], [0.42, 0.03], [0.62, 0.0], [0.8, 0.03], [0.94, 0.14]] },
+  b: { w: 0.9, in: 1, hi: 1, pts: [[0, 0.12], [0.2, 0.6], [0.34, 1.2], [0.42, 1.62], [0.36, 1.82], [0.26, 1.74], [0.24, 1.3], [0.24, 0.5], [0.26, 0.08], [0.42, 0.0], [0.62, 0.1], [0.72, 0.44], [0.66, 0.8], [0.48, 0.92], [0.34, 0.84], [0.4, 0.78], [0.56, 0.88], [0.76, 0.94], [0.9, 0.92]] },
+  g: { w: 1.1, in: 3, pts: [[0, 0.18], [0.18, 0.68], [0.44, 0.98], [0.7, 0.92], [0.5, 0.98], [0.26, 0.9], [0.09, 0.64], [0.06, 0.3], [0.2, 0.04], [0.42, 0.0], [0.6, 0.16], [0.7, 0.5], [0.73, 0.88], [0.77, 1.03], [0.83, 0.97], [0.8, 0.5], [0.78, -0.2], [0.72, -0.62], [0.56, -0.86], [0.38, -0.84], [0.34, -0.66], [0.5, -0.42], [0.74, -0.2], [0.96, 0.02], [1.1, 0.18]] },
+};
+function composeWord(word) {
+  const pts = [], dots = [], bars = []; let x = 0, prevHi = false;
+  [...word].forEach((ch, k) => {
+    const G = WG[ch], drop = k === 0 ? G.in : prevHi ? (G.inHi ?? G.in) : 0;
+    G.pts.slice(drop).forEach(([a, b]) => pts.push([x + a, b]));
+    if (G.dot) dots.push([x + G.dot[0], G.dot[1]]);
+    if (G.bar) { const last = bars[bars.length - 1], b0 = x + G.bar[0], b1 = x + G.bar[1];
+      if (last && b0 - last[1] < 0.2) last[1] = b1; else bars.push([b0, b1, G.bar[2]]); }
+    x += G.w - 0.02; prevHi = !!G.hi;
+  });
+  return { pts, dots, bars, width: x + 0.02 };
+}
+// Lay a word: one polyline in x-height units with the bender's unsteadiness in it.
+function layWord(word, key) {
+  const R = rng('wire:' + key), src = composeWord(word);
+  const pts = src.pts.map(([x, y]) => [x + (R() - 0.5) * 0.03, y + (Math.abs(y) > 0.04 ? (R() - 0.5) * 0.03 : 0)]);
+  const bars = src.bars.map(([b0, b1, by]) => [[b0 - 0.04, by - 0.04 + (R() - 0.5) * 0.04], [(b0 + b1) / 2, by + 0.02], [b1 + 0.04, by + 0.05 + (R() - 0.5) * 0.04]]);
+  const contacts = []; for (const [x, y] of pts) if (Math.abs(y) < 0.035 && !(contacts.length && x - contacts[contacts.length - 1] < 0.4)) contacts.push(x);   // one binding per run along the rod
+  return { pts, dots: src.dots, bars, contacts, width: src.width };
+}
+// ---------- paddles: sheet steel cut with tin snips, brushed with enamel ----------
+const K_AREA = 2000;         // px² of steel per letter: each word sets its paddle's area
+const RHO_PLATE = 3.0;       // steel per px² (a 3 px sheet)
+const SS = 2;                // paddle textures are baked at 2x
+// A shape is a closed run of points; a point tagged 'c' is a corner the snips turned sharply.
+function shapeSpline(shape) {
+  const ci = shape.map((q, i) => q[2] === 'c' ? i : -1).filter(i => i >= 0);
+  if (!ci.length) return spline(shape, 0.01, true);
+  const n = shape.length, out = [];
+  for (let k = 0; k < ci.length; k++) {
+    const a = ci[k], b = ci[(k + 1) % ci.length], run = [];
+    for (let i = a; ; i = (i + 1) % n) { run.push(shape[i]); if (i === b && run.length > 1) break; }
+    out.push(...spline(run, 0.01, false).slice(0, -1));
+  }
+  return out;
+}
+// The outline is one smooth curve, sampled every 1.5 px so no polygon edge can show. Tin snips
+// leave it a little uneven: each bite of the blades bows a fraction of a pixel, and the sheet's
+// edge wanders slowly. The attach point (shape[0]) grows the tab crimped round the rod.
+// Points (a outward from the rod end, b down), px.
+function cutOutline(shape, area, key, noTab) {
+  const R = rng('snip:' + key);
+  let sm = shapeSpline(shape);
+  const k0 = Math.sqrt(area / polyArea(sm)); sm = sm.map(([a, b]) => [a * k0, b * k0]);
+  const L = polyLen(sm), cum = [0];
+  for (let i = 1; i < sm.length; i++) cum.push(cum[i - 1] + Math.hypot(sm[i][0] - sm[i - 1][0], sm[i][1] - sm[i - 1][1]));
+  const at = d => { let i = 1; while (i < sm.length - 1 && cum[i] < d) i++; const f = (d - cum[i - 1]) / ((cum[i] - cum[i - 1]) || 1); return [lerp(sm[i - 1][0], sm[i][0], f), lerp(sm[i - 1][1], sm[i][1], f)]; };
+  const bites = []; for (let d = 0; d < L; d += 22 + R() * 26) bites.push(d);
+  bites.push(L);
+  const body = [], ph = R() * 6.28;
+  let bi = 0;
+  for (let d = 6; d < L - 6; d += 1.5) {
+    while (bites[bi + 1] < d) bi++;
+    const t = (d - bites[bi]) / (bites[bi + 1] - bites[bi]);
+    const p = at(d), q = at(Math.min(d + 1.5, L)), nx = -(q[1] - p[1]), ny = q[0] - p[0], nl = Math.hypot(nx, ny) || 1;
+    const off = 0.7 * Math.sin(d / 47 + ph) + 0.35 * Math.sin(d / 13 + ph * 2) * 0.5 + 0.45 * (4 * t * (1 - t) - 0.66);
+    body.push([p[0] + nx / nl * off, p[1] + ny / nl * off]);
+  }
+  const k2 = Math.sqrt(area / polyArea(body)), cut = body.map(([a, b]) => [a * k2, b * k2]);
+  const tab = [[2, 6], [-8, 5.8], [-14, 5.2], [-17.5, 3.4], [-18.5, 0], [-17.5, -3.4], [-14, -5.2], [-8, -5.8], [2, -6]];
+  return { body: cut, outline: noTab ? cut : [...(cut[0][1] < 0 ? tab : tab.slice().reverse()), ...cut] };
+}
+// Bake one paddle in local px (x along the arm, y down) at SS: albedo, coverage, an enamel
+// sheen mask that holds the brush marks, a cut-edge band, and which pixels are the crimped tab.
+function bakePaddle(P) {
+  const R = rng('paddle:' + P.key), cutr = cutOutline(P.shape, K_AREA * P.count, P.key, P.noTab);
+  const toL = ([a, b]) => [P.side * a, b];
+  const outl = cutr.outline.map(toL), body = cutr.body.map(toL);
+  P.outline = outl; P.area = polyArea(body); P.cen = polyCentroid(body);
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of outl) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+  let bx0 = 1e9, by0 = 1e9, bx1 = -1e9, by1 = -1e9;
+  for (const [x, y] of body) { bx0 = Math.min(bx0, x); by0 = Math.min(by0, y); bx1 = Math.max(bx1, x); by1 = Math.max(by1, y); }
+  P.ox = Math.floor(x0) - 3; P.oy = Math.floor(y0) - 3;
+  const cw = Math.ceil(x1 - P.ox + 4) * SS, ch = Math.ceil(y1 - P.oy + 4) * SS;
+  const c = document.createElement('canvas'); c.width = cw; c.height = ch;
+  const g = c.getContext('2d');
+  g.setTransform(SS, 0, 0, SS, -P.ox * SS, -P.oy * SS);
+  const path = () => { g.beginPath(); outl.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y)); g.closePath(); };
+  const base = PAL[P.col];
+  path(); g.fillStyle = `rgb(${base[0]},${base[1]},${base[2]})`; g.fill();
+  const id = g.getImageData(0, 0, cw, ch).data, N = cw * ch, sd = hstr(P.key);
+
+  const alb = new Float32Array(N * 3), cov = new Float32Array(N), sheen = new Float32Array(N), edge = new Float32Array(N), tab = new Uint8Array(N);
+  // the brush strokes: broad bands laid across the sheet, the last one on top; enamel levels
+  // inside a stroke and stands in a low ridge along its edges, so they show only in the sheen
+  const strokes = [];
+  for (let k = 0; k < 9; k++) {
+    const ang = P.brush + (R() - 0.5) * 0.6;
+    strokes.push({ dx: Math.cos(ang), dy: Math.sin(ang), cx: lerp(bx0, bx1, R()), cy: lerp(by0, by1, R()), w: 24 + R() * 22, len: 140 + R() * 220, ph: R() * 9 });
+  }
+  for (let j = 0; j < ch; j++) for (let i = 0; i < cw; i++) {
+    const k = j * cw + i, lx = P.ox + i / SS, ly = P.oy + j / SS;
+    cov[k] = id[k * 4 + 3] / 255; if (cov[k] <= 0) continue;
+    let ridge = 0, bristle = 0;
+    for (const st of strokes) {
+      const rx = lx - st.cx, ry = ly - st.cy, al = rx * st.dx + ry * st.dy, ac = Math.abs(-rx * st.dy + ry * st.dx);
+      if (ac < st.w / 2 && Math.abs(al) < st.len / 2) { ridge = Math.exp(-(((st.w / 2 - ac) / 2.4) ** 2)); bristle = Math.sin(ac * 1.6 + st.ph + 2 * vnoise(al * 0.02, ac * 0.3, sd)); }
+    }
+    const body2 = fbm(lx * 0.013, ly * 0.013, sd + 3, 3);
+    // brush streaks along the stroke direction; where the brush ran dry the colour thins
+    const ca = Math.cos(P.brush), sa = Math.sin(P.brush), al2 = lx * ca + ly * sa, ac2 = -lx * sa + ly * ca;
+    const load = fbm(ac2 * 0.022, al2 * 0.005, sd + 11, 3), streak = vnoise(ac2 * 0.42, al2 * 0.012, sd + 5) * 0.65 + vnoise(ac2 * 1.1, al2 * 0.03, sd + 7) * 0.35;
+    const thin = smooth(clamp((0.46 - load) / 0.16, 0, 1));
+    const sk = P.streak || 1, tone = 1 + (body2 - 0.5) * 0.05 + ((streak - 0.5) * (0.05 + 0.07 * thin) - thin * 0.05) * sk + bristle * 0.008 * sk;
+    const a = P.side * lx;                           // distance out from the rod end
+    let tf = 1;
+    if (a < 1.5 && Math.abs(ly) < 6.5 && !P.noTab) { // the tab, folded round the rod and crimped
+      tab[k] = 1; tf = 0.78 - 0.18 * (Math.abs(ly) / 6.5) ** 2;
+      for (const ac of [-5.5, -10, -14.5]) if (Math.abs(a - ac) < 0.9) tf *= 0.55;
+    }
+    alb[k * 3] = id[k * 4] * tone * tf; alb[k * 3 + 1] = id[k * 4 + 1] * tone * tf; alb[k * 3 + 2] = id[k * 4 + 2] * tone * tf;   // enamel right to the cut
+    sheen[k] = 0.45 + ridge * 0.55 + bristle * 0.06 + (body2 - 0.5) * 0.3 + (tab[k] ? 0.3 * Math.exp(-((ly / 2.2) ** 2)) : 0);
+  }
+  for (let j = 0; j < ch; j++) for (let i = 0; i < cw; i++) {
+    const k = j * cw + i; if (cov[k] <= 0) continue;
+    let m = 1; for (let dj = -2; dj <= 2; dj += 2) for (let di = -2; di <= 2; di += 2) m = Math.min(m, cov[clamp(j + dj, 0, ch - 1) * cw + clamp(i + di, 0, cw - 1)]);
+    edge[k] = 1 - m;
+  }
+  P.tex = { cw, ch, alb, cov, sheen, edge, tab, ph1: R() * 6.28, ph2: R() * 6.28 };
+}
+
+// ---------- the mobile: one paddle per word, real balance ----------
+// side: which way a paddle's shape is mirrored (-1 outward to the left, +1 to the right).
+// psi/phi: how it is twisted where it is crimped on (yaw, roll). Shapes are (a outward, b down).
+const PADDLES = {
+  a:          { key: 'a', count: 1, col: 'red', side: 1, psi: 12 * DEG, phi: 0, brush: -0.6, noTab: true,   // on its own wire, through a hole: a runs down it
+                shape: [[0, 0, 'c'], [0.2, -0.3], [0.55, -0.42], [0.88, -0.25], [0.98, 0.08], [0.78, 0.36], [0.42, 0.42], [0.12, 0.25]] },
+  little:     { key: 'little', count: 6, col: 'black', side: 1, psi: 106 * DEG, phi: 6 * DEG, brush: -0.8,     // turned toward edge-on
+                shape: [[0, 0, 'c'], [0.16, -0.26], [0.42, -0.5], [0.76, -0.62], [1.04, -0.6, 'c'], [0.9, -0.3], [0.66, -0.06], [0.36, 0.08], [0.12, 0.08]] },
+  faith:      { key: 'faith', count: 5, col: 'yellow', side: 1, psi: -20 * DEG, phi: 10 * DEG, brush: 1.4,
+                shape: [[0, 0, 'c'], [0.25, 0.08], [0.5, 0.3], [0.58, 0.6], [0.42, 0.88], [0.12, 1.05, 'c'], [0.0, 0.75], [-0.08, 0.4]] },
+  in:         { key: 'in', count: 2, col: 'black', side: 1, psi: 24 * DEG, phi: 11 * DEG, brush: 1.0,
+                shape: [[0, 0], [-0.127, -0.249], [-0.083, -0.525], [0.115, -0.723], [0.391, -0.767], [0.64, -0.64], [0.767, -0.391], [0.723, -0.115], [0.525, 0.083], [0.249, 0.127]] },   // sits up on the rod, right of its crimp
+  impossible: { key: 'impossible', count: 10, col: 'red', side: -1, psi: -18 * DEG, phi: 12 * DEG, brush: 1.2, streak: 1.9,
+                shape: [[0, 0, 'c'], [0.02, 0.3], [0.16, 0.62], [0.42, 0.92, 'c'], [0.74, 0.76], [0.95, 0.44], [0.88, 0.08], [0.46, -0.06]] },
+  things:     { key: 'things', count: 6, col: 'blue', side: 1, psi: -30 * DEG, phi: 9 * DEG, brush: 0.4,
+                shape: [[0, 0], [0.2, -0.1], [0.55, -0.05], [0.85, 0.15], [0.98, 0.48], [0.85, 0.8], [0.52, 0.95], [0.2, 0.82], [0.04, 0.5], [-0.02, 0.2]] },
+};
+// Arms top to bottom, one line of the phrase each. An end carries its words outward from the
+// pivot in reading order, then its paddle: crimped on past the words (gap), or under them (inner,
+// that far from the pivot). It may bend an eye under the rod for the arm hung below (subAt), and
+// a bare end may end in a hook for a pendant on its own wire (tip). solve: the one length on each
+// arm that is computed so the arm balances.
+const LINES = [0, 2, 4].map(i => PHRASE_TO_RENDER.split(' ').slice(i, i + 2));   // a little / faith in / impossible things
+const ARMS = [
+  { id: 'A', rodW: 5.5, bow: 0.0001, tilt: -0.08, theta: -26 * DEG, amp: 2.5 * DEG, per: 23, solve: ['L', 'tip'],
+    L: { sub: 'C', subAt: 145, link: 410, tip: { p: LINES[0][0], u: 290, drop: 40 } },
+    R: { words: [{ w: LINES[0][0], xh: 36 }, { w: LINES[0][1], xh: 32 }], cl: 30, p: LINES[0][1], gap: 64, sub: 'B', subAt: 180, link: 110 } },
+  { id: 'B', rodW: 5, bow: 0.0003, tilt: 0.12, theta: -35 * DEG, amp: 4 * DEG, per: 17, solve: ['L', 'inner'],
+    L: { words: [{ w: LINES[1][0], xh: 32 }], cl: 30, p: LINES[1][0], inner: 20 },
+    R: { words: [{ w: LINES[1][1], xh: 32 }], cl: 30, p: LINES[1][1], gap: 40 } },
+  { id: 'C', rodW: 5, bow: 0.0002, tilt: -0.07, theta: -12 * DEG, amp: 5 * DEG, per: 13, solve: ['R', 'gap'],
+    L: { words: [{ w: LINES[2][0], xh: 28 }], cl: 30, p: LINES[2][0], inner: 50 },
+    R: { words: [{ w: LINES[2][1], xh: 30 }], cl: 30, p: LINES[2][1], gap: 40 } },
+];
+const TOP = { x: 642, y: 440, z: 430 };    // A's pivot: its wire comes down just right of the caption
+const rhoWire = w => Math.PI / 4 * w * w;    // steel per px of wire of width w
+const WORD_W = 5, SUSP_W = 5, PEND_W = 4, EYE_R = 7, LOOP_R = 6, J_U = 7, J_V = 11, J_LEN = 34;   // lettering bent from the rods' own gauge
+const armById = Object.fromEntries(ARMS.map(a => [a.id, a]));
+const SIDES = [['L', -1], ['R', 1]];
+const vArm = (A, u) => A.bow * u * u + A.tilt * u;
+const dvArm = (A, u) => vArm(A, u + 0.5) - vArm(A, u - 0.5);
+const H0 = A => A.rodW * 0.4 + 2 * EYE_R;            // the hang point sits this far above the rod
+const linkMass = S => rhoWire(SUSP_W) * (S.up.e.link + 30);
+
+// Lay an end out along the rod: its words in reading order, its paddle, eye and hook.
+function layEnd(A, e, s) {
+  e.ws = (e.words || []).map((w, i) => ({ ...w, lay: e.lays[i], ww: e.lays[i].width * w.xh }));
+  const tot = e.ws.reduce((a, w, i) => a + w.ww + (i ? 0.75 * w.xh : 0), 0), far = e.ws.length ? (e.cl || 0) + tot : 0;
+  let u = s > 0 ? e.cl : -far;
+  e.ws.forEach((w, i) => { if (i) u += 0.75 * w.xh; w.uws = u; u += w.ww; });
+  e.uat = e.p ? s * (e.inner != null ? e.inner : far + e.gap) : null;
+  e.ueye = e.sub ? s * e.subAt : null;
+  e.utip = e.tip ? s * e.tip.u : null;
+  e.uend = s * Math.max(far ? far + 8 : 0, e.p && e.inner == null ? far + e.gap + 2 : 0, e.sub ? e.subAt + 10 : 0, e.tip ? e.tip.u : 0);
+}
+// A word's wire as it is bent: the curled run and the t bars, in x-height units, cut once.
+function prepWord(lay) {
+  lay.path = curl(curl(spline(lay.pts, 0.035, false), 0.07, true), 0.07, false);
+  lay.barPaths = lay.bars.map(b => ({ p: curl(curl(spline(b, 0.03, false), 0.05, true), 0.05, false), bx: Math.max(b[0][0], b[2][0]) }));
+  const cum = [0]; for (let i = 1; i < lay.path.length; i++) cum.push(cum[i - 1] + Math.hypot(lay.path[i][0] - lay.path[i - 1][0], lay.path[i][1] - lay.path[i - 1][1]));
+  lay.cum = cum.map(c => c / cum[cum.length - 1]);
+  // how far along the wire the bender is when he passes x (for the bars and dots)
+  lay.fracAt = x => { for (let i = 0; i < lay.path.length; i++) if (lay.path[i][0] >= x) return lay.cum[i]; return 1; };
+}
+const onRodUV = (A, w, x, y) => { const ub = w.uws + x * w.xh, al = Math.atan(dvArm(A, ub)); return [ub + y * w.xh * Math.sin(al), vArm(A, ub) - y * w.xh * Math.cos(al)]; };
+
+// Everything an arm carries, as weighed parts in its own frame: u along the rod from the pivot,
+// v down from the hang point. st says which stage of the build puts the part on (SCHED).
+function parts(A) {
+  const out = [], h = H0(A), add = (m, u, v, st) => out.push({ m, u, v: v + h, st }), rho = rhoWire(A.rodW), rw = rhoWire(WORD_W);
+  for (const [k, s] of SIDES) {
+    const e = A[k], E = Math.abs(e.uend);
+    for (let a = 0; a < E - 1e-6; a += 8) { const b = Math.min(E, a + 8), u = s * (a + b) / 2; add(rho * (b - a) * Math.hypot(1, dvArm(A, u)), u, vArm(A, u), { k: 'rod', a: a / E, b: b / E }); }
+    if (e.tip) add(rho * J_LEN, e.utip + s * J_U * 0.6, vArm(A, e.utip) + J_V * 0.6, { k: 'rod', a: 0.995, b: 1 });   // the hook bent on the tip
+    for (const w of e.ws) {
+      const L = w.lay, n = 12, acc = Array.from({ length: n }, () => [0, 0, 0]);
+      for (let i = 1; i < L.path.length; i++) {
+        const [u0, v0] = onRodUV(A, w, ...L.path[i - 1]), [u1, v1] = onRodUV(A, w, ...L.path[i]), m = Math.hypot(u1 - u0, v1 - v0) * rw, c = acc[Math.min(n - 1, Math.floor(L.cum[i - 1] * n))];
+        c[0] += m; c[1] += m * (u0 + u1) / 2; c[2] += m * (v0 + v1) / 2;
+      }
+      acc.forEach(([m, mu, mv], j) => { if (m > 0) add(m, mu / m, mv / m, { k: 'word', w: w.w, a: j / n, b: (j + 1) / n }); });
+      for (const B of L.barPaths) {
+        let m = 0, mu = 0, mv = 0;
+        for (let i = 1; i < B.p.length; i++) { const [u0, v0] = onRodUV(A, w, ...B.p[i - 1]), [u1, v1] = onRodUV(A, w, ...B.p[i]), dm = Math.hypot(u1 - u0, v1 - v0) * rw * 0.85 ** 2; m += dm; mu += dm * (u0 + u1) / 2; mv += dm * (v0 + v1) / 2; }
+        const f = L.fracAt(B.bx); add(m, mu / m, mv / m, { k: 'word', w: w.w, a: f, b: Math.min(1, f + 0.04) });
+      }
+      for (const [x, y] of L.dots) { const [u, v] = onRodUV(A, w, x, y), f = L.fracAt(x); add(Math.PI * (0.15 * w.xh) ** 2 * RHO_PLATE, u, v, { k: 'word', w: w.w, a: f, b: Math.min(1, f + 0.03) }); }
+    }
+    if (e.p) {
+      const P = PADDLES[e.p];
+      add(P.area * RHO_PLATE, e.uat + P.cen[0] * Math.cos(P.psi) - P.cen[1] * Math.sin(P.phi) * Math.sin(P.psi), vArm(A, e.uat) + P.cen[1] * Math.cos(P.phi), { k: 'pad', p: e.p });
+    }
+    if (e.sub) add(0, e.ueye, vArm(A, e.ueye) + A.rodW * 0.4 + 2 * LOOP_R, { k: 'sub', S: armById[e.sub] });
+    if (e.tip) add(PADDLES[e.tip.p].area * RHO_PLATE + rhoWire(PEND_W) * (e.tip.drop + 16), e.utip + s * J_U, vArm(A, e.utip) + J_V, { k: 'tip' });
+  }
+  return out;
+}
+// Solve every arm from the bottom up: an arm hangs as drawn only if its eye sits exactly over
+// the centre of mass of all it carries (steel, lettering, rod, and the arms hung from it, each
+// weighing on its own eye). One length per arm is free, and it is found by bisection.
+function armMoment(A) {
+  for (const [k, s] of SIDES) layEnd(A, A[k], s);
+  A.parts = parts(A);
+  let m = 0, M = 0, V = 0;
+  for (const q of A.parts) { const mm = q.st.k === 'sub' ? q.st.S.mass + linkMass(q.st.S) : q.m; m += mm; M += mm * q.u; V += mm * q.v; }
+  return { m, M, V };
+}
+function solve() {
+  for (const P of Object.values(PADDLES)) bakePaddle(P);
+  for (const A of ARMS) for (const [k, s] of SIDES) {
+    const e = A[k]; e.lays = (e.words || []).map(w => { const L = layWord(w.w, A.id + w.w); prepWord(L); return L; });
+    if (e.sub) armById[e.sub].up = { A, e, s };
+  }
+  for (const A of [...ARMS].reverse()) {
+    const [k, f] = A.solve, e = A[k], set = x => { if (f === 'tip') e.tip.u = x; else e[f] = x; };
+    const net = x => { set(x); return armMoment(A).M; };
+    let lo = f === 'tip' ? e.subAt + 40 : f === 'inner' ? -150 : 2, hi = f === 'inner' ? 300 : 700; const sLo = Math.sign(net(lo));
+    A.solvable = sLo !== Math.sign(net(hi));
+    for (let i = 0; i < 60; i++) { const mid = (lo + hi) / 2; if (Math.sign(net(mid)) === sLo) lo = mid; else hi = mid; }
+    A.solved = (lo + hi) / 2; set(A.solved);
+    const r = armMoment(A); A.mass = r.m; A.check = r.M; A.stiff = Math.max(r.V, 1);   // the finished arm's pull back to level, per radian
+  }
+}
+
+// ---------- the build: hung from the top down, against gravity ----------
+// The wire is let down from the ceiling first, right of the caption. Then each arm is bent out
+// from its eye, its words are bent along it in reading order and its paddles are hooked on; the
+// next arm is let down on its link from an eye under the arm above. Every new load tips the
+// mobile and it swings back, damped. Until the last piece the top arm hangs off level, its left
+// end light: the tiny red "a" goes on last, on the longest bare rod, and levels it.
+const ease = x => { x = clamp(x, 0, 1); return x * x * x * (x * (6 * x - 15) + 10); };
+const rise = (t, a, b) => ease((t - a) / (b - a));
+const SPR_T = 0.3, SPR_W = 2 * Math.PI / 1.0;
+const springIn = s => s <= 0 ? 0 : 1 - Math.exp(-s / SPR_T) * (Math.cos(s * SPR_W) + Math.sin(s * SPR_W) / (SPR_W * SPR_T));   // 0 to 1 from rest, one damped overshoot
+const kick = (t, at, amp, per) => t > at ? amp * Math.exp(-(t - at) / 0.8) * Math.sin(2 * Math.PI * (t - at) / per) : 0;
+const SCHED = {
+  A: { link: [0.45, 0.9], rod: [0.88, 1.26], words: { a: [0.98, 1.12], little: [1.1, 1.44] }, pads: { little: 1.46 }, tip: { at: 3.92, hook: 4.3 },
+       hand: [14, 'C'], kicks: [[1.46, 2.2], [1.74, -1.4], [2.52, 1.6], [4.3, -1.2]] },
+  B: { link: [1.5, 1.74], rod: [1.72, 1.98], words: { faith: [1.8, 2.08], in: [2.04, 2.16] }, pads: { faith: 2.14, in: 2.26 },
+       hand: [3, 'B'], kicks: [[2.14, 3], [2.26, -2.4]] },
+  C: { link: [2.2, 2.52], rod: [2.5, 2.78], words: { impossible: [2.58, 2.92], things: [2.88, 3.04] }, pads: { impossible: 2.96, things: 3.08 },
+       hand: [12, 'C'], kicks: [[2.96, 3], [3.08, -2.4]] },
+};
+function presence(A, st, t) {        // how much of a part is on the mobile at time t
+  const S = SCHED[A.id];
+  if (st.k === 'rod') return clamp((rise(t, ...S.rod) - st.a) / (st.b - st.a), 0, 1);
+  if (st.k === 'word') return clamp((rise(t, ...S.words[st.w]) - st.a) / (st.b - st.a), 0, 1);
+  if (st.k === 'pad') return rise(t, S.pads[st.p], S.pads[st.p] + 0.12);
+  if (st.k === 'tip') return rise(t, S.tip.hook, S.tip.hook + 0.1);
+  return 0;
+}
+function massAt(S, t) {               // what an arm and its link weigh at t, as far as they are built
+  let m = linkMass(S) * rise(t, ...SCHED[S.id].link);
+  for (const q of S.parts) m += q.st.k === 'sub' ? massAt(q.st.S, t) : q.m * presence(S, q.st, t);
+  return m;
+}
+// Where an arm comes to rest at t: turned until the centre of mass of all it carries hangs under
+// its hang point, tan(roll) = sum(m u) / sum(m v), counting only the parts on at t. While an arm
+// is being loaded a hand steadies it: a restoring moment of `hand[0]` times the finished arm's
+// stiffness, easing off as the arm named in `hand[1]` is built (the top arm is let go as its last
+// arm goes on). Once let go the tilt is the plain physics, so the top arm, still without its
+// "a", hangs right side down.
+const ROLL_W = 2 * Math.PI / 0.85, ROLL_Z = 0.68;
+function rollEq(A, t) {
+  let Mu = 0, Mv = 0;
+  for (const q of A.parts) { const m = q.st.k === 'sub' ? massAt(q.st.S, t) : q.m * presence(A, q.st, t); Mu += m * q.u; Mv += m * q.v; }
+  if (!Mu) return 0;
+  const [f, id] = SCHED[A.id].hand, X = armById[id], built = massAt(X, t) / (X.mass + linkMass(X));
+  return Math.atan2(Mu, Mv + f * A.stiff * (1 - built));
+}
+function rollAt(A, t) {               // a damped swing toward rest, integrated from the bare wall
+  let r = 0, w = 0; const dt = 1 / 240, n = Math.ceil(t / dt);
+  for (let i = 0; i < n; i++) { w += (-ROLL_W * ROLL_W * (r - rollEq(A, i * dt)) - 2 * ROLL_Z * ROLL_W * w) * dt; r += w * dt; }
+  return r;
+}
+// Pose at t: each arm turns about its wire and tips in its own plane about its hang point;
+// the arms below hang from their links, and the pendant from its hook, plumb.
+let poseT = 0;
+function pose(t) {
+  poseT = t;
+  ARMS.forEach((A, ai) => {
+    const S = SCHED[A.id], h = H0(A);
+    A.roll = rollAt(A, t);
+    A.th = A.theta + A.amp * Math.sin(2 * Math.PI * (t - HERO) / A.per) + S.kicks.reduce((a, [at, amp]) => a + kick(t, at, amp * DEG, 1.6), 0);
+    if (ai === 0) { A.piv = v3(TOP.x, TOP.y, TOP.z); A.hang = v3(TOP.x, TOP.y - h, TOP.z); A.linkTop = v3(TOP.x, -80, TOP.z); }
+    const p0 = A.piv, cr = Math.cos(A.roll), sr = Math.sin(A.roll);
+    A.ct = Math.cos(A.th); A.st = Math.sin(A.th);
+    A.W = (u, v) => { const vh = v + h, uu = u * cr - vh * sr, vv = u * sr + vh * cr - h; return v3(p0.x + uu * A.ct, p0.y + vv, p0.z + uu * A.st); };
+    for (const [k, s] of SIDES) {
+      const e = A[k];
+      if (e.sub) {
+        const S2 = armById[e.sub], top = A.W(e.ueye, vArm(A, e.ueye) + A.rodW * 0.4 + 2 * LOOP_R);
+        S2.linkTop = top; S2.hang = v3(top.x, top.y + e.link, top.z); S2.piv = v3(top.x, top.y + e.link + H0(S2), top.z);
+      }
+      if (e.tip) e.hp = A.W(e.utip + s * J_U, vArm(A, e.utip) + J_V);
+    }
+  });
+}
+// The first fraction f of a polyline, by length.
+function cutPoly(p, f) {
+  if (f >= 1) return p; if (f <= 0 || p.length < 2) return [];
+  let L = 0; const seg = []; for (let i = 1; i < p.length; i++) { const l = Math.hypot(p[i][0] - p[i - 1][0], p[i][1] - p[i - 1][1]); seg.push(l); L += l; }
+  let want = f * L; const out = [p[0]];
+  for (let i = 1; i < p.length; i++) { if (want <= seg[i - 1]) { const k = seg[i - 1] ? want / seg[i - 1] : 0; out.push([lerp(p[i - 1][0], p[i][0], k), lerp(p[i - 1][1], p[i][1], k)]); break; } out.push(p[i]); want -= seg[i - 1]; }
+  return out;
+}
+
+// ---------- geometry at a pose: every wire as world points, every paddle as a frame ----------
+// A curled end: the bender closes each free end into a small eye.
+function curl(pts, r, atStart) {
+  const q = atStart ? pts.slice().reverse() : pts.slice(), n = q.length;
+  if (n < 3) return pts;
+  const a = q[n - 1], b = q[n - 3], tx = a[0] - b[0], ty = a[1] - b[1], tl = Math.hypot(tx, ty) || 1;
+  const ux = tx / tl, uy = ty / tl, c0x = a[0] - uy * r, c0y = a[1] + ux * r, a0 = Math.atan2(a[1] - c0y, a[0] - c0x);
+  for (let k = 1; k <= 14; k++) { const ang = a0 + k / 14 * Math.PI * 1.75, rr = r * (1 - k / 14 * 0.25); q.push([c0x + Math.cos(ang) * rr, c0y + Math.sin(ang) * rr]); }
+  return atStart ? q.reverse() : q;
+}
+const rotAxis = (v, k, a) => { const c = Math.cos(a), sn = Math.sin(a), kv = dot3(k, v), kx = cross3(k, v); return v3(v.x * c + kx.x * sn + k.x * kv * (1 - c), v.y * c + kx.y * sn + k.y * kv * (1 - c), v.z * c + kx.z * sn + k.z * kv * (1 - c)); };
+const ring = (W3, cu, cv0, rx, ry, n = 24, a0 = Math.PI / 2) => { const o = []; for (let k = 0; k <= n; k++) { const a = a0 + k / n * Math.PI * 2; o.push(W3(cu + Math.cos(a) * rx, cv0 + Math.sin(a) * ry)); } return o; };
+const add3 = (p, d, k) => v3(p.x + d.x * k, p.y + d.y * k, p.z + d.z * k);
+function plateFrame(A, P, ang, roll) {   // a paddle's sheet: e1 outward, e2 down, tipped with its arm
+  let e1 = v3(Math.cos(ang), 0, Math.sin(ang)), e2 = v3(-e1.z * Math.sin(P.phi), Math.cos(P.phi), e1.x * Math.sin(P.phi));
+  if (roll) { const ax = v3(-A.st, 0, A.ct); e1 = rotAxis(e1, ax, roll); e2 = rotAxis(e2, ax, roll); }
+  return { e1, e2, n: cross3(e1, e2) };
+}
+function buildScene() {
+  const t = poseT, groups = [];
+  ARMS.forEach((A, ai) => {
+    const W3 = A.W, S = SCHED[A.id], G = { arm: A, wires: [], plates: [], discs: [] }, wire = (pts, w, role) => G.wires.push({ pts, w, role, arm: A });
+    groups.push(G);
+    const lf = rise(t, ...S.link); if (lf <= 0) return;
+    const g = rise(t, ...S.rod), ey = vArm(A, 0) - A.rodW * 0.4 - EYE_R;
+    // the wire it hangs from, let down from above: from the ceiling, or from the eye under the arm above
+    const top = A.linkTop, yB = lerp(top.y, A.hang.y, lf), lk = [];
+    for (let y = top.y; y < yB - 1; y += 6) lk.push(v3(top.x, y, top.z));
+    lk.push(v3(top.x, yB, top.z));
+    if (g > 0) lk.push(W3(0, ey + 2), W3(4, ey + 6), W3(8, ey + 1), W3(7, ey - 5));   // threaded through the eye, twisted off
+    wire(lk, ai ? SUSP_W * 0.9 : SUSP_W, ai ? 'link' : 'susp');
+    if (A.up) { const lp = []; for (let j = 0; j <= 16; j++) { const a = Math.PI / 2 + j / 16 * Math.PI * 2; lp.push(v3(top.x + Math.cos(a) * 4, top.y + 1 + Math.sin(a) * 5, top.z)); } wire(lp, SUSP_W * 0.8, 'link'); }
+    if (g <= 0) return;
+    const uL = A.L.uend * g, uR = A.R.uend * g, rod = [];   // bent out from the eye both ways
+    for (let u = uL; u < uR; u += 3) rod.push(W3(u, vArm(A, u)));
+    rod.push(W3(uR, vArm(A, uR)));
+    for (const [k, s] of SIDES) {                     // a bare end bent down into a hook
+      const e = A[k]; if (!e.tip || g < 0.999) continue;
+      const uh = e.utip, vh = vArm(A, uh);
+      const J = curl(spline([[uh, vh], [uh + s * 2, vh + 6], [uh + s * J_U, vh + J_V], [uh + s * 12, vh + 6], [uh + s * 13, vh - 4]], 1.5, false), 3, false).map(([u, v]) => W3(u, v));
+      if (s < 0) rod.unshift(...J.reverse()); else rod.push(...J);
+    }
+    wire(rod, A.rodW, 'rod');
+    wire(ring(W3, 0, ey, EYE_R * 0.9, EYE_R), A.rodW * 0.72, 'eye');   // the pivot eye, twisted into the rod
+    for (const sx of [-1, 1]) for (let k = 0; k < 3; k++) { const u0 = sx * (EYE_R * 0.6 + k * 3.4); wire([W3(u0 - 2, vArm(A, u0) - A.rodW * 0.62), W3(u0 + 2, vArm(A, u0) + A.rodW * 0.62)], 3, 'wrap'); }
+    for (const [k, s] of SIDES) {
+      const e = A[k], front = Math.abs(s < 0 ? uL : uR);
+      for (const w of e.ws) {                         // each word bent along the rod from its first letter
+        const f = rise(t, ...S.words[w.w]); if (f <= 0) continue;
+        const L = w.lay, onRod = ([x, y]) => { const [u, v] = onRodUV(A, w, x, y); return W3(u, v); };
+        const p2 = cutPoly(L.path, f);
+        let xf = -1e9; for (const [x] of p2) xf = Math.max(xf, x); if (f >= 1) xf = 1e9;
+        if (p2.length > 1) wire(p2.map(onRod), WORD_W, 'word');
+        for (const B of L.barPaths) { const gb = ease((xf - B.bx) / 0.5); if (gb <= 0) continue; const bp = cutPoly(B.p, gb); if (bp.length > 1) wire(bp.map(onRod), WORD_W * 0.85, 'word'); }
+        for (const [x, y] of L.dots) { const gd = ease((xf - x) / 0.3); if (gd > 0) G.discs.push({ c: onRod([x, y]), r: 0.15 * w.xh * gd, arm: A }); }
+        for (const c1 of L.contacts) { if (c1 > xf) continue; const [ub] = onRodUV(A, w, c1, 0), vb = vArm(A, ub); for (let j = -1; j <= 1; j++) wire([W3(ub + j * 2.6 - 1.6, vb - A.rodW * 0.6), W3(ub + j * 2.6 + 1.6, vb + A.rodW * 0.6)], 2.2, 'wrap'); }
+      }
+      if (e.sub && Math.abs(e.ueye) <= front) {        // an eye bent down under the rod to carry the arm below
+        const v0 = vArm(A, e.ueye) + A.rodW * 0.4 + LOOP_R;
+        wire(ring(W3, e.ueye, v0, LOOP_R * 0.85, LOOP_R, 20, -Math.PI / 2), A.rodW * 0.7, 'eye');
+      }
+      if (e.p && t > S.pads[e.p]) {                   // hooked on edge-first, the paddle swings round into place
+        const P = PADDLES[e.p], sp = t - S.pads[e.p], a0 = W3(e.uat, vArm(A, e.uat)), at = v3(a0.x, a0.y - 10 * (1 - ease(sp / 0.3)), a0.z);
+        G.plates.push({ P, at, ...plateFrame(A, P, A.th + P.psi + s * 55 * DEG * (1 - springIn(sp)), A.roll), arm: A });
+      }
+      if (e.tip && t >= S.tip.at) {                   // hooked on, held out, let go: it swings down on its own wire and hangs plumb
+        const P = PADDLES[e.tip.p], q = rise(t, S.tip.at, S.tip.hook), ang = A.th + P.psi, hz = v3(Math.cos(ang), 0, Math.sin(ang));
+        const beta = s * 55 * DEG * (1 - q) + kick(t, S.tip.hook, -s * 6 * DEG, 0.9), top = e.hp;
+        const e1 = v3(Math.sin(beta) * hz.x, Math.cos(beta), Math.sin(beta) * hz.z), e2 = v3(Math.cos(beta) * hz.x, -Math.sin(beta), Math.cos(beta) * hz.z);
+        const hook = []; for (let j = 0; j <= 14; j++) { const a = -Math.PI / 2 + j / 14 * Math.PI * 1.75; hook.push(add3(add3(top, e2, 4 * Math.cos(a)), e1, -4 * Math.sin(a))); }
+        const at = add3(top, e1, e.tip.drop);
+        wire([...hook.reverse(), add3(top, e1, e.tip.drop * 0.5), add3(at, e1, 2)], PEND_W, 'link');
+        const eye = []; for (let j = 0; j <= 18; j++) { const a = j / 18 * Math.PI * 2; eye.push(add3(add3(at, e1, 5 - 3.5 * Math.cos(a)), e2, 3 * Math.sin(a))); }
+        wire(eye, PEND_W * 0.8, 'wrap');           // looped through a hole drilled near the edge
+        G.plates.push({ P, at, e1, e2, n: cross3(e1, e2), arm: A });
+      }
+    }
+  });
+  return groups;
+}
+
+// ---------- the wall, the spotlight's pool, and the second drawing the mobile makes ----------
+const SW = W / 2, SHh = H / 2;
+const wallBase = new Float32Array(W * H * 3), pool = new Float32Array(W * H);
+function bakeWall() {
+  const sd = hstr('wall');
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const k = y * W + x;
+    // the spot's pool: aimed a little below the mobile, falling off gently toward the corners
+    const dx = (x - 600) / 1900, dy = (y - 760) / 1900;
+    pool[k] = Math.exp(-(dx * dx * 1.1 + dy * dy * 0.9));
+    const lum = 1 + (fbm(x / 420, y / 420, sd, 3) - 0.5) * 0.016 + (hash2(x, y, sd) - 0.5) * 0.011;
+    wallBase[k * 3] = PAL.wall[0] * lum; wallBase[k * 3 + 1] = PAL.wall[1] * lum; wallBase[k * 3 + 2] = PAL.wall[2] * lum;
+  }
+}
+function boxBlur(a, w, h, r) {
+  if (r < 1) return;
+  const t = new Float32Array(Math.max(w, h)), n = 2 * r + 1;
+  for (let y = 0; y < h; y++) {
+    const o = y * w; let s = 0;
+    for (let i = -r; i <= r; i++) s += a[o + clamp(i, 0, w - 1)];
+    for (let x = 0; x < w; x++) { t[x] = s / n; s += a[o + clamp(x + r + 1, 0, w - 1)] - a[o + clamp(x - r, 0, w - 1)]; }
+    for (let x = 0; x < w; x++) a[o + x] = t[x];
+  }
+  for (let x = 0; x < w; x++) {
+    let s = 0;
+    for (let i = -r; i <= r; i++) s += a[clamp(i, 0, h - 1) * w + x];
+    for (let y = 0; y < h; y++) { t[y] = s / n; s += a[clamp(y + r + 1, 0, h - 1) * w + x] - a[clamp(y - r, 0, h - 1) * w + x]; }
+    for (let y = 0; y < h; y++) a[y * w + x] = t[y];
+  }
+}
+function gaussBlur(a, w, h, sigma) { const r = Math.max(0, Math.round((Math.sqrt(4 * sigma * sigma + 1) - 1) / 2)); for (let k = 0; k < 3; k++) boxBlur(a, w, h, r); }
+const shc = document.createElement('canvas'); shc.width = SW; shc.height = SHh;
+const shx = shc.getContext('2d');
+const wallP = q => { const [x, y] = onWall(q); return [x / 2, y / 2]; };
+// Each part throws its shadow along the line from the lamp; the lamp's lens blurs it by an
+// amount that grows with the part's distance from the wall, so parts are binned by that blur.
+function shadowMap(groups) {
+  const prims = [];
+  for (const G of groups) {
+    for (const wr of G.wires) for (let i = 0; i < wr.pts.length - 1; i += 6) {
+      const seg = wr.pts.slice(i, Math.min(i + 7, wr.pts.length)); let z = 0; for (const q of seg) z += q.z; z /= seg.length;
+      const t = SPOT.z / (SPOT.z - z);
+      prims.push({ z, draw: () => { shx.lineWidth = wr.w * t / 2; shx.lineCap = 'round'; shx.lineJoin = 'round'; shx.beginPath(); seg.forEach((q, j) => { const [sx, sy] = wallP(q); j ? shx.lineTo(sx, sy) : shx.moveTo(sx, sy); }); shx.stroke(); } });
+    }
+    for (const pl of G.plates) {
+      const pts = pl.P.outline.map(([a, b]) => v3(pl.at.x + a * pl.e1.x + b * pl.e2.x, pl.at.y + a * pl.e1.y + b * pl.e2.y, pl.at.z + a * pl.e1.z + b * pl.e2.z));
+      let z = 0; for (const q of pts) z += q.z;
+      prims.push({ z: z / pts.length, draw: () => { shx.beginPath(); pts.forEach((q, j) => { const [sx, sy] = wallP(q); j ? shx.lineTo(sx, sy) : shx.moveTo(sx, sy); }); shx.closePath(); shx.fill(); } });
+    }
+    for (const d of G.discs) prims.push({ z: d.c.z, draw: () => { const [sx, sy] = wallP(d.c); shx.beginPath(); shx.arc(sx, sy, d.r / 2, 0, Math.PI * 2); shx.fill(); } });
+  }
+  const T = new Float32Array(SW * SHh), bins = new Map();
+  for (const p of prims) { const b = Math.round(penumbra(p.z) / 2.5); if (!bins.has(b)) bins.set(b, []); bins.get(b).push(p); }
+  shx.fillStyle = shx.strokeStyle = '#000';
+  for (const [b, list] of bins) {
+    shx.clearRect(0, 0, SW, SHh);
+    for (const p of list) p.draw();
+    const d = shx.getImageData(0, 0, SW, SHh).data, a = new Float32Array(SW * SHh);
+    for (let i = 0; i < a.length; i++) a[i] = d[i * 4 + 3] / 255;
+    gaussBlur(a, SW, SHh, b * 2.5 / 2 * 0.42);      // half-res sigma for a penumbra of b*2.5 px
+    // the further a part stands from the wall, the more the room's light fills its shadow in:
+    // dark and crisp near the wall, pale and wide out front
+    const pw = b * 2.5, z = pw * SPOT.z / (LAMP_R + pw), op = clamp(1.06 - z / 420, 0.22, 0.96);
+    for (let i = 0; i < a.length; i++) T[i] = 1 - (1 - T[i]) * (1 - a[i] * op);
+  }
+  return T;
+}
+const AMB_W = 0.32, DIR_W = 0.76;  // room fill, and what the spot adds where it reaches
+function paintWall(T) {
+  const img = cx.createImageData(W, H), o = img.data;
+  for (let y = 0; y < H; y++) {
+    const fy = y / 2 - 0.25, y0 = clamp(Math.floor(fy), 0, SHh - 1), y1 = Math.min(y0 + 1, SHh - 1), ty = clamp(fy - y0, 0, 1);
+    for (let x = 0; x < W; x++) {
+      const fx = x / 2 - 0.25, x0 = clamp(Math.floor(fx), 0, SW - 1), x1 = Math.min(x0 + 1, SW - 1), tx = clamp(fx - x0, 0, 1);
+      const s = lerp(lerp(T[y0 * SW + x0], T[y0 * SW + x1], tx), lerp(T[y1 * SW + x0], T[y1 * SW + x1], tx), ty);
+      const k = y * W + x, lit = DIR_W * pool[k] * (1 - s), L = AMB_W + lit;
+      o[k * 4] = wallBase[k * 3] * L * (1 - 0.03 * s); o[k * 4 + 1] = wallBase[k * 3 + 1] * L * (1 - 0.012 * s); o[k * 4 + 2] = wallBase[k * 3 + 2] * L * (1 + 0.012 * s) * (0.99 - 0.02 * lit); o[k * 4 + 3] = 255;
+    }
+  }
+  cx.putImageData(img, 0, 0);
+}
+
+// ---------- the mobile, through the lens ----------
+const rgb = (c, k = 1, a = 1) => `rgba(${Math.round(clamp(c[0] * k, 0, 255))},${Math.round(clamp(c[1] * k, 0, 255))},${Math.round(clamp(c[2] * k, 0, 255))},${a})`;
+// Matte black rod: no glint, just the round of it — a shade lighter on the side the lamp
+// reaches, a shade darker on the far side.
+function drawWire(pts, w) {
+  if (pts.length < 2) return;
+  const Q = pts.map(proj), f = Q.reduce((s, q) => s + q[2], 0) / Q.length, lw = w * f;
+  const sx = SPOT.x - Q[0][0], sy = SPOT.y - Q[0][1], sl = Math.hypot(sx, sy), lx = sx / sl, ly = sy / sl;
+  const line = (off, width, col) => {
+    cx.beginPath();
+    Q.forEach(([x, y], i) => {
+      const a = Q[Math.max(0, i - 1)], b = Q[Math.min(Q.length - 1, i + 1)];
+      let tx = b[0] - a[0], ty = b[1] - a[1]; const tl = Math.hypot(tx, ty) || 1; tx /= tl; ty /= tl;
+      let nx = -ty, ny = tx; if (nx * lx + ny * ly < 0) { nx = -nx; ny = -ny; }
+      const k = Math.abs(nx * lx + ny * ly), px = x + nx * off * lw * k, py = y + ny * off * lw * k;
+      i ? cx.lineTo(px, py) : cx.moveTo(px, py);
+    });
+    cx.lineWidth = width; cx.strokeStyle = col; cx.stroke();
+  };
+  cx.lineCap = 'round'; cx.lineJoin = 'round';
+  line(0, lw, rgb(PAL.wire));
+  line(0.2, lw * 0.42, 'rgba(92,86,80,0.32)');
+  line(-0.3, lw * 0.3, 'rgba(14,12,11,0.35)');
+}
+const AMB = 0.46, DIF = 1.0, GLOSS = 0.4;
+// A paddle is ray-cast: every pixel of its image traced back through the lens onto the sheet.
+// Enamel takes the lamp diffusely, glints softly where the mirror angle meets the lens, and at
+// a grazing angle reflects the pale room; the sheet is not quite flat, so the light wanders.
+function drawPlate(pl) {
+  const P = pl.P, T = P.tex, e1 = pl.e1, e2 = pl.e2, at = pl.at;
+  let n = pl.n; const vc = norm3(v3(CAM.x - at.x, CAM.y - at.y, CAM.z - at.z)); if (dot3(n, vc) < 0) n = v3(-n.x, -n.y, -n.z);
+  const pts = P.outline.map(([a, b]) => proj(v3(at.x + a * e1.x + b * e2.x, at.y + a * e1.y + b * e2.y, at.z + a * e1.z + b * e2.z)));
+  // the sheet's thickness, seen where it turns away: the back face, offset by 2 px of steel
+  const th = 2.2, back = P.outline.map(([a, b]) => proj(v3(at.x + a * e1.x + b * e2.x - n.x * th, at.y + a * e1.y + b * e2.y - n.y * th, at.z + a * e1.z + b * e2.z - n.z * th)));
+  cx.beginPath(); back.forEach(([x, y], i) => i ? cx.lineTo(x, y) : cx.moveTo(x, y)); cx.closePath(); cx.fillStyle = rgb(PAL[P.col], 0.7); cx.fill();   // the sheet's cut edge, enamelled with it
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of pts) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+  x0 = Math.floor(x0) - 2; y0 = Math.floor(y0) - 2; x1 = Math.ceil(x1) + 2; y1 = Math.ceil(y1) + 2;
+  const bw = x1 - x0, bh = y1 - y0; if (bw <= 0 || bh <= 0) return;
+  const img = new ImageData(bw, bh), o = img.data, cw = T.cw, chh = T.ch;
+  const dn = dot3(v3(at.x - CAM.x, at.y - CAM.y, at.z - CAM.z), n);
+  const NS = 3;                                     // 3x3 rays a pixel: a sheet turned edge-on keeps its brushwork
+  for (let j = 0; j < bh; j++) for (let i = 0; i < bw; i++) {
+    let r0 = 0, g0 = 0, b0 = 0, a0 = 0;
+    for (let sj = 0; sj < NS; sj++) for (let si = 0; si < NS; si++) {
+      const sx = x0 + i + (si + 0.5) / NS, sy = y0 + j + (sj + 0.5) / NS, Dx = sx - CAM.x, Dy = sy - CAM.y, Dz = -CAM.z;
+      const den = Dx * n.x + Dy * n.y + Dz * n.z; if (Math.abs(den) < 1e-6) continue;
+      const t = dn / den, px = CAM.x + t * Dx, py = CAM.y + t * Dy, pz = CAM.z + t * Dz;
+      const qx = px - at.x, qy = py - at.y, qz = pz - at.z, lx = qx * e1.x + qy * e1.y + qz * e1.z, ly = qx * e2.x + qy * e2.y + qz * e2.z;
+      const fi = (lx - P.ox) * SS - 0.5, fj = (ly - P.oy) * SS - 0.5, ii = Math.floor(fi), jj = Math.floor(fj);
+      if (ii < 0 || jj < 0 || ii >= cw - 1 || jj >= chh - 1) continue;
+      const ax = fi - ii, ay = fj - jj, k00 = jj * cw + ii, k10 = k00 + 1, k01 = k00 + cw, k11 = k01 + 1;
+      const w00 = (1 - ax) * (1 - ay), w10 = ax * (1 - ay), w01 = (1 - ax) * ay, w11 = ax * ay;
+      const c = T.cov[k00] * w00 + T.cov[k10] * w10 + T.cov[k01] * w01 + T.cov[k11] * w11; if (c <= 0.002) continue;
+      const kk = ay < 0.5 ? (ax < 0.5 ? k00 : k10) : (ax < 0.5 ? k01 : k11);
+      const bx = 0.05 * Math.sin(ly / 80 + T.ph1), by = 0.04 * Math.sin(lx / 95 + T.ph2);
+      let nx = n.x + e1.x * bx + e2.x * by, ny = n.y + e1.y * bx + e2.y * by, nz = n.z + e1.z * bx + e2.z * by; const nn = Math.hypot(nx, ny, nz); nx /= nn; ny /= nn; nz /= nn;
+      let Lx = SPOT.x - px, Ly = SPOT.y - py, Lz = SPOT.z - pz; const Ll = Math.hypot(Lx, Ly, Lz); Lx /= Ll; Ly /= Ll; Lz /= Ll;
+      let Vx = CAM.x - px, Vy = CAM.y - py, Vz = CAM.z - pz; const Vl = Math.hypot(Vx, Vy, Vz); Vx /= Vl; Vy /= Vl; Vz /= Vl;
+      const nl = nx * Lx + ny * Ly + nz * Lz, lit = AMB + DIF * Math.max(0, nl);
+      const rv = (2 * nl * nx - Lx) * Vx + (2 * nl * ny - Ly) * Vy + (2 * nl * nz - Lz) * Vz, nv = Math.max(0, nx * Vx + ny * Vy + nz * Vz);
+      const sh = Math.max(0, T.sheen[kk]), ed = T.edge[kk];
+      const ab = ch3 => T.alb[k00 * 3 + ch3] * w00 + T.alb[k10 * 3 + ch3] * w10 + T.alb[k01 * 3 + ch3] * w01 + T.alb[k11 * 3 + ch3] * w11;
+      const F = 0.04 + 0.96 * (1 - nv) ** 5;          // enamel turns to a mirror of the pale room at a grazing angle
+      const add = (Math.exp(-(1 - rv) / 0.02) * GLOSS * sh + F * (0.75 + 0.25 * sh) * 0.88) * 255;
+      const L = lit * (1 - F);
+      r0 += (ab(0) * L + add) * c; g0 += (ab(1) * L + add * 0.98) * c; b0 += (ab(2) * L + add * 0.95) * c; a0 += c;
+    }
+    if (a0 <= 0) continue;
+    const q = (j * bw + i) * 4; o[q] = r0 / a0; o[q + 1] = g0 / a0; o[q + 2] = b0 / a0; o[q + 3] = clamp(a0 / (NS * NS), 0, 1) * 255;
+  }
+  const tc = document.createElement('canvas'); tc.width = bw; tc.height = bh; tc.getContext('2d').putImageData(img, 0, 0);
+  cx.drawImage(tc, x0, y0);
+}
+function drawDisc(d) {
+  const [x, y, f] = proj(d.c), rx = d.r * f * Math.max(0.3, Math.abs(d.arm.ct)), ry = d.r * f;
+  cx.beginPath(); cx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2); cx.fillStyle = rgb(PAL.red); cx.fill();
+  cx.beginPath(); cx.ellipse(x + rx * 0.25, y - ry * 0.3, rx * 0.45, ry * 0.4, 0, 0, Math.PI * 2); cx.fillStyle = 'rgba(255,214,190,0.18)'; cx.fill();
+}
+function compose(t) {
+  pose(t);
+  const groups = buildScene();
+  paintWall(shadowMap(groups));
+  const zOf = G => { let s = 0, n = 0; for (const w of G.wires) for (const q of w.pts) { s += q.z; n++; } return n ? s / n : 0; };
+  groups.sort((a, b) => zOf(a) - zOf(b));
+  for (const G of groups) {
+    for (const w of G.wires) if (w.role !== 'word' && w.role !== 'wrap') drawWire(w.pts, w.w);
+    for (const p of G.plates) drawPlate(p);
+    for (const w of G.wires) if (w.role === 'word') drawWire(w.pts, w.w);
+    for (const w of G.wires) if (w.role === 'wrap') drawWire(w.pts, w.w);
+    for (const d of G.discs) drawDisc(d);
+  }
+  return groups;
+}
+function seek(t) { const g = compose(clamp(t, 0, DUR)); window.__calder = report(g); }
+function report(groups) {
+  const box = Q => { let a = [1e9, 1e9, -1e9, -1e9]; for (const [x, y] of Q) { a[0] = Math.min(a[0], x); a[1] = Math.min(a[1], y); a[2] = Math.max(a[2], x); a[3] = Math.max(a[3], y); } return a.map(Math.round); };
+  const out = { arms: ARMS.map(A => ({ id: A.id, mass: Math.round(A.mass), check: +A.check.toExponential(2), solved: Math.round(A.solved), ok: A.solvable, roll: +(A.roll / DEG).toFixed(2), piv: [A.piv.x, A.piv.y, A.piv.z].map(Math.round) })), words: [], plates: [] };
+  for (const G of groups) {
+    for (const w of G.wires) if (w.role === 'word') out.words.push({ arm: G.arm.id, box: box(w.pts.map(proj)) });
+    for (const p of G.plates) out.plates.push({ k: p.P.key, area: Math.round(p.P.area), z: Math.round(p.at.z), box: box(p.P.outline.map(([a, b]) => proj(v3(p.at.x + a * p.e1.x + b * p.e2.x, p.at.y + a * p.e1.y + b * p.e2.y, p.at.z + a * p.e1.z + b * p.e2.z)))) });
+  }
+  return out;
+}
+window.__riso = { duration: DUR, ready: false, seek, hero: HERO, build: { end: BUILD_END } };
+solve(); bakeWall();
+seek(Number(new URLSearchParams(location.search).get('t')) || HERO);
+window.__riso.ready = true;
+</script>

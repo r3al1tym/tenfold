@@ -1,0 +1,672 @@
+<!doctype html><meta charset="utf-8"><title>13 varini · a little faith in impossible things</title>
+<style>html,body{margin:0;height:100%;background:#d8d6d2;display:grid;place-items:center}canvas{height:96vh;width:auto;max-width:96vw}</style>
+<canvas id="c"></canvas>
+<script>
+/* A Varini anamorphosis, ray-traced, as a build. A white, top-lit stair hall with a wall return (the
+   pier) on the right. "a little faith in impossible things" is projected from a single eye point and
+   painted in matte red onto every surface the projector can see. The hall starts bare; from 0.5 s the
+   coat is rolled on surface by surface, climbing the stair, until 4.6 s. The camera sits on the
+   projector point while the paint goes on, so the phrase reads flat; then it steps 23 cm down and the
+   pier's share of "impossible" jumps off the line. Each frame traces the room from the camera at
+   time t, lights it with the sun (shadow rays over the solar disc), the sky through the glass roof
+   (analytic area light) and one traced bounce, then paints whatever the projector reached by t. */
+const PHRASE_TO_RENDER = 'a little faith in impossible things';
+const W = 1080, H = 1350, DUR = 6, HERO = 5.4, D2R = Math.PI / 180;
+const FL = 1169, PCX = 540, PCY = 560;            // focal length (px) and shifted principal point (projector)
+const FLC = FL * 1.15, PCYC = 881;                // the camera: 15% longer lens, shifted so the floor is ~12% of the frame
+const EYE = [0.40, 1.60, 0.0];                    // the projector / the seat
+const cv = document.getElementById('c'), cx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+
+// ---------- seeded randomness ----------
+function hstr(s) { let h = 2166136261 >>> 0; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+function rng(key) { let a = hstr(key); return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+function hash3(x, y, s) { let h = Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul(s | 0, 1442695041); h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; }
+const sm = t => t * t * (3 - 2 * t);
+function vnoise(x, y, s) {
+  const xi = Math.floor(x), yi = Math.floor(y), xf = sm(x - xi), yf = sm(y - yi);
+  const a = hash3(xi, yi, s), b = hash3(xi + 1, yi, s), c = hash3(xi, yi + 1, s), d = hash3(xi + 1, yi + 1, s);
+  return a + (b - a) * xf + (c - a + (d - c - b + a) * xf) * yf;
+}
+function fbm(x, y, s, oct = 4) { let v = 0, amp = 0.5, f = 1, tot = 0; for (let o = 0; o < oct; o++) { v += amp * vnoise(x * f, y * f, s + o * 31); tot += amp; amp *= 0.5; f *= 2.03; } return v / tot; }
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const sstep = (a, b, v) => { const t = clamp((v - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+
+// ---------- the room (metres; x right, y up, z away from the seat) ----------
+// materials: 0 wall plaster, 1 polished concrete floor, 2 limestone stair, 3 ceiling, 4 steel, 5 rail, 6 court stone
+const BL = [], ML = [], GROUPS = [];
+function box(x0, y0, z0, x1, y1, z1, m) { BL.push(x0, y0, z0, x1, y1, z1); ML.push(m); }
+function group(fn) { const i0 = ML.length; fn(); GROUPS.push([i0, ML.length]); }
+// A top-lit stair hall: a glass roof (out of frame) and a wall return (the pier) on the right. A high
+// sun from straight behind the camera comes through the roof. The solid roof strip over the entrance
+// throws its shadow edge onto the foot of the first riser, so the floor in front of the stair sits
+// in shade and the stair itself in sun; the roof is glass over the pier, so its front face is lit.
+const SUN_E = 68 * D2R, SUN_A = 0 * D2R;           // sun elevation; azimuth from straight behind toward the right
+const DOOR = { x0: -0.9, x1: 0.48, y0: 2.8, y1: 5.0 };          // doorway at the top of the stair, onto a deep court
+const ZB = 13.5, ZD = 40.0, XL = -2.0, XR = 3.2, YC = 16.0;     // back wall, the court's far wall, wall faces, roof
+const RISE = 0.175, GOING = 0.30, Z0 = 6.0, NSTEP = 16;
+const PIER = { x0: 1.15, z0: 3.2, z1: 4.2, h: 4.8 };            // the return: x0..XR, z0..z1; its top is out of frame
+const RT = 0.4, ZRF = Z0 - 0.015 - (YC + RT) * Math.cos(SUN_A) / Math.tan(SUN_E);   // roof glass starts here: shade edge at the stair foot
+group(() => {                                                    // shell
+  box(XL, -0.3, -4.3, XR, 0, 16.5, 1);                          // floor
+  box(XL, 0, -4.3, XR, YC, -4.0, 0);                            // wall behind the seat
+  box(XL - 0.3, 0, -4.3, XL, YC, 16.5, 0);                      // left wall
+  box(XR, -0.3, -4.3, XR + 0.3, YC, 16.5, 0);                   // right wall
+  box(XL, YC, -4.3, PIER.x0 + 0.09, YC + RT, ZRF, 3);           // solid roof over the entrance (glass over the pier;
+                                                                 // the 9 cm overlap keeps the penumbra off the floor)
+});
+group(() => {                                                    // back wall, doorway, and the open court beyond
+  box(XL, 0, ZB, DOOR.x0, YC, ZB + 0.4, 0);
+  box(DOOR.x1, 0, ZB, XR, YC, ZB + 0.4, 0);
+  box(DOOR.x0, DOOR.y1, ZB, DOOR.x1, YC, ZB + 0.4, 0);
+  box(-5.0, 0, ZB, 3.0, DOOR.y0, ZD, 2);                         // the court floor (the landing runs on)
+  box(-5.0, DOOR.y0, ZD, 3.0, 16.0, ZD + 0.3, 6);                // its far wall, warm stone, open to the sky and in full sun
+});
+group(() => {                                                    // the stair: square limestone blocks, no nosing
+  for (let k = 1; k <= NSTEP; k++) box(XL, 0, Z0 + GOING * (k - 1), XR, RISE * k, Z0 + GOING * k, 2);
+  box(XL, 0, Z0 + GOING * NSTEP, XR, RISE * NSTEP, ZB, 2);     // landing
+});
+group(() => { box(PIER.x0, 0, PIER.z0, XR, PIER.h, PIER.z1, 0); });   // the pier: a wall return
+// the handrail: a painted steel bar on the left wall, pitched with the stair (an oriented box)
+const NBOX = ML.length, RTH = Math.atan2(RISE, GOING);
+const RE2 = [0, Math.cos(RTH), -Math.sin(RTH)], RE3 = [0, Math.sin(RTH), Math.cos(RTH)];
+const RZ0 = Z0 - 0.25, RZ1 = Z0 + GOING * (NSTEP - 1) + 0.25, RZM = (RZ0 + RZ1) / 2;
+const RC = [XL + 0.075, (RZM - Z0) * Math.tan(RTH) + RISE + 0.9, RZM], RH = [0.022, 0.024, (RZ1 - RZ0) / Math.cos(RTH) / 2];
+ML.push(5);
+const NRM = [], TBS = [];                         // per-face normal and tangent basis
+for (let f = 0; f < (NBOX + 1) * 6; f++) {
+  const a = (f % 6) >> 1, sg = (f % 2) ? 1 : -1, b = (f / 6) | 0;
+  const e = b < NBOX ? [[1, 0, 0], [0, 1, 0], [0, 0, 1]][a] : [[1, 0, 0], RE2, RE3][a];
+  const n = [e[0] * sg, e[1] * sg, e[2] * sg]; NRM.push(n);
+  const t1 = Math.abs(n[0]) > 0.9 ? [0, 1, 0] : [1, 0, 0], d = t1[0] * n[0] + t1[1] * n[1] + t1[2] * n[2];
+  let u = [t1[0] - n[0] * d, t1[1] - n[1] * d, t1[2] - n[2] * d]; const ul = Math.hypot(...u); u = u.map(v => v / ul);
+  const w = [n[1] * u[2] - n[2] * u[1], n[2] * u[0] - n[0] * u[2], n[0] * u[1] - n[1] * u[0]];
+  TBS.push([u[0], u[1], u[2], w[0], w[1], w[2]]);
+}
+function railT(ox, oy, oz, dx, dy, dz, tmax) {    // ray vs the rail; returns t (or Infinity), sets RF
+  const rx = ox - RC[0], ry = oy - RC[1], rz = oz - RC[2];
+  const o = [rx, ry * RE2[1] + rz * RE2[2], ry * RE3[1] + rz * RE3[2]], d = [dx, dy * RE2[1] + dz * RE2[2], dy * RE3[1] + dz * RE3[2]];
+  let tn = -Infinity, tf = Infinity, ax = 0;
+  for (let a = 0; a < 3; a++) {
+    const id = 1 / nz9(d[a]); let t0 = (-RH[a] - o[a]) * id, t1 = (RH[a] - o[a]) * id; if (t0 > t1) { const q = t0; t0 = t1; t1 = q; }
+    if (t0 > tn) { tn = t0; ax = a; } if (t1 < tf) tf = t1;
+  }
+  if (tn > tf || tn <= 1e-6 || tn >= tmax) return Infinity;
+  RF = ax * 2 + (d[ax] < 0 ? 1 : 0); return tn;
+}
+let RF = 0;
+const BX = new Float64Array(BL), NG = GROUPS.length;
+const GB = new Float64Array(NG * 6), G0 = new Int32Array(NG), G1 = new Int32Array(NG);
+GROUPS.forEach(([i0, i1], g) => {
+  G0[g] = i0; G1[g] = i1;
+  for (let a = 0; a < 3; a++) { GB[g * 6 + a] = Infinity; GB[g * 6 + 3 + a] = -Infinity; }
+  for (let k = i0; k < i1; k++) for (let a = 0; a < 3; a++) {
+    GB[g * 6 + a] = Math.min(GB[g * 6 + a], BX[k * 6 + a]); GB[g * 6 + 3 + a] = Math.max(GB[g * 6 + 3 + a], BX[k * 6 + 3 + a]);
+  }
+});
+
+// ---------- ray casting against axis-aligned boxes ----------
+let hitT = 0, hitB = -1, hitF = 0;           // face = axis*2 + (normal positive ? 1 : 0)
+const nz9 = v => (v > -1e-9 && v < 1e-9) ? 1e-9 : v;
+function trace(ox, oy, oz, dx, dy, dz, tmax) {
+  dx = nz9(dx); dy = nz9(dy); dz = nz9(dz);
+  const ix = 1 / dx, iy = 1 / dy, iz = 1 / dz;
+  let best = tmax, bb = -1, bax = 0;
+  for (let g = 0; g < NG; g++) {
+    let o = g * 6;
+    let a0 = (GB[o] - ox) * ix, a1 = (GB[o + 3] - ox) * ix; if (a0 > a1) { const s = a0; a0 = a1; a1 = s; }
+    let b0 = (GB[o + 1] - oy) * iy, b1 = (GB[o + 4] - oy) * iy; if (b0 > b1) { const s = b0; b0 = b1; b1 = s; }
+    let c0 = (GB[o + 2] - oz) * iz, c1 = (GB[o + 5] - oz) * iz; if (c0 > c1) { const s = c0; c0 = c1; c1 = s; }
+    let tn = a0 > b0 ? a0 : b0; if (c0 > tn) tn = c0;
+    let tf = a1 < b1 ? a1 : b1; if (c1 < tf) tf = c1;
+    if (tn > tf || tf < 1e-6 || tn >= best) continue;
+    for (let k = G0[g]; k < G1[g]; k++) {
+      o = k * 6;
+      a0 = (BX[o] - ox) * ix; a1 = (BX[o + 3] - ox) * ix; if (a0 > a1) { const s = a0; a0 = a1; a1 = s; }
+      b0 = (BX[o + 1] - oy) * iy; b1 = (BX[o + 4] - oy) * iy; if (b0 > b1) { const s = b0; b0 = b1; b1 = s; }
+      c0 = (BX[o + 2] - oz) * iz; c1 = (BX[o + 5] - oz) * iz; if (c0 > c1) { const s = c0; c0 = c1; c1 = s; }
+      let ax = 0; tn = a0; if (b0 > tn) { tn = b0; ax = 1; } if (c0 > tn) { tn = c0; ax = 2; }
+      tf = a1 < b1 ? a1 : b1; if (c1 < tf) tf = c1;
+      if (tn <= tf && tn > 1e-6 && tn < best) { best = tn; bb = k; bax = ax; }
+    }
+  }
+  if (bb >= 0) hitF = bax * 2 + ((bax === 0 ? dx : bax === 1 ? dy : dz) < 0 ? 1 : 0);
+  const tr = railT(ox, oy, oz, dx, dy, dz, best); if (tr < best) { best = tr; bb = NBOX; hitF = RF; }
+  hitT = best; hitB = bb;
+  return bb >= 0;
+}
+function occluded(ox, oy, oz, dx, dy, dz, tmax) {
+  dx = nz9(dx); dy = nz9(dy); dz = nz9(dz);
+  const ix = 1 / dx, iy = 1 / dy, iz = 1 / dz;
+  for (let g = 0; g < NG; g++) {
+    let o = g * 6;
+    let a0 = (GB[o] - ox) * ix, a1 = (GB[o + 3] - ox) * ix; if (a0 > a1) { const s = a0; a0 = a1; a1 = s; }
+    let b0 = (GB[o + 1] - oy) * iy, b1 = (GB[o + 4] - oy) * iy; if (b0 > b1) { const s = b0; b0 = b1; b1 = s; }
+    let c0 = (GB[o + 2] - oz) * iz, c1 = (GB[o + 5] - oz) * iz; if (c0 > c1) { const s = c0; c0 = c1; c1 = s; }
+    let tn = a0 > b0 ? a0 : b0; if (c0 > tn) tn = c0;
+    let tf = a1 < b1 ? a1 : b1; if (c1 < tf) tf = c1;
+    if (tn > tf || tf < 1e-6 || tn >= tmax) continue;
+    for (let k = G0[g]; k < G1[g]; k++) {
+      o = k * 6;
+      a0 = (BX[o] - ox) * ix; a1 = (BX[o + 3] - ox) * ix; if (a0 > a1) { const s = a0; a0 = a1; a1 = s; }
+      b0 = (BX[o + 1] - oy) * iy; b1 = (BX[o + 4] - oy) * iy; if (b0 > b1) { const s = b0; b0 = b1; b1 = s; }
+      c0 = (BX[o + 2] - oz) * iz; c1 = (BX[o + 5] - oz) * iz; if (c0 > c1) { const s = c0; c0 = c1; c1 = s; }
+      tn = a0 > b0 ? a0 : b0; if (c0 > tn) tn = c0;
+      tf = a1 < b1 ? a1 : b1; if (c1 < tf) tf = c1;
+      if (tn <= tf && tn > 1e-6 && tn < tmax) return true;
+    }
+  }
+  return railT(ox, oy, oz, dx, dy, dz, tmax) < tmax;
+}
+const FN = [[-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1]];
+
+// ---------- the painting, designed in the projector's image (px of a 1080x1350 frame) ----------
+// Letters are built from Varini's vocabulary: a ring, a band, a disc, an arc cut square across the
+// stroke. Each glyph emits primitives; coverage is their exact signed distance, so the taped edge
+// stays razor sharp at any depth. Primitives: [0 arc, cx, cy, rc, hw, a0, a1] (canvas angles,
+// clockwise from +x, a0 in -pi..pi) | [1 rect, x0, y0, x1, y1] | [2 disc, cx, cy, r].
+const PRIM = [];
+const ringP = (cx, cy, R, b, a0, a1) => PRIM.push([0, cx, cy, R - b / 2, b / 2, a0, a1]);
+const barP = (x0, y0, w, h) => PRIM.push([1, x0, y0, x0 + w, y0 + h]);
+// Every letter is built from the same parts on a module: every round is a full ring at x-height H,
+// every stroke one band b, arches and ascenders are half rings, and the gap between parts is one
+// band. Every end is cut square across the stroke.
+function partGlyph(ch, x, yb, H) {                // returns the glyph's width (gaps are added by the line)
+  const b = H * 0.24, R = H / 2, cy = yb - R, top = yb - H, asc = top - R;
+  const arch = (x0, w) => ringP(x0 + w / 2, top + w / 2, w / 2, b, Math.PI, 2 * Math.PI);
+  const ring = () => ringP(x + R, cy, R, b, 0, 2 * Math.PI);
+  switch (ch) {
+    case 'o': ring(); return H;
+    case 'a': ring(); barP(x + H - b, top, b, H); return H;
+    case 'b': ring(); barP(x, asc, b, H + R); return H;
+    case 'p': ring(); barP(x, top, b, H + R); return H;
+    case 'g': { const rh = H * 0.4; ring(); barP(x + H - b, top, b, H * 1.1); ringP(x + H - rh, yb + H * 0.1, rh, b, 0, 160 * D2R); return H; }
+    case 'e': ringP(x + R, cy, R, b, 40 * D2R, 2 * Math.PI); barP(x, cy - b / 2, H, b); return H;
+    case 'i': barP(x, top, b, H); PRIM.push([2, x + b / 2, top - b * 0.5 - b * 0.625, b * 0.625]); return b;
+    case 'l': barP(x, asc, b, H + R); return b;
+    case 't': barP(x + H * 0.19, top - H * 0.3, b, H * 1.3); barP(x, top, H * 0.62, b); return H * 0.62;
+    case 'f': { const rf = H * 0.42, xs = x + H * 0.19;
+      ringP(xs + rf, asc + rf, rf, b, Math.PI, 1.5 * Math.PI); barP(xs, asc + rf, b, yb - asc - rf); barP(x, top, H * 0.62, b); return H * 0.62; }
+    case 's': { const r = (H + b) / 4, w = H * 0.82;   // two half rings joined by three bands
+      ringP(x + r, top + r, r, b, 0.5 * Math.PI, 1.5 * Math.PI); barP(x + r, top, w - r, b); barP(x + r, top + 2 * r - b, w - 2 * r, b);
+      ringP(x + w - r, yb - r, r, b, -0.5 * Math.PI, 0.5 * Math.PI); barP(x, yb - b, w - r, b); return w; }
+    case 'n': barP(x, top, b, H); arch(x, H); barP(x + H - b, top + R, b, R); return H;
+    case 'h': barP(x, asc, b, H + R); arch(x, H); barP(x + H - b, top + R, b, R); return H;
+    case 'm': { const w = H * 0.88; barP(x, top, b, H); arch(x, w); arch(x + w - b, w);
+      barP(x + w - b, top + w / 2, b, H - w / 2); barP(x + 2 * w - 2 * b, top + w / 2, b, H - w / 2); return 2 * w - b; }
+  }
+  return 0;
+}
+function partLine(str, x, yb, H) {                // one band between parts, 0.6 H between words
+  let first = true;
+  for (const ch of str) {
+    if (ch === ' ') { x += H * 0.6; first = true; continue; }
+    if (!first) x += H * 0.24;
+    x += partGlyph(ch, x, yb, H); first = false;
+  }
+  return x;
+}
+// Four lines flush left at one size. "impossible" runs off the stair onto the pier, and the pier's back
+// edge (eye x 749) cuts its b 70% of the way across the bowl, so the stair keeps a whole-looking b. "a little" crosses the left wall's corner
+// and both door jambs; "faith" runs off the left wall onto the top risers, low enough that every
+// part of it (the h's ascender, the dot of "in") stays below the stair's top edge and off the court.
+const WORDS = PHRASE_TO_RENDER.split(' ');                   // four lines: a little / faith in / impossible / things
+const LAYOUT = { x: 131, H: 77, lines: [WORDS.slice(0, 2), WORDS.slice(2, 4), WORDS.slice(4, 5), WORDS.slice(5)].map((w, i) => [w.join(' '), 378 + 168 * i]) };
+let PBB = null;                                    // per-primitive bounds, for early rejection
+const GC = 16; let GX0 = 0, GY0 = 0, GNX = 0, GNY = 0, GCELL = null, GLIST = null;   // a bucket grid over the bounds
+function bakePaint() {
+  PRIM.length = 0;
+  for (const [str, yb] of LAYOUT.lines) partLine(str, LAYOUT.x, yb, LAYOUT.H);
+  PBB = new Float64Array(PRIM.length * 4);
+  PRIM.forEach((p, k) => {
+    const bb = p[0] === 0 ? [p[1] - p[3] - p[4], p[2] - p[3] - p[4], p[1] + p[3] + p[4], p[2] + p[3] + p[4]]
+      : p[0] === 1 ? [p[1], p[2], p[3], p[4]] : [p[1] - p[3], p[2] - p[3], p[1] + p[3], p[2] + p[3]];
+    PBB.set(bb, k * 4);
+  });
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (let k = 0; k < PRIM.length; k++) { x0 = Math.min(x0, PBB[k * 4]); y0 = Math.min(y0, PBB[k * 4 + 1]); x1 = Math.max(x1, PBB[k * 4 + 2]); y1 = Math.max(y1, PBB[k * 4 + 3]); }
+  GX0 = Math.floor(x0 - 4); GY0 = Math.floor(y0 - 4); GNX = Math.floor((x1 + 4 - GX0) / GC) + 1; GNY = Math.floor((y1 + 4 - GY0) / GC) + 1;
+  const cells = Array.from({ length: GNX * GNY }, () => []);
+  for (let k = 0; k < PRIM.length; k++) {         // each part sits in every cell within 4 px of it (reach is at most 3)
+    const o = k * 4, a0 = Math.floor((PBB[o] - 4 - GX0) / GC), a1 = Math.floor((PBB[o + 2] + 4 - GX0) / GC);
+    const b0 = Math.floor((PBB[o + 1] - 4 - GY0) / GC), b1 = Math.floor((PBB[o + 3] + 4 - GY0) / GC);
+    for (let b = b0; b <= b1; b++) for (let a = a0; a <= a1; a++) cells[b * GNX + a].push(k);
+  }
+  GCELL = new Int32Array(GNX * GNY + 1); const flat = [];
+  cells.forEach((c, i) => { GCELL[i] = flat.length; flat.push(...c); }); GCELL[GNX * GNY] = flat.length;
+  GLIST = new Int32Array(flat);
+}
+function capDist(dx, dy, rc, hw, a) {             // distance to an arc's square end cut
+  const ux = Math.cos(a), uy = Math.sin(a), t = clamp(dx * ux + dy * uy, rc - hw, rc + hw);
+  return Math.hypot(dx - ux * t, dy - uy * t);
+}
+function paintSD(u, v, reach) {                    // signed distance (eye px) to the painted shape; capped at reach
+  const gx = Math.floor((u - GX0) / GC), gy = Math.floor((v - GY0) / GC);
+  if (gx < 0 || gy < 0 || gx >= GNX || gy >= GNY) return reach;
+  let d = reach;
+  for (let q = GCELL[gy * GNX + gx], q1 = GCELL[gy * GNX + gx + 1]; q < q1; q++) {
+    const k = GLIST[q], o = k * 4;
+    if (u < PBB[o] - d || v < PBB[o + 1] - d || u > PBB[o + 2] + d || v > PBB[o + 3] + d) continue;
+    const p = PRIM[k]; let e;
+    if (p[0] === 0) {
+      const dx = u - p[1], dy = v - p[2];
+      let th = Math.atan2(dy, dx); if (th < p[5]) th += 2 * Math.PI;
+      e = th <= p[6] ? Math.abs(Math.hypot(dx, dy) - p[3]) - p[4] : Math.min(capDist(dx, dy, p[3], p[4], p[5]), capDist(dx, dy, p[3], p[4], p[6]));
+    } else if (p[0] === 1) {
+      const qx = Math.max(p[1] - u, u - p[3]), qy = Math.max(p[2] - v, v - p[4]);
+      e = qx > 0 || qy > 0 ? Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) : Math.max(qx, qy);
+    } else e = Math.hypot(u - p[1], v - p[2]) - p[3];
+    if (e < d) d = e;
+  }
+  return d;
+}
+function paintCov(u, v) { return clamp(0.5 - paintSD(u, v, 2), 0, 1); }   // box-filtered over one eye px
+
+// ---------- the build: a crew works every surface at once ----------
+// Each painted surface is split into patches about one letter across. A patch is one roller stroke:
+// on walls and the pier a vertical stroke from the top, on risers, treads, the floor and the rail a
+// horizontal stroke from the right. Every stroke eases in and out over BD. The patches are taken in a
+// scattered order on an eased clock (a few at first, a busy middle, a few at the end), so red pieces
+// land across all four lines at once and come together into the phrase.
+const BUILD_T0 = 0.55, BUILD_END = 4.3, BD = 0.42;
+const NFACE = (NBOX + 1) * 6;
+const SAX = new Int8Array(NFACE), WAX = new Int8Array(NFACE), NS = new Int32Array(NFACE), NB = new Int32Array(NFACE);
+const S0 = new Float64Array(NFACE), CS = new Float64Array(NFACE), W0 = new Float64Array(NFACE), BWD = new Float64Array(NFACE);
+const PB = new Int32Array(NFACE);
+let PST = new Float64Array(0), TNOW = 0;
+function bakeBuild() {
+  const mn = new Float64Array(NFACE * 3).fill(Infinity), mx = new Float64Array(NFACE * 3).fill(-Infinity), cnt = new Float64Array(NFACE);
+  const SF = [], SP = [];
+  for (let v = -230; v < 1000; v += 2) for (let u = 60; u < 1030; u += 2) {   // what the projector paints, by surface
+    if (paintSD(u, v, 2) > 0) continue;
+    const dx = (u - PCX) / FL, dy = (PCY - v) / FL, l = Math.hypot(dx, dy, 1);
+    if (!trace(EYE[0], EYE[1], EYE[2], dx / l, dy / l, 1 / l, 1e9)) continue;
+    const f = hitB * 6 + hitF, P = [EYE[0] + dx / l * hitT, EYE[1] + dy / l * hitT, EYE[2] + hitT / l];
+    cnt[f]++; SF.push(f); SP.push(P[0], P[1], P[2]);
+    for (let a = 0; a < 3; a++) { mn[f * 3 + a] = Math.min(mn[f * 3 + a], P[a]); mx[f * 3 + a] = Math.max(mx[f * 3 + a], P[a]); }
+  }
+  let np = 0;
+  for (let f = 0; f < NFACE; f++) {
+    if (cnt[f] < 2) continue;
+    const b = (f / 6) | 0, ax = (f % 6) >> 1, m = ML[b];
+    let sa, wa;
+    if (b === NBOX) { sa = 2; wa = 1; }                          // the rail: strokes along its length, far end first
+    else if (ax === 1 || (ax === 2 && m === 2)) { sa = 0; wa = ax === 1 ? 2 : 1; }   // floor, treads, risers: along x
+    else { sa = 1; wa = ax === 0 ? 2 : 0; }                      // walls, the pier: vertical strokes
+    const c = [0, 1, 2].map(a => (mn[f * 3 + a] + mx[f * 3 + a]) / 2), span = a => {
+      const p0 = c.slice(), p1 = c.slice(); p0[a] = mn[f * 3 + a]; p1[a] = mx[f * 3 + a];
+      projEye(p0[0], p0[1], p0[2]); const u0 = PU, v0 = PV; projEye(p1[0], p1[1], p1[2]); return Math.hypot(PU - u0, PV - v0);
+    };
+    SAX[f] = sa; WAX[f] = wa; S0[f] = mn[f * 3 + sa]; W0[f] = mn[f * 3 + wa];
+    NS[f] = clamp(Math.round(span(sa) / 100), 1, 8); NB[f] = clamp(Math.round(span(wa) / 70), 1, 6);
+    CS[f] = (mx[f * 3 + sa] - S0[f]) / NS[f] + 1e-9; BWD[f] = (mx[f * 3 + wa] - W0[f]) / NB[f] + 1e-9;
+    PB[f] = np; np += NS[f] * NB[f];
+  }
+  const area = new Float64Array(np);                             // painted samples in each patch
+  for (let k = 0; k < SF.length; k++) { const f = SF[k]; if (NS[f] > 0) area[patchOf(f, SP[k * 3], SP[k * 3 + 1], SP[k * 3 + 2])]++; }
+  const key = new Float64Array(np), order = [];
+  for (let f = 0; f < NFACE; f++) for (let k = 0; k < NS[f] * NB[f]; k++) { key[PB[f] + k] = hash3(f, k, 4607); if (area[PB[f] + k]) order.push(PB[f] + k); }
+  order.sort((p, q) => key[p] - key[q]);                         // a scattered order, keyed to the patch
+  PST = new Float64Array(np);
+  const at = r => { const k = 0.5 * r + 0.5 * Math.acos(1 - 2 * r) / Math.PI; return BUILD_T0 + (BUILD_END - BD - 0.02 - BUILD_T0) * k; };
+  for (let k = 0; k < np; k++) PST[k] = at(key[k]);              // empty patches: any slot
+  const tot = order.reduce((a, k) => a + area[k], 0); let cum = 0;
+  for (const k of order) { PST[k] = at(cum / tot); cum += area[k]; }   // the clock runs on painted area
+}
+let PI_ = 0;                                       // the patch's index along its stroke, set by patchOf
+function patchOf(fid, px, py, pz) {
+  const s = SAX[fid] === 0 ? px : SAX[fid] === 1 ? py : pz, w = WAX[fid] === 0 ? px : WAX[fid] === 1 ? py : pz;
+  PI_ = clamp(Math.floor((s - S0[fid]) / CS[fid]), 0, NS[fid] - 1);
+  return PB[fid] + PI_ * NB[fid] + clamp(Math.floor((w - W0[fid]) / BWD[fid]), 0, NB[fid] - 1);
+}
+function landed(fid, px, py, pz) {               // how much of the coat is on at this point by TNOW (0..1)
+  if (NS[fid] === 0) return TNOW >= BUILD_END ? 1 : 0;
+  const k = patchOf(fid, px, py, pz), t0 = PST[k];
+  if (TNOW <= t0) return 0;
+  if (TNOW >= t0 + BD) return 1;
+  const s = SAX[fid] === 0 ? px : SAX[fid] === 1 ? py : pz, w = WAX[fid] === 0 ? px : WAX[fid] === 1 ? py : pz;
+  const lo = S0[fid] + PI_ * CS[fid], hi = lo + CS[fid], E = 0.05;
+  const f = hi + E - (hi - lo + 2 * E) * ease((TNOW - t0) / BD);   // the roller's front, from the top / right end
+  const rag = (vnoise(w * 30, s * 4, 63) - 0.5) * 0.03;          // its edge is a little ragged
+  return clamp((s - f + rag) / 0.015, 0, 1);
+}
+
+// ---------- daylight: high sun through the glass roof, sky through the same glass, one bounce ----------
+const SUN = [Math.cos(SUN_E) * Math.sin(SUN_A), Math.sin(SUN_E), -Math.cos(SUN_E) * Math.cos(SUN_A)];   // toward the sun
+const ST1 = (() => { const l = Math.hypot(SUN[2], SUN[0]); return [-SUN[2] / l, 0, SUN[0] / l]; })();
+const ST2 = [SUN[1] * ST1[2] - SUN[2] * ST1[1], SUN[2] * ST1[0] - SUN[0] * ST1[2], SUN[0] * ST1[1] - SUN[1] * ST1[0]];
+const SUN_R = 0.0047;                              // solar disc radius (rad): crisp edges, a few px of penumbra
+const ESUN = [1.78, 1.66, 1.46];                   // normal irradiance of a midday sun (warm)
+const LSKY = [0.085, 0.097, 0.128];                // sky radiance seen through the roof (cool)
+function sunVis(px, py, pz, seed, n) {            // fraction of the solar disc visible from p
+  let vis = 0; const rot = hash3(seed, 17, 9) * 6.283185307;
+  for (let i = 0; i < n; i++) {
+    const r = SUN_R * Math.sqrt((i + 0.5) / n), a = rot + 2.39996323 * i, cu = r * Math.cos(a), cv = r * Math.sin(a);
+    if (!occluded(px, py, pz, SUN[0] + ST1[0] * cu + ST2[0] * cv, SUN[1] + ST1[1] * cu + ST2[1] * cv, SUN[2] + ST1[2] * cu + ST2[2] * cv, 1e9)) vis++;
+  }
+  return vis / n;
+}
+const SKYQ = [XL, YC, ZRF, XR, YC, ZRF, XR, YC, ZB, XL, YC, ZB];   // the glass roof over the hall
+const CLP = new Float64Array(24);
+function quadPhi(Q, px, py, pz, nx, ny, nz) {     // projected solid angle of a quad, 0..pi
+  let n = 0;
+  for (let i = 0; i < 4; i++) {
+    const j = (i + 1) & 3;
+    const ax = Q[i * 3] - px, ay = Q[i * 3 + 1] - py, az = Q[i * 3 + 2] - pz;
+    const bx = Q[j * 3] - px, by = Q[j * 3 + 1] - py, bz = Q[j * 3 + 2] - pz;
+    const da = ax * nx + ay * ny + az * nz - 1e-5, db = bx * nx + by * ny + bz * nz - 1e-5;
+    if (da >= 0) { CLP[n * 3] = ax; CLP[n * 3 + 1] = ay; CLP[n * 3 + 2] = az; n++; }
+    if ((da >= 0) !== (db >= 0)) { const t = da / (da - db); CLP[n * 3] = ax + (bx - ax) * t; CLP[n * 3 + 1] = ay + (by - ay) * t; CLP[n * 3 + 2] = az + (bz - az) * t; n++; }
+  }
+  if (n < 3) return 0;
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    let ax = CLP[i * 3], ay = CLP[i * 3 + 1], az = CLP[i * 3 + 2], bx = CLP[j * 3], by = CLP[j * 3 + 1], bz = CLP[j * 3 + 2];
+    const la = Math.sqrt(ax * ax + ay * ay + az * az), lb = Math.sqrt(bx * bx + by * by + bz * bz); ax /= la; ay /= la; az /= la; bx /= lb; by /= lb; bz /= lb;
+    const th = Math.acos(clamp(ax * bx + ay * by + az * bz, -1, 1));
+    const cxx = ay * bz - az * by, cyy = az * bx - ax * bz, czz = ax * by - ay * bx, cl = Math.sqrt(cxx * cxx + cyy * cyy + czz * czz);
+    if (cl > 1e-12) sum += th * (cxx * nx + cyy * ny + czz * nz) / cl;
+  }
+  return Math.abs(sum) * 0.5;
+}
+function roofVis(px, py, pz, seed, n) {           // fraction of the roof glass visible from p (stratified)
+  const k = Math.round(Math.sqrt(n)); let vis = 0;
+  for (let a = 0; a < k; a++) for (let b = 0; b < k; b++) {
+    const s = a * k + b, wx = XL + (XR - XL) * (a + hash3(seed, s, 3)) / k, wz = ZRF + (ZB - ZRF) * (b + hash3(seed, s, 4)) / k;
+    const dx = wx - px, dy = YC - 1e-3 - py, dz = wz - pz, d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (!occluded(px, py, pz, dx / d, dy / d, dz / d, d - 1e-3)) vis++;
+  }
+  return vis / (k * k);
+}
+function skyPhi(px, py, pz, nx, ny, nz, seed, n) { // projected solid angle of open sky through the roof
+  const phi = quadPhi(SKYQ, px, py, pz, nx, ny, nz);
+  return phi > 0 ? phi * roofVis(px + nx * 1e-3, py + ny * 1e-3, pz + nz * 1e-3, seed, n) : 0;
+}
+function seedAt(px, py, pz, fid) {                 // noise seeds keyed to the wall, so GI noise sticks to the room in motion
+  let h = Math.imul(Math.floor(px * 400) | 0, 73856093) ^ Math.imul(Math.floor(py * 400) | 0, 19349663) ^ Math.imul(Math.floor(pz * 400) | 0, 83492791) ^ Math.imul(fid + 1, 2654435761);
+  h = Math.imul(h ^ (h >>> 15), 2246822519); return (h ^ (h >>> 13)) >>> 0;
+}
+
+// ---------- materials (linear albedo) ----------
+const ALB = [[0.80, 0.79, 0.765], [0.31, 0.297, 0.28], [0.71, 0.685, 0.63], [0.81, 0.80, 0.78], [0.22, 0.22, 0.23], [0.74, 0.735, 0.72], [0.62, 0.55, 0.46]];
+const RED = [0.60, 0.024, 0.017];                 // the one Varini red, matte acrylic
+let PU = 0, PV = 0;
+function projEye(px, py, pz) {
+  const dz = pz - EYE[2]; if (dz < 0.05) return false;
+  PU = PCX + FL * (px - EYE[0]) / dz; PV = PCY - FL * (py - EYE[1]) / dz; return true;
+}
+function faceJitter(fid) { return [(hash3(fid, 7, 99) - 0.5) * 2.4, (hash3(fid, 11, 99) - 0.5) * 2.4]; }
+const FJ = new Float32Array((NBOX + 1) * 12);       // per-face taping registration error (eye px)
+for (let f = 0; f < (NBOX + 1) * 6; f++) { const j = faceJitter(f); FJ[f * 2] = j[0]; FJ[f * 2 + 1] = j[1]; }
+function eyeSees(px, py, pz, fid) {                // can the projector see this surface point?
+  const n = NRM[fid], ox = px + n[0] * 2e-4, oy = py + n[1] * 2e-4, oz = pz + n[2] * 2e-4;
+  const dx = EYE[0] - ox, dy = EYE[1] - oy, dz = EYE[2] - oz, d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  return !occluded(ox, oy, oz, dx / d, dy / d, dz / d, d - 1e-3);
+}
+function paintAt(px, py, pz, fid, checkVis) {     // red coverage at a surface point
+  if (!projEye(px, py, pz)) return 0;
+  const c = paintCov(PU + FJ[fid * 2], PV + FJ[fid * 2 + 1]); if (c <= 0.001) return 0;
+  const l = landed(fid, px, py, pz); if (l <= 0) return 0;
+  return checkVis && !eyeSees(px, py, pz, fid) ? 0 : c * l;
+}
+function creep(u, v) {                             // eye px the paint wicked under the tape here (mostly none)
+  const n = vnoise(u * 140, v * 140, 81) * 0.65 + vnoise(u * 520, v * 520, 82) * 0.35, c = Math.max(0, n - 0.5) / 0.5;
+  return 1.7 * c * c;
+}
+function paintFine(px, py, pz, fid, u, v, fw) {   // coverage for a seen sample: tape-sharp edge, slight creep
+  if (!projEye(px, py, pz)) return 0;
+  const sd = paintSD(PU + FJ[fid * 2], PV + FJ[fid * 2 + 1], 3) / fw;
+  if (sd > 2.2 / fw) return 0;
+  let c = clamp(0.5 - sd, 0, 1);
+  if (sd > -0.5) { const cr = creep(u, v) / fw; if (cr > 0) c = Math.max(c, 0.55 * clamp(0.5 - (sd - cr), 0, 1)); }
+  if (c <= 0.001) return 0;
+  c *= landed(fid, px, py, pz);
+  return c > 0.001 && eyeSees(px, py, pz, fid) ? c : 0;
+}
+
+const NGI = 16, NSH = 9, EAMB = 0.10;
+const SH = new Float64Array(6);
+function shade(px, py, pz, fid, seed, sky = true) { // irradiance: SH[0..2] sky through the glass, SH[3..5] one bounce
+  const n = NRM[fid], nx = n[0], ny = n[1], nz = n[2];
+  const ox = px + nx * 1e-3, oy = py + ny * 1e-3, oz = pz + nz * 1e-3;
+  if (sky) { const sk = skyPhi(px, py, pz, nx, ny, nz, seed, NSH); SH[0] = LSKY[0] * sk; SH[1] = LSKY[1] * sk; SH[2] = LSKY[2] * sk; }
+  const tb = TBS[fid];
+  let ar = 0, ag = 0, ab = 0;
+  for (let s = 0; s < NGI; s++) {
+    const u1 = ((s % 4) + hash3(seed, s, 5)) / 4, u2 = (((s / 4) | 0) + hash3(seed, s, 6)) / (NGI / 4);
+    const r = Math.sqrt(u1), ph = 6.283185307 * u2, lx = r * Math.cos(ph), ly = r * Math.sin(ph), lz = Math.sqrt(Math.max(0, 1 - u1));
+    const dx = tb[0] * lx + tb[3] * ly + nx * lz, dy = tb[1] * lx + tb[4] * ly + ny * lz, dz = tb[2] * lx + tb[5] * ly + nz * lz;
+    if (!trace(ox, oy, oz, dx, dy, dz, 1e9)) {                  // out through the glass: the sky term has it;
+      if (pz > ZB + 0.4) { ar += Math.PI * LSKY[0]; ag += Math.PI * LSKY[1]; ab += Math.PI * LSKY[2]; }   // the open court sees the sky
+      continue;
+    }
+    const qx = ox + dx * hitT, qy = oy + dy * hitT, qz = oz + dz * hitT, qf = hitB * 6 + hitF, a = ALB[ML[hitB]], qn = NRM[qf];
+    const pa = paintAt(qx, qy, qz, qf, false), qs = seed * 13 + s;
+    const cs = qn[0] * SUN[0] + qn[1] * SUN[1] + qn[2] * SUN[2], sv = cs > 0 ? cs * sunVis(qx + qn[0] * 1e-3, qy + qn[1] * 1e-3, qz + qn[2] * 1e-3, qs, 1) : 0;
+    const qk = quadPhi(SKYQ, qx, qy, qz, qn[0], qn[1], qn[2]) * 0.6;
+    ar += lerp(a[0], RED[0], pa) * (ESUN[0] * sv + LSKY[0] * qk + EAMB);
+    ag += lerp(a[1], RED[1], pa) * (ESUN[1] * sv + LSKY[1] * qk + EAMB);
+    ab += lerp(a[2], RED[2], pa) * (ESUN[2] * sv + LSKY[2] * qk + EAMB);
+  }
+  SH[3] = ar / NGI; SH[4] = ag / NGI; SH[5] = ab / NGI;
+}
+
+// ---------- surface detail at full resolution ----------
+const AL = new Float64Array(3); let PA = 0, JT = 0;
+function cover(c, w, x, fp) {                     // box-filtered coverage of the band [c-w/2, c+w/2] at x
+  const a = Math.max(c - w / 2, x - fp / 2), b = Math.min(c + w / 2, x + fp / 2); return b > a ? (b - a) / fp : 0;
+}
+function surface(px, py, pz, fid, t, dy, fw) {    // albedo with the material's own texture + the paint
+  const m = ML[(fid / 6) | 0], ax = (fid % 6) >> 1, base = ALB[m];
+  const u = ax === 0 ? pz : px, v = ax === 1 ? pz : py, fp = t / FL;
+  let k = 1, sub = 0; JT = 0;
+  if (m === 0 || m === 3 || m === 6) {            // trowelled plaster (and the court's rendered stone): soft clouds
+    sub = (fbm(u * 0.45 + fid, v * 0.45, 11) - 0.5) * 0.016 + (vnoise(u * 7, v * 7, 12) - 0.5) * 0.006 * sstep(0.03, 0.006, fp);
+    k = 1 + sub;
+    if (m === 0 && ax !== 1 && py < 0.03) k *= 1 - 0.7 * cover(0.006, 0.012, py, Math.max(fp, 1e-4)); // shadow gap at the floor
+    if (m === 0 && ax !== 1 && py < 0.14) {       // mop water: a grey tide at the skirting with a faint high-water line
+      const tl = 0.095 + (fbm(u * 3.1, 0.5, 26) - 0.5) * 0.03;
+      k *= 1 - 0.05 * sstep(tl, tl - 0.06, py) - 0.045 * Math.exp(-(((py - tl) / 0.004) ** 2));
+    }
+  } else if (m === 1) {                            // polished concrete: trowel clouds, aggregate, saw-cut joints
+    sub = (fbm(px * 0.32, pz * 0.32, 21) - 0.5) * 0.27 + (fbm(px * 2.6, pz * 2.6, 22) - 0.5) * 0.05;
+    const g = hash3(Math.floor(px * 70), Math.floor(pz * 70), 23);
+    sub += (g > 0.975 ? 0.05 : g < 0.02 ? -0.07 : 0) * sstep(0.02, 0.006, fp);
+    k = 1 + sub;
+    const fpz = fp / Math.max(Math.abs(dy), 0.03), jw = 0.007;
+    let j = 0;
+    for (const jx of [-0.35, 1.3]) j = Math.max(j, cover(jx, jw, px, Math.max(fp, 1e-4)));
+    const zz = ((pz - 3.3) % 3.2 + 3.2) % 3.2; j = Math.max(j, cover(0, jw, zz > 1.6 ? zz - 3.2 : zz, Math.max(fpz, 1e-4)));
+    JT = Math.min(1, j);
+    const foot = 0.45 + 0.55 * Math.exp(-(((pz - Z0) / 0.7) ** 2));   // grime: scuffs and heel marks, worst at the stair foot
+    k *= 1 - 0.09 * foot * sstep(0.55, 0.85, fbm(px * 1.3, pz * 1.3, 24)) - 0.13 * foot * sstep(0.78, 0.88, vnoise(px * 22, pz * 9, 25));
+    k *= 1 - 0.14 * sstep(Z0 - 0.05, Z0, pz);                          // dust packed against the first riser
+  } else if (m === 2) {                            // limestone: soft beds and a fine shell grain
+    sub = (fbm(u * 1.1, v * 1.1 + fid * 0.37, 31) - 0.5) * 0.10 + (vnoise(u * 30, v * 30, 32) - 0.5) * 0.05 * sstep(0.012, 0.004, fp);
+    k = 1 + sub;
+    if (fid % 6 === 4) {                           // toe scuffs along the foot of each riser
+      const lo = py - Math.floor(py / RISE + 1e-6) * RISE;
+      k *= 1 - 0.11 * sstep(0.05, 0.0, lo) * sstep(0.45, 0.8, fbm(px * 4.2, pz * 3, 27));
+    }
+  }
+  AL[0] = base[0] * k; AL[1] = base[1] * k; AL[2] = base[2] * k;
+  const pa = paintFine(px, py, pz, fid, u, v, fw);
+  PA = pa;
+  if (pa > 0) {                                    // flat matte acrylic over the grime
+    const pk = (1 + sub * 0.08) * (1 + (fbm(u * 0.9 + fid * 0.13, v * 0.9, 51) - 0.5) * 0.03)   // two coats: opaque
+      * (m === 1 ? 0.8 : 1);                       // concrete drinks the coat: the same red dries deeper on the floor
+    AL[0] = lerp(AL[0], RED[0] * pk, pa); AL[1] = lerp(AL[1], RED[1] * pk, pa); AL[2] = lerp(AL[2], RED[2] * pk, pa);
+  }
+  if (JT > 0) { const q = 1 - 0.62 * JT * (1 - pa); AL[0] *= q; AL[1] *= q; AL[2] *= q; }   // joints, bridged where painted
+}
+
+// ---------- camera: locked on the seat while the paint goes on, then one step up off it ----------
+// The step is a rise with a shift lens that holds the stair foot (z = ZS) still, the way an
+// architectural photographer would: nearer surfaces drop by their depth, farther ones rise.
+const ease = k => k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
+const CAM = { x: 0, y: 0, z: 0, c: 1, s: 0, px: PCX, py: PCYC };
+const OFF = [-0.06, 0.42, 0], CAM_T0 = 4.3, CAM_T1 = 5.3, ZS = 6.0;   // 42 cm up, 6 cm left: the pier's paint drops 60 to 100 px
+function setCam(t) {
+  const k = sm(clamp((t - CAM_T0) / (CAM_T1 - CAM_T0), 0, 1)) + 0.05 * sm(clamp((t - CAM_T1) / (DUR - CAM_T1), 0, 1));
+  const dx = OFF[0] * k, dy = OFF[1] * k;
+  CAM.x = EYE[0] + dx; CAM.y = EYE[1] + dy; CAM.z = EYE[2]; CAM.c = 1; CAM.s = 0;
+  CAM.px = PCX + FLC * dx / (ZS - EYE[2]); CAM.py = PCYC - FLC * dy / (ZS - EYE[2]);
+}
+let RX = 0, RY = 0, RZ = 0;
+function rayDir(sx, sy) {
+  const x = (sx - CAM.px) / FLC, y = (CAM.py - sy) / FLC;
+  const dx = x * CAM.c + CAM.s, dz = -x * CAM.s + CAM.c, l = Math.sqrt(dx * dx + y * y + dz * dz);
+  RX = dx / l; RY = y / l; RZ = dz / l;
+}
+
+// ---------- render ----------
+// Sky, bounce and a sun-visibility probe are traced on a coarse grid (one sample per 4x4 pixels) and
+// denoised per surface; the full-resolution pass reads them back on the same surface and traces the
+// sun itself only where the probe found a shadow edge nearby.
+const QS = 4, QW = W / QS, QH = Math.ceil(H / QS), MB = 1.7, CHB = 0.5;   // MB: further bounces in a white room
+const GF = new Int32Array(W * H), GT = new Float32Array(W * H);
+const QF = new Int32Array(QW * QH), QD = new Float32Array(QW * QH * 3), QI = new Float32Array(QW * QH * 3), QV = new Float32Array(QW * QH);
+const QP = new Float64Array(QW * QH * 3), QSD = new Uint32Array(QW * QH);   // each probe's surface point and noise seed
+const SVC = new Float32Array(W * H), SVG = new Int32Array(W * H).fill(-1); // per-pixel sun, valid while the camera holds still
+let GEN = 0, CAMKEY = '';
+function faceBlur(buf, w, h, r) {
+  const tmp = new Float32Array(buf.length);
+  for (let pass = 0; pass < 2; pass++) {
+    const src = pass ? tmp : buf, dst = pass ? buf : tmp;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x, f = QF[i]; let s0 = 0, s1 = 0, s2 = 0, n = 0;
+      if (f < 0) { dst[i * 3] = src[i * 3]; dst[i * 3 + 1] = src[i * 3 + 1]; dst[i * 3 + 2] = src[i * 3 + 2]; continue; }
+      for (let k = -r; k <= r; k++) {
+        const xx = pass ? x : x + k, yy = pass ? y + k : y; if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+        const j = yy * w + xx; if (QF[j] !== f) continue;
+        s0 += src[j * 3]; s1 += src[j * 3 + 1]; s2 += src[j * 3 + 2]; n++;
+      }
+      dst[i * 3] = s0 / n; dst[i * 3 + 1] = s1 / n; dst[i * 3 + 2] = s2 / n;
+    }
+  }
+}
+const EL = new Float64Array(3);
+function addE(k, w) {
+  const im = (QI[k * 3] + QI[k * 3 + 1] + QI[k * 3 + 2]) / 3;     // later bounces wash the red bleed out
+  EL[0] += (QD[k * 3] + (im + (QI[k * 3] - im) * CHB) * MB) * w; EL[1] += (QD[k * 3 + 1] + (im + (QI[k * 3 + 1] - im) * CHB) * MB) * w;
+  EL[2] += (QD[k * 3 + 2] + (im + (QI[k * 3 + 2] - im) * CHB) * MB) * w;
+}
+function lookupE(sx, sy, fid, px, py, pz) {       // sky + bounce from the coarse pass (same surface only)
+  const hx = (sx - QS / 2) / QS, hy = (sy - QS / 2) / QS, i0 = Math.floor(hx), j0 = Math.floor(hy), fx = hx - i0, fy = hy - j0;
+  let wt = 0; EL[0] = EL[1] = EL[2] = 0;
+  for (let c = 0; c < 4; c++) {
+    const i = i0 + (c & 1), j = j0 + (c >> 1); if (i < 0 || j < 0 || i >= QW || j >= QH) continue;
+    const k = j * QW + i; if (QF[k] !== fid) continue;
+    const w = ((c & 1) ? fx : 1 - fx) * ((c >> 1) ? fy : 1 - fy) + 1e-6; addE(k, w); wt += w;
+  }
+  if (wt === 0) for (let j = j0 - 1; j <= j0 + 2; j++) for (let i = i0 - 1; i <= i0 + 2; i++) {   // a thin surface: look wider
+    if (i < 0 || j < 0 || i >= QW || j >= QH) continue;
+    const k = j * QW + i; if (QF[k] !== fid) continue;
+    const w = 1 / (1 + (i - hx) * (i - hx) + (j - hy) * (j - hy)); addE(k, w); wt += w;
+  }
+  if (wt > 0) { EL[0] /= wt; EL[1] /= wt; EL[2] /= wt; return; }
+  const key = seedAt(Math.floor(px * 20) / 400, Math.floor(py * 20) / 400, Math.floor(pz * 20) / 400, fid);   // a sliver the coarse
+  let e = SLIVER.get(key);                                          // pass missed: shade it once per 5 cm cell
+  if (!e) { shade(px, py, pz, fid, key ^ 0x5bd1e995); e = [SH[0] + SH[3] * MB, SH[1] + SH[4] * MB, SH[2] + SH[5] * MB]; SLIVER.set(key, e); }
+  EL[0] = e[0]; EL[1] = e[1]; EL[2] = e[2];
+}
+const SLIVER = new Map();
+function sunClear(sx, sy, fid) {                   // 1 or 0 when every probe within ~8 px on this surface agrees; else -1
+  const i0 = Math.floor((sx - QS / 2) / QS), j0 = Math.floor((sy - QS / 2) / QS); let v = -1, n = 0;
+  for (let j = j0 - 1; j <= j0 + 2; j++) for (let i = i0 - 1; i <= i0 + 2; i++) {
+    if (i < 0 || j < 0 || i >= QW || j >= QH) continue;
+    const k = j * QW + i; if (QF[k] !== fid) continue;
+    const q = QV[k]; if (q !== 0 && q !== 1) return -1;
+    if (n++ === 0) v = q; else if (q !== v) return -1;
+  }
+  return n >= 4 ? v : -1;
+}
+const ACC = new Float64Array(3);
+function samplePixel(sx, sy, useG, gi, fw, nsun) { // linear radiance of one camera sample into ACC (+=)
+  let t, fid;
+  if (useG) { fid = GF[gi]; t = GT[gi]; rayDir(sx, sy); }
+  else { rayDir(sx, sy); if (!trace(CAM.x, CAM.y, CAM.z, RX, RY, RZ, 1e9)) fid = -1; else { fid = hitB * 6 + hitF; t = hitT; } }
+  if (fid < 0) { ACC[0] += EXT[0]; ACC[1] += EXT[1]; ACC[2] += EXT[2]; return; }   // out through the glass
+  const px = CAM.x + RX * t, py = CAM.y + RY * t, pz = CAM.z + RZ * t;
+  surface(px, py, pz, fid, t, RY, fw);
+  lookupE(sx, sy, fid, px, py, pz);
+  const n = NRM[fid], cs = n[0] * SUN[0] + n[1] * SUN[1] + n[2] * SUN[2];   // the sun, traced at full resolution near edges
+  let sv = 0;
+  if (cs > 0) {
+    if (useG && SVG[gi] === GEN) sv = SVC[gi];                     // the camera has not moved: the sun is where it was
+    else {
+      sv = sunClear(sx, sy, fid);
+      if (sv < 0) {
+        const ox = px + n[0] * 1e-3, oy = py + n[1] * 1e-3, oz = pz + n[2] * 1e-3, sd = seedAt(px, py, pz, fid);
+        sv = sunVis(ox, oy, oz, sd, nsun);
+        if (nsun > 1 && sv > 0 && sv < 1) sv = (sv * nsun + sunVis(ox, oy, oz, sd ^ 0x9e3779b9, 26) * 26) / (nsun + 26);   // in the penumbra
+      }
+      if (useG) { SVC[gi] = sv; SVG[gi] = GEN; }
+    }
+    sv *= cs;
+  }
+  ACC[0] += AL[0] * (EL[0] + ESUN[0] * sv); ACC[1] += AL[1] * (EL[1] + ESUN[1] * sv); ACC[2] += AL[2] * (EL[2] + ESUN[2] * sv);
+}
+const EXPO = 1.30, EXT = [1.9, 1.95, 2.05];       // EXT: the bright day seen through the glass
+const aces = x => clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0, 1);
+const srgb = x => x <= 0.0031308 ? 12.92 * x : 1.055 * Math.pow(x, 1 / 2.4) - 0.055;
+let lastT = null, lastImg = null;
+function render(t) {
+  setCam(t); TNOW = t; SLIVER.clear();
+  const key = [CAM.x, CAM.y, CAM.z, CAM.c, CAM.s, CAM.px, CAM.py].join(), still = key === CAMKEY;
+  if (!still) { CAMKEY = key; GEN++; }
+  // While the camera holds still (the whole build), the G-buffer, the sky and the sun are as they were
+  // on the last seek; only the bounce, which carries the paint's red, is traced again. The result is
+  // the same image either way.
+  if (!still) for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {   // 1. G-buffer
+    rayDir(x + 0.5, y + 0.5); const i = y * W + x;
+    if (trace(CAM.x, CAM.y, CAM.z, RX, RY, RZ, 1e9)) { GF[i] = hitB * 6 + hitF; GT[i] = hitT; } else GF[i] = -1;
+  }
+  for (let j = 0; j < QH; j++) for (let i = 0; i < QW; i++) {        // 2. coarse sky, bounce and sun probe
+    const k = j * QW + i;
+    if (still) {
+      if (QF[k] < 0) continue;
+      shade(QP[k * 3], QP[k * 3 + 1], QP[k * 3 + 2], QF[k], QSD[k], false);
+      QI[k * 3] = SH[3]; QI[k * 3 + 1] = SH[4]; QI[k * 3 + 2] = SH[5]; continue;
+    }
+    rayDir(QS * i + QS / 2, Math.min(QS * j + QS / 2, H - 0.5));
+    if (!trace(CAM.x, CAM.y, CAM.z, RX, RY, RZ, 1e9)) { QF[k] = -1; continue; }
+    const fid = hitB * 6 + hitF, px = CAM.x + RX * hitT, py = CAM.y + RY * hitT, pz = CAM.z + RZ * hitT, sd = seedAt(px, py, pz, fid);
+    QF[k] = fid; QP[k * 3] = px; QP[k * 3 + 1] = py; QP[k * 3 + 2] = pz; QSD[k] = sd;
+    shade(px, py, pz, fid, sd);
+    for (let c = 0; c < 3; c++) { QD[k * 3 + c] = SH[c]; QI[k * 3 + c] = SH[3 + c]; }
+    const n = NRM[fid];
+    QV[k] = n[0] * SUN[0] + n[1] * SUN[1] + n[2] * SUN[2] > 0 ? sunVis(px + n[0] * 1e-3, py + n[1] * 1e-3, pz + n[2] * 1e-3, sd ^ 0x2545f491, 8) : 0;
+  }
+  faceBlur(QI, QW, QH, 6); if (!still) faceBlur(QD, QW, QH, 1);       // 3. per-surface denoise
+  const img = cx.createImageData(W, H), d = img.data;                 // 4. final, supersampled at edges
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x, f = GF[i];
+    const edge = (x > 0 && GF[i - 1] !== f) || (x < W - 1 && GF[i + 1] !== f) || (y > 0 && GF[i - W] !== f) || (y < H - 1 && GF[i + W] !== f);
+    ACC[0] = ACC[1] = ACC[2] = 0;
+    if (!edge) samplePixel(x + 0.5, y + 0.5, true, i, 1, 6);
+    else {                                                            // jittered 4x4, so a sub-pixel sliver keeps its true weight
+      for (let s = 0; s < 16; s++) samplePixel(x + ((s & 3) + hash3(x, y, s * 2 + 1)) / 4, y + ((s >> 2) + hash3(x, y, s * 2 + 2)) / 4, false, 0, 0.35, 1);
+      ACC[0] /= 16; ACC[1] /= 16; ACC[2] /= 16;
+    }
+    const ddx = (x + 0.5 - PCX) / FLC, ddy = (y + 0.5 - PCYC) / FLC, cos2 = 1 / (1 + ddx * ddx + ddy * ddy);
+    const vig = lerp(1, cos2 * cos2, 0.22) * EXPO;                    // natural lens fall-off, mostly corrected
+    const gr = (hash3(x, y, 4242) - 0.5) * 0.012;                     // fine film grain
+    for (let c = 0; c < 3; c++) d[i * 4 + c] = Math.round(255 * clamp(srgb(aces(ACC[c] * vig)) + gr, 0, 1));
+    d[i * 4 + 3] = 255;
+  }
+  return img;
+}
+function seek(t) {
+  t = clamp(+t || 0, 0, DUR);
+  if (lastT !== t) { lastImg = render(t); lastT = t; }
+  cx.putImageData(lastImg, 0, 0);
+}
+window.__riso = { duration: DUR, ready: false, seek, hero: HERO, build: { end: BUILD_END } };
+window.addEventListener('load', () => setTimeout(() => {
+  const t0 = performance.now(); bakePaint(); bakeBuild(); seek(HERO); window.__riso.ready = true;
+  console.log('rendered in ' + Math.round(performance.now() - t0) + ' ms');
+}, 0));
+</script>

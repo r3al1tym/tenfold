@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>06 flip-dot sign: phrase</title>
+<style>html,body{margin:0;background:#151615}canvas{display:block;width:540px;height:675px}</style>
+<canvas id="c" width="1080" height="1350"></canvas>
+<script>
+'use strict';
+// A station board writes one phrase on three panels, the disc size growing line by line. Every pixel
+// is drawn here: the discs are 3D objects on horizontal axles, seen through a pinhole camera.
+const W = 1080, H = 1350, DUR = 6;
+const PHRASE_TO_RENDER = 'a little faith in impossible things';
+const cv = document.getElementById('c');
+cv.width = W; cv.height = H;
+const main = cv.getContext('2d');
+let ctx = main; // drawing target; the housing is painted on its own layer first
+
+// ---- seeded randomness, keyed by stable strings (seek stays pure in t) ----
+function xmur3(s) { let h = 1779033703 ^ s.length;
+  for (let i = 0; i < s.length; i++) { h = Math.imul(h ^ s.charCodeAt(i), 3432918353); h = h << 13 | h >>> 19; }
+  return () => { h = Math.imul(h ^ h >>> 16, 2246822507); h = Math.imul(h ^ h >>> 13, 3266489909); return (h ^= h >>> 16) >>> 0; }; }
+function mulberry32(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const rng = key => mulberry32(xmur3(key)());
+function hash3(x, y, z) { let h = Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul(z | 0, 2147483647);
+  h = Math.imul(h ^ h >>> 13, 1274126177); return ((h ^ h >>> 16) >>> 0) / 4294967296; }
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = t => t * t * (3 - 2 * t);
+
+// ---- the font: the sign's own 5x7 bitmap (proportional, as real sign fonts are) ----
+const F57 = {
+  A: ['.###.','#...#','#...#','#####','#...#','#...#','#...#'], B: ['####.','#...#','#...#','####.','#...#','#...#','####.'],
+  E: ['#####','#....','#....','####.','#....','#....','#####'], F: ['#####','#....','#....','####.','#....','#....','#....'],
+  G: ['.###.','#...#','#....','#.###','#...#','#...#','.###.'], H: ['#...#','#...#','#...#','#####','#...#','#...#','#...#'],
+  I: ['###','.#.','.#.','.#.','.#.','.#.','###'], L: ['#....','#....','#....','#....','#....','#....','#####'],
+  M: ['#...#','##.##','#.#.#','#.#.#','#...#','#...#','#...#'], N: ['#...#','#...#','##..#','#.#.#','#..##','#...#','#...#'],
+  O: ['.###.','#...#','#...#','#...#','#...#','#...#','.###.'], P: ['####.','#...#','#...#','####.','#....','#....','#....'],
+  S: ['.###.','#...#','#....','.###.','....#','#...#','.###.'], T: ['#####','..#..','..#..','..#..','..#..','..#..','..#..'],
+  ' ': ['.','.','.','.','.','.','.'],
+};
+const textCols = str => [...str].reduce((n, ch) => n + F57[ch][0].length + 1, -1);
+
+// ---- layout ----
+// One board, three panels, one line each, every panel's disc size chosen so its line runs the full
+// width: a little faith in on small discs, then IMPOSSIBLE, then THINGS on the largest. The small
+// panel runs up to the hood, so the phrase sits low under a field of blank discs.
+const BX = 30, X1 = W - 30, IW = X1 - BX, TOP = 62, MULL = 24, END = 1268;
+let BOTTOM = 0;
+const SPECS = [];
+{
+  const fit = (str, side, module, seam) => {
+    const cols = textCols(str) + 2 * side, seams = Math.ceil(cols / module) - 1;
+    return { cols, module, seam, pitch: (IW - seams * seam) / cols };
+  };
+  const words = PHRASE_TO_RENDER.toUpperCase().split(' '), LINES = [words.slice(0, 4).join(' '), words[4], words[5]]; // the sign sets capitals
+  const a = fit(LINES[0], 2, 29, 3), b = fit(LINES[1], 2, 59, 0), c = fit(LINES[2], 1, 7, 4);
+  const rB = 11, rC = 9, rA = Math.floor((END - TOP - 2 * MULL - rB * b.pitch - rC * c.pitch) / a.pitch);
+  let y = TOP;
+  SPECS.push({ id: 'p1', x0: BX, y0: y, rows: rA, ...a, topD: 64, leftD: 20, text: [[LINES[0], 2, rA - 12]],
+    pen: { y: 300, w: 520 } }); // the canopy above throws a soft penumbra: deep shade under the hood, sun toward the phrase
+  y += rA * a.pitch + MULL;
+  SPECS.push({ id: 'p2', x0: BX, y0: y, rows: rB, ...b, topD: 24, leftD: 20, text: [[LINES[1], 2, 2]] });
+  y += rB * b.pitch + MULL;
+  SPECS.push({ id: 'p3', x0: BX, y0: y, rows: rC, ...c, topD: 24, leftD: 20, text: [[LINES[2], 1, 1]] });
+  BOTTOM = y + rC * c.pitch;
+}
+
+function setText(grid, cols, rows, font, str, col, row) {
+  for (const ch of str) {
+    const g = font[ch]; const w = g[0].length;
+    for (let y = 0; y < g.length; y++) for (let x = 0; x < w; x++)
+      if (g[y][x] === '#' && col + x < cols && row + y >= 0 && row + y < rows) grid[(row + y) * cols + col + x] = 1;
+    col += w + 1;
+  }
+}
+// ---- the build ----
+// The controller writes each panel column by column, left to right, and the three lines overlap,
+// so the phrase writes itself in reading order. Only discs that change turn. A real disc turns in
+// about 20 ms; the film is a high-speed take, so a turn lasts `turn` seconds, the front's speed
+// eases in and out, and each coil row fires a beat after the one above it.
+const BUILD_END = 4.6, HERO = BUILD_END + 0.6;
+const WAVES = { p1: { t0: 0.3, t1: 2.6, turn: 0.42, row: 0.016, soft: 0.5 }, p2: { t0: 1.5, t1: 3.6, turn: 0.5, row: 0.02 },
+  p3: { t0: 2.45, t1: 4.42, turn: 0.6, row: 0.024 } };
+const invSmooth = u => 0.5 - Math.sin(Math.asin(1 - 2 * clamp(u, 0, 1)) / 3);
+const frontAt = (u, soft) => lerp(invSmooth(u), clamp(u, 0, 1), soft); // when the front reaches u; soft blends toward a steady pace
+function makePanel(sp) {
+  const p = Object.assign({}, sp);
+  p.colOff = c => c * p.pitch + Math.floor(c / p.module) * p.seam;
+  p.w = p.colOff(p.cols - 1) + p.pitch; p.h = p.rows * p.pitch;
+  const target = new Uint8Array(p.cols * p.rows);
+  const [str, col0, row0] = sp.text[0], col1 = col0 + textCols(str) - 1;
+  setText(target, p.cols, p.rows, F57, str, col0, row0);
+  const wv = WAVES[p.id], span = wv.t1 - wv.turn - wv.t0 - 6 * wv.row - 0.03;
+  p.discs = [];
+  for (let r = 0; r < p.rows; r++) for (let c = 0; c < p.cols; c++) {
+    const q = rng(`disc:${p.id}:${c}:${r}`), mod = Math.floor(c / p.module);
+    const fresh = p.id === 'p3' && mod === 3; // one module replaced, its paint newer than the rest
+    const small = p.id === 'p1';
+    p.discs.push({ p, c, r, on: target[r * p.cols + c], R: 0.43 * p.pitch,
+      x: p.x0 + p.colOff(c) + p.pitch / 2, y: p.y0 + (r + 0.5) * p.pitch,
+      tx: (q() - 0.5) * 0.14, ty: (q() - 0.5) * 0.2,              // rest tilt of the disc face
+      rest: (q() - 0.5) * 0.1 + (q() < 0.03 ? (q() - 0.5) * 0.5 : 0), // the axle never quite square; a few sit well off their stop
+      fade: clamp(0.05 + q() * 0.1 + (q() < 0.015 && small ? 0.3 : 0), 0, 0.5) * (fresh ? 0.5 : 1), fresh,
+      bfade: (q() * q() * 0.3 + rng(`mod:${p.id}:${mod}`)() * 0.12) * (fresh ? 0.5 : 1), // years of sun bleach the black faces
+      chip: q() < 0.04 && small ? { a: q() * Math.PI * 2, s: 0.18 + q() * 0.25 } : null, // the big glyphs stay whole
+      seedA: q() * 1000, // per-disc paint texture offset
+      ts: wv.t0 + span * frontAt((c - col0) / (col1 - col0), wv.soft || 0) + clamp(r - row0, 0, 6) * wv.row + q() * 0.03,
+      turn: wv.turn * (0.94 + q() * 0.12),
+      stuck: null });
+  }
+  return p;
+}
+const PANELS = SPECS.map(makePanel);
+const panel = id => PANELS.find(p => p.id === id);
+const discAt = (id, c, r) => { const p = panel(id); return p.discs[r * p.cols + c]; };
+// The board's real faults.
+const R1 = panel('p1').rows - 12;
+discAt('p1', 72, 3).stuck = 'jam';           // seized half-turned, up under the hood
+discAt('p1', 41, R1 + 3).stuck = 'black';    // a dropout at the end of the E's middle bar
+discAt('p3', 33, 5).ts += 0.12;              // a sticky coil, the last disc to land
+
+// ---- light, colour and camera ----
+const toLin = v => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+const toS = v => { v = clamp(v, 0, 1); return 255 * (v <= 0.0031308 ? v * 12.92 : 1.055 * Math.pow(v, 1 / 2.4) - 0.055); };
+const lin = a => a.map(toLin);
+const mixc = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
+const mulc = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const mul3 = (a, b) => [a[0] * b[0], a[1] * b[1], a[2] * b[2]];
+const css = (l, al = 1) => `rgba(${Math.round(toS(l[0]))},${Math.round(toS(l[1]))},${Math.round(toS(l[2]))},${al})`;
+const norm3 = v => { const m = Math.hypot(v[0], v[1], v[2]); return [v[0] / m, v[1] / m, v[2] / m]; };
+const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+// Low late sun rakes in from the upper left; the open sky fills the shade, cooler.
+const SUN_DIR = norm3([-0.42, -0.58, -0.46]);      // toward the sun; -z faces the camera
+const HALF = norm3([SUN_DIR[0], SUN_DIR[1], SUN_DIR[2] - 1]);
+const SUN = [1.8, 1.4, 0.88], SKY = [0.22, 0.31, 0.5];
+const SLOPE = [SUN_DIR[0] / SUN_DIR[2], SUN_DIR[1] / SUN_DIR[2]]; // shadow travel per px of height
+const FLAT = [0, 0, -1];
+let sunK = 1; // the low sun, breathing as thin cloud crosses it
+function lightAt(n, vis, occ) { const d = Math.max(0, dot3(n, SUN_DIR)) * vis * sunK; return [SUN[0] * d + SKY[0] * occ, SUN[1] * d + SKY[1] * occ, SUN[2] * d + SKY[2] * occ]; }
+const YEL = lin([228, 240, 40]), YEL_FADE = lin([236, 234, 160]), YEL_FRESH = lin([208, 238, 20]);
+const BLK = lin([15, 16, 15]), BLK_FADE = lin([30, 29, 27]), LATTICE = lin([22, 23, 22]), CAVITY = lin([10, 11, 10]);
+const ENAMEL = lin([26, 74, 56]), PRIMER = lin([112, 66, 52]), STEEL = lin([128, 128, 124]), RIM = lin([48, 49, 46]);
+
+// Pinhole camera a little below and to the right: the board turns a few degrees away to the
+// left, keystones slightly, and the far edge falls just out of focus.
+const CAM = { x: 560, y: 760, f: 1900 }, KT = 0.03, YC = 675, YAW = -0.085, XC = 540;
+const CY = Math.cos(YAW), SY = Math.sin(YAW);
+function proj(X, Y, Z) {
+  const xr = XC + (X - XC) * CY - Z * SY, zr = (X - XC) * SY + Z * CY;
+  const zw = zr + (YC - Y) * KT, s = CAM.f / (CAM.f + zw);
+  return [CAM.x + (xr - CAM.x) * s, CAM.y + (Y - CAM.y) * s, s];
+}
+const HOOD = 64, FRAME_D = 20;
+
+// Sun reaching a point of a panel: the housing above and to the left throws a hard shadow down
+// and to the right; the sky reaches less into the corners.
+function shadowEdge(p) { return { y: p.y0 + p.topD * SLOPE[1], x: p.x0 + p.leftD * SLOPE[0] }; }
+function lightOf(x, y, p) {
+  const e = shadowEdge(p);
+  let v = smooth(clamp((y - e.y) / 3 + 0.5, 0, 1)) * smooth(clamp((x - e.x) / 3 + 0.5, 0, 1));
+  if (p.pen) v *= 0.08 + 0.92 * smooth(clamp((y - p.pen.y) / p.pen.w + 0.5, 0, 1));
+  const o = (0.8 + 0.2 * smooth(clamp((y - p.y0) / (3 * p.topD + 20), 0, 1))) * (0.86 + 0.14 * smooth(clamp((x - p.x0) / 80, 0, 1)));
+  return { v, o };
+}
+
+// ---- the flip ----
+// Each disc of a letter turns from black to yellow: the coil's pull speeds it up through the turn,
+// it strikes its stop, and the rebounds die away.
+function settle(u) { u = clamp(u, 0, 1); return 0.36 * Math.sin(u * Math.PI * 2.6) * Math.pow(1 - u, 1.4); }
+function write(p) { // phi = -PI shows black, phi = 0 yellow; the yellow face tips up toward the sun
+  const go = 0.46;
+  if (p <= 0) return -Math.PI;
+  if (p < go) return -Math.PI * Math.cos(0.5 * Math.PI * p / go);
+  return -settle((p - go) / (1 - go));
+}
+function angleOf(d, t) {
+  if (d.stuck === 'jam') return -1.2;
+  if (d.stuck === 'black' || !d.on) return -Math.PI + d.rest;
+  return write((t - d.ts) / d.turn) + d.rest;
+}
+
+// ---- one disc ----
+// Discs pivot on a horizontal axle. Faces are matte fluorescent paint; the backs are matte black.
+function discColour(d, phi, E) {
+  const c = Math.cos(phi), s = Math.sin(phi), front = c > 0;
+  const nv = front ? [0, s, -c] : [0, -s, c];
+  const n = norm3([nv[0] + d.tx, nv[1] + d.ty, nv[2]]);
+  const base = front ? mixc(mixc(YEL, YEL_FADE, d.fade), YEL_FRESH, d.fresh ? 0.5 : 0) : mixc(BLK, BLK_FADE, d.bfade);
+  const h = Math.max(0, dot3(n, HALF)) * E.v, sheen = front ? 0.3 * Math.pow(h, 8) : 0.05 * Math.pow(h, 12);
+  const col = mul3(base, lightAt(n, E.v, E.o));
+  return { front, nv, col: [col[0] + sheen * SUN[0] * 0.5, col[1] + sheen * SUN[1] * 0.5, col[2] + sheen * SUN[2] * 0.5] };
+}
+function ellipsePath(c2d, x, y, rx, ry) { c2d.beginPath(); c2d.ellipse(x, y, Math.max(0.01, rx), Math.max(0.01, ry), 0, 0, Math.PI * 2); }
+function drawDiscShadow(c2d, d, phi, E) {
+  const [px, py, s] = proj(d.x, d.y, 0), pt = d.p.pitch * s;
+  const r = d.R * s, ry = Math.max(r * 0.35, r * Math.abs(Math.cos(phi)));
+  // axle bosses either side of the disc, on the backplate
+  c2d.fillStyle = css(mul3(RIM, lightAt(FLAT, E.v, E.o)));
+  const pw = Math.max(0.16 * pt, 1.4), ph = Math.max(0.16 * pt, 1.3);
+  c2d.fillRect(px - r - 0.12 * pt, py - ph / 2, pw, ph); c2d.fillRect(px + r - 0.04 * pt, py - ph / 2, pw, ph);
+  if (E.v < 0.01) return;
+  const h = 0.26 * pt; // the raised disc throws its shadow down and to the right across the backplate
+  c2d.fillStyle = css(mul3(CAVITY, mulc(SKY, E.o * 0.8)), E.v);
+  c2d.beginPath();
+  for (let i = 1; i <= 5; i++) { const f = i / 5, x = px + h * SLOPE[0] * f, y = py + h * SLOPE[1] * f; c2d.moveTo(x + r, y); c2d.ellipse(x, y, r, ry, 0, 0, Math.PI * 2); }
+  c2d.fill();
+}
+function drawDisc(c2d, d, phi, E, alpha) {
+  const pt = d.p.pitch, [px, py, s] = proj(d.x, d.y, -0.3 * pt), TK = 0.05 * pt * s;
+  const r = d.R * s, c = Math.cos(phi), sn = Math.sin(phi), ac = Math.abs(c);
+  const ry = Math.max(0.05, r * ac), info = discColour(d, phi, E);
+  const turned = Math.abs(sn) > 0.08, off = turned ? info.nv[1] * TK : 0, fy = py + off;
+  c2d.globalAlpha = alpha;
+  if (turned) { // the disc's edge, black plastic between the two faces, lit from above
+    const pts = [], N = 18, lo = -Math.abs(off), hi = Math.abs(off);
+    for (let i = 0; i <= N; i++) { const xx = -r + 2 * r * i / N, hh = ry * Math.sqrt(Math.max(0, 1 - (xx / r) ** 2)); pts.push([px + xx, py + lo - hh]); }
+    for (let i = N; i >= 0; i--) { const xx = -r + 2 * r * i / N, hh = ry * Math.sqrt(Math.max(0, 1 - (xx / r) ** 2)); pts.push([px + xx, py + hi + hh]); }
+    c2d.beginPath(); pts.forEach(([x, y], i) => i ? c2d.lineTo(x, y) : c2d.moveTo(x, y)); c2d.closePath();
+    c2d.fillStyle = css(mul3(RIM, lightAt(norm3([0, -ac, -Math.abs(sn)]), E.v, E.o))); c2d.fill();
+  }
+  // the face: soft falloff from the side nearest the sun
+  c2d.save(); c2d.translate(px, fy); c2d.scale(1, ry / r);
+  const g = c2d.createRadialGradient(-0.3 * r, -0.35 * r, 0, 0, 0, 1.12 * r);
+  g.addColorStop(0, css(mulc(info.col, 1.1))); g.addColorStop(0.55, css(info.col)); g.addColorStop(1, css(mulc(info.col, 0.66)));
+  c2d.fillStyle = g; c2d.beginPath(); c2d.arc(0, 0, r, 0, Math.PI * 2); c2d.fill();
+  c2d.lineWidth = Math.max(0.05 * pt * s, 0.85); // the moulded rim: lit on its upper left, a dark bevel lower right
+  c2d.strokeStyle = css(mulc(info.col, 0.5), 0.6 * alpha); c2d.beginPath(); c2d.arc(0, 0, r - 0.025 * pt, -0.2 * Math.PI, 0.8 * Math.PI); c2d.stroke();
+  const rimLit = (info.front ? 1.35 : 2.2), rimA = (0.2 + 0.6 * E.v) * alpha;
+  c2d.strokeStyle = css(mulc(info.col, rimLit), rimA); c2d.beginPath(); c2d.arc(0, 0, r - 0.03 * pt, 0.92 * Math.PI, 1.62 * Math.PI); c2d.stroke();
+  if (ac > 0.3) { // the axle under the paint: a shallow groove across the face
+    const gw = Math.max(0.07 * pt * s, 0.75);
+    c2d.fillStyle = css(mulc(info.col, 0.68), 0.6 * alpha); c2d.fillRect(-r + 0.07 * pt, -gw / 2, 2 * r - 0.14 * pt, gw);
+    c2d.fillStyle = css(mulc(info.col, 1.12), 0.4 * alpha); c2d.fillRect(-r + 0.09 * pt, -gw / 2 - gw * 0.7, 2 * r - 0.18 * pt, gw * 0.6);
+  }
+  if (info.front && d.chip && ac > 0.5) { // paint chipped off the rim, black plastic beneath
+    c2d.beginPath(); c2d.arc(0, 0, r, 0, Math.PI * 2); c2d.clip();
+    c2d.fillStyle = css(mul3(BLK, lightAt(FLAT, E.v, E.o))); c2d.beginPath();
+    c2d.ellipse(Math.cos(d.chip.a) * r, Math.sin(d.chip.a) * r, d.chip.s * r, d.chip.s * r * 0.7, d.chip.a, 0, Math.PI * 2); c2d.fill();
+  }
+  c2d.restore(); c2d.globalAlpha = 1;
+}
+
+// ---- a panel: chassis, lattice, then discs ----
+const pq = pts => pts.map(p => proj(p[0], p[1], p[2]));
+function polyPath(c2d, pts) { c2d.beginPath(); pts.forEach(([x, y], i) => i ? c2d.lineTo(x, y) : c2d.moveTo(x, y)); c2d.closePath(); }
+function line3(c2d, xa, ya, xb, yb) { const a = proj(xa, ya, 0), b = proj(xb, yb, 0); c2d.beginPath(); c2d.moveTo(a[0], a[1]); c2d.lineTo(b[0], b[1]); c2d.stroke(); }
+const discCv = document.createElement('canvas'); discCv.width = W; discCv.height = H;
+const dl = discCv.getContext('2d');
+function drawPanel(p, t) {
+  const x0 = p.x0, y0 = p.y0, x1 = x0 + p.w, y1 = y0 + p.h, pt = p.pitch, e = shadowEdge(p);
+  const o = lightOf(x0 + p.w * 0.6, y0 + p.h * 0.6, p).o, lit = lightAt(FLAT, 1, o);
+  polyPath(main, pq([[x0, y0, 0], [x1, y0, 0], [x1, y1, 0], [x0, y1, 0]])); main.fillStyle = css(mul3(CAVITY, lit)); main.fill();
+  main.lineWidth = 0.1 * pt; main.strokeStyle = css(mul3(LATTICE, lit)); // cell walls, seen in the corners between discs
+  for (let c = 0; c <= p.cols; c++) {
+    if (c % p.module === 0 && c > 0 && c < p.cols) continue;
+    const xx = x0 + (c === p.cols ? p.w : p.colOff(c)); line3(main, xx, y0, xx, y1);
+  }
+  for (let r = 0; r <= p.rows; r++) line3(main, x0, y0 + r * pt, x1, y0 + r * pt);
+  for (let m = 1; m * p.module < p.cols; m++) { // seams where modules butt together
+    const xs = x0 + p.colOff(m * p.module) - p.seam;
+    polyPath(main, pq([[xs, y0, 0], [xs + p.seam, y0, 0], [xs + p.seam, y1, 0], [xs, y1, 0]]));
+    main.fillStyle = css(mul3(CAVITY, mulc(lit, 0.6))); main.fill();
+    main.strokeStyle = css(mul3(LATTICE, mulc(lit, 1.4))); main.lineWidth = 0.8; line3(main, xs + p.seam - 0.3, y0, xs + p.seam - 0.3, y1);
+  }
+  // the housing's own shadow, hard-edged: below the hood or mullion line, right of the frame line
+  const shade = mulc(SKY, o);
+  main.globalCompositeOperation = 'multiply';
+  main.fillStyle = css([shade[0] / lit[0], shade[1] / lit[1], shade[2] / lit[2]]);
+  polyPath(main, pq([[x0, y0, 0], [x1, y0, 0], [x1, e.y, 0], [e.x, e.y, 0], [e.x, y1, 0], [x0, y1, 0]])); main.fill();
+  if (p.pen) { // the canopy's soft penumbra falls on the lattice as well as the discs
+    const g = main.createLinearGradient(0, proj(540, e.y, 0)[1], 0, proj(540, y1, 0)[1]);
+    for (let i = 0; i <= 10; i++) {
+      const L = lightAt(FLAT, lightOf(x0 + p.w * 0.6, lerp(e.y, y1, i / 10), p).v, o);
+      g.addColorStop(i / 10, css([L[0] / lit[0], L[1] / lit[1], L[2] / lit[2]]));
+    }
+    main.fillStyle = g; polyPath(main, pq([[e.x, e.y, 0], [x1, e.y, 0], [x1, y1, 0], [e.x, y1, 0]])); main.fill();
+  }
+  main.globalCompositeOperation = 'source-over';
+  const SH = 0.015; // shutter, in film time
+  for (const d of p.discs) {
+    const E = lightOf(d.x, d.y, p), phi = angleOf(d, t);
+    drawDiscShadow(main, d, phi, E);
+    if (Math.abs(angleOf(d, t + SH) - angleOf(d, t - SH)) > 0.02) { // caught turning: a trace of blur
+      drawDisc(dl, d, angleOf(d, t - SH), E, 0.4); drawDisc(dl, d, angleOf(d, t + SH), E, 0.4); drawDisc(dl, d, phi, E, 0.9);
+    } else drawDisc(dl, d, phi, E, 1);
+  }
+}
+// Fluorescent enamel is sprayed: a fine orange peel and a slow mottle, only on the disc faces.
+function vnoise(x, y, s, z) {
+  const fx = x / s, fy = y / s, ix = Math.floor(fx), iy = Math.floor(fy), u = smooth(fx - ix), v = smooth(fy - iy);
+  return lerp(lerp(hash3(ix, iy, z), hash3(ix + 1, iy, z), u), lerp(hash3(ix, iy + 1, z), hash3(ix + 1, iy + 1, z), u), v);
+}
+function peel(c2d, fine, slow, zf, zs, fineAmp, slowAmp) {
+  const img = c2d.getImageData(0, 0, W, H), a = img.data;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = (y * W + x) * 4; if (!a[i + 3]) continue;
+    const m = 1 + (vnoise(x, y, fine, zf) - 0.5) * fineAmp + (vnoise(x, y, slow, zs) - 0.5) * slowAmp;
+    a[i] *= m; a[i + 1] *= m; a[i + 2] *= m;
+  }
+  c2d.putImageData(img, 0, 0);
+}
+
+// ---- housing: green transit enamel on steel, riveted, chipped down to red-oxide primer ----
+const houseCv = document.createElement('canvas'); houseCv.width = W; houseCv.height = H;
+const hl = houseCv.getContext('2d');
+const hcol = (n, m = 1) => mulc(mul3(ENAMEL, lightAt(norm3(n), 1, 1)), m);
+function face(pts, fill) { polyPath(hl, pq(pts)); hl.fillStyle = css(fill); hl.fill(); }
+function vgrad(ya, yb, z, stops) {
+  const a = proj(540, ya, z), b = proj(540, yb, z), g = hl.createLinearGradient(0, a[1], 0, b[1]);
+  stops.forEach(([o, c]) => g.addColorStop(o, css(c))); return g;
+}
+function hgrad(xa, xb, y, z, stops) {
+  const a = proj(xa, y, z), b = proj(xb, y, z), g = hl.createLinearGradient(a[0], 0, b[0], 0);
+  stops.forEach(([o, c]) => g.addColorStop(o, css(c))); return g;
+}
+function rivet(X, Y, Z, key) {
+  const q = rng(key), [px, py, s] = proj(X + (q() - 0.5) * 3, Y + (q() - 0.5) * 2.5, Z), rr = 6.4 * s;
+  hl.fillStyle = css(mul3(ENAMEL, mulc(SKY, 0.7)), 0.85); hl.beginPath();
+  for (let i = 1; i <= 4; i++) { const f = i * 1.5 * s; hl.moveTo(px + f * SLOPE[0] + rr, py + f * SLOPE[1]); hl.arc(px + f * SLOPE[0], py + f * SLOPE[1], rr, 0, Math.PI * 2); }
+  hl.fill();
+  const g = hl.createRadialGradient(px - rr * 0.4, py - rr * 0.5, 0, px, py, rr * 1.15);
+  g.addColorStop(0, css(hcol(FLAT, 3.2))); g.addColorStop(0.3, css(hcol(FLAT, 1.5))); g.addColorStop(0.8, css(hcol(FLAT, 0.7))); g.addColorStop(1, css(hcol(FLAT, 0.4)));
+  hl.fillStyle = g; hl.beginPath(); hl.arc(px, py, rr, 0, Math.PI * 2); hl.fill();
+}
+function streak(X, Y, Z, key) { // rain has run grime down from a rivet
+  const q = rng(key), [px, py, s] = proj(X, Y, Z), len = (14 + q() * 26) * s, w = (3 + q() * 4) * s;
+  const g = hl.createLinearGradient(0, py, 0, py + len);
+  g.addColorStop(0, `rgba(24,22,14,${(0.25 + q() * 0.2).toFixed(3)})`); g.addColorStop(1, 'rgba(24,22,14,0)');
+  hl.fillStyle = g; hl.fillRect(px - w / 2, py, w, len);
+}
+function chips(key, X0, X1, Y, Z, n, spread) { // enamel knocked off an edge: primer, sometimes bright steel
+  const q = rng(key);
+  for (let i = 0; i < n; i++) {
+    const [px, py, s] = proj(lerp(X0, X1, q()), Y + (q() - 0.3) * spread, Z), w = (1.6 + q() * q() * 9) * s, h = (1 + q() * 3) * s, a = (q() - 0.5) * 0.6;
+    hl.fillStyle = css(mul3(PRIMER, lightAt([0, -0.6, -0.8], 1, 1))); hl.beginPath(); hl.ellipse(px, py, w, h, a, 0, Math.PI * 2); hl.fill();
+    if (w > 4 * s) { hl.fillStyle = css(mul3(STEEL, lightAt([0, -0.6, -0.8], 1, 1))); hl.beginPath(); hl.ellipse(px + 0.3 * w, py, w * 0.4, h * 0.45, a, 0, Math.PI * 2); hl.fill(); }
+  }
+}
+function drawHousing() {
+  const XL = -80, XR = W + 80, D = FRAME_D;
+  const MULLS = [['p1', 'p2', 24], ['p2', 'p3', 24]]
+    .map(([a, b, d]) => ({ ya: panel(a).y0 + panel(a).h, yb: panel(b).y0, D: d }));
+  const lit = hcol(FLAT), up = hcol([0, -0.75, -0.66], 1.3), down = hcol([0, 0.75, -0.66], 0.8);
+  // faces seen in perspective: undersides above the lens, tops below it, the frames' inner sides
+  face([[XL, TOP, -HOOD], [XR, TOP, -HOOD], [XR, TOP, 0], [XL, TOP, 0]], hcol([0, 1, 0], 0.5));
+  for (const m of MULLS) {
+    face([[XL, m.yb, -m.D], [XR, m.yb, -m.D], [XR, m.yb, 0], [XL, m.yb, 0]], hcol([0, 1, 0], 0.55));
+    face([[XL, m.ya, 0], [XR, m.ya, 0], [XR, m.ya, -m.D], [XL, m.ya, -m.D]], hcol([0, -1, 0], 1.05));
+  }
+  face([[XL, BOTTOM, 0], [XR, BOTTOM, 0], [XR, BOTTOM, -D], [XL, BOTTOM, -D]], hcol([0, -1, 0], 1.05));
+  face([[BX, TOP, -D], [BX, TOP, 0], [BX, BOTTOM, 0], [BX, BOTTOM, -D]], hcol([1, 0, 0], 0.7));
+  face([[X1, TOP, -D], [X1, TOP, 0], [X1, BOTTOM, 0], [X1, BOTTOM, -D]], hcol([-1, 0, 0], 1));
+  // front faces
+  for (const m of MULLS) {
+    hl.fillStyle = vgrad(m.ya, m.yb, -m.D, [[0, up], [0.12, mulc(lit, 1.06)], [0.85, lit], [1, down]]);
+    polyPath(hl, pq([[XL, m.ya, -m.D], [XR, m.ya, -m.D], [XR, m.yb, -m.D], [XL, m.yb, -m.D]])); hl.fill();
+  }
+  hl.fillStyle = vgrad(BOTTOM, H + 60, -D, [[0, up], [0.08, lit], [1, mulc(lit, 0.85)]]);
+  polyPath(hl, pq([[XL, BOTTOM, -D], [XR, BOTTOM, -D], [XR, H + 60, -D], [XL, H + 60, -D]])); hl.fill();
+  hl.fillStyle = hgrad(XL, BX, 600, -D, [[0, mulc(lit, 0.9)], [0.88, lit], [1, hcol([0.75, 0, -0.66], 0.8)]]);
+  polyPath(hl, pq([[XL, TOP, -D], [BX, TOP, -D], [BX, H + 60, -D], [XL, H + 60, -D]])); hl.fill();
+  hl.fillStyle = hgrad(X1, XR, 600, -D, [[0, hcol([-0.75, 0, -0.66], 1.25)], [0.12, lit], [1, lit]]);
+  polyPath(hl, pq([[X1, TOP, -D], [XR, TOP, -D], [XR, H + 60, -D], [X1, H + 60, -D]])); hl.fill();
+  hl.fillStyle = vgrad(-60, TOP, -HOOD, [[0, mulc(lit, 0.92)], [0.88, lit], [1, down]]);
+  polyPath(hl, pq([[XL, -60, -HOOD], [XR, -60, -HOOD], [XR, TOP, -HOOD], [XL, TOP, -HOOD]])); hl.fill();
+  // wear, then the rivets
+  MULLS.forEach((m, k) => { chips(`ch:m:${k}`, -20, W + 20, m.ya, -m.D, m.D > 20 ? 7 : 4, 3); chips(`ch:mf:${k}`, -20, W + 20, (m.ya + m.yb) / 2, -m.D, 1, m.yb - m.ya); });
+  chips('ch:hood', -20, W + 20, TOP - 3, -HOOD, 6, 4); chips('ch:bot', -20, W + 20, BOTTOM, -D, 7, 4);
+  chips('ch:botf', -20, W + 20, BOTTOM + 25, -D, 2, 20);
+  for (let i = 0; i < 11; i++) { const x = 46 + i * 99; streak(x, TOP - 22, -HOOD, `st:h:${i}`); rivet(x, TOP - 30, -HOOD, `rv:h:${i}`); }
+  for (const [k, m] of MULLS.slice(0, 2).entries()) for (let i = 0; i < 9; i++) {
+    const x = 70 + i * 118 + k * 40; if (rng(`st:${k}:${i}`)() < 0.6) streak(x, (m.ya + m.yb) / 2 + 6, -m.D, `st:m:${k}:${i}`); rivet(x, (m.ya + m.yb) / 2, -m.D, `rv:m:${k}:${i}`);
+  }
+  for (let i = 0; i < 11; i++) { const x = 46 + i * 99; streak(x, BOTTOM + 30, -D, `st:b:${i}`); rivet(x, BOTTOM + 24, -D, `rv:b:${i}`); }
+  for (let j = 0; j < 9; j++) { rivet(BX / 2, TOP + 60 + j * 140, -D, `rv:l:${j}`); rivet(X1 + BX / 2, TOP + 60 + j * 140, -D, `rv:r:${j}`); }
+  peel(hl, 3.4, 46, 21, 22, 0.1, 0.14);
+}
+
+// ---- grime, the lens, the camera's own grain ----
+function dust(c2d, key, x0, x1, ya, yb, z, n, tone, maxA) {
+  const q = rng(key);
+  for (let i = 0; i < n; i++) {
+    const u = q(), v = Math.pow(q(), 0.7), [px, py] = proj(lerp(x0, x1, u), lerp(ya, yb, v), z);
+    c2d.fillStyle = `rgba(${tone},${(0.08 + q() * maxA).toFixed(3)})`;
+    const s = 0.5 + q() * q() * 1.8; c2d.fillRect(px, py, s, s * (0.6 + q() * 0.6));
+  }
+}
+function drawGrime() { // dust settles on the lattice ledges, thickest along the bottom of each panel
+  for (const p of PANELS) {
+    const n = p.w * p.h / 2400;
+    dust(main, `du:lo:${p.id}`, p.x0, p.x0 + p.w, p.y0 + p.h - Math.min(3 * p.pitch, 40), p.y0 + p.h, -3, n * 0.8, '140,134,118', 0.3);
+    dust(main, `du:al:${p.id}`, p.x0, p.x0 + p.w, p.y0, p.y0 + p.h, -3, n * 0.5, '130,126,112', 0.2);
+  }
+}
+function drawTopDust() { // and on every upward face of the housing
+  const tops = [panel('p1').y0 + panel('p1').h, panel('p2').y0 + panel('p2').h, BOTTOM];
+  tops.forEach((y, i) => dust(main, `du:top:${i}`, -40, W + 40, y, y, -10, 700, '168,160,136', 0.35));
+}
+function depthOfField() { // focused on the hero destination; the far left edge goes soft
+  const b = document.createElement('canvas'); b.width = W; b.height = H;
+  const bc = b.getContext('2d');
+  bc.filter = 'blur(1px)'; bc.drawImage(cv, 0, 0); bc.filter = 'none';
+  bc.globalCompositeOperation = 'destination-in';
+  const g = bc.createLinearGradient(0, 0, 180, 0); g.addColorStop(0, 'rgba(0,0,0,1)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+  bc.fillStyle = g; bc.fillRect(0, 0, W, H);
+  main.drawImage(b, 0, 0);
+}
+function grain() {
+  const img = main.getImageData(0, 0, W, H), a = img.data;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = (y * W + x) * 4, L = 0.3 * a[i] + 0.59 * a[i + 1] + 0.11 * a[i + 2];
+    const n = (hash3(x, y, 7) - 0.5) + (hash3(x >> 1, y >> 1, 11) - 0.5) * 0.6;
+    const amp = 2.2 + L * 0.03, dx = (x - W * 0.55) / W, dy = (y - H * 0.5) / H, v = 1 - 0.3 * (dx * dx + dy * dy);
+    a[i] = clamp(a[i] * v + n * amp, 0, 255); a[i + 1] = clamp(a[i + 1] * v + n * amp, 0, 255); a[i + 2] = clamp(a[i + 2] * v + n * amp * 1.1, 0, 255);
+  }
+  main.putImageData(img, 0, 0);
+}
+
+function seek(t) {
+  t = clamp(t, 0, DUR);
+  sunK = 1 - 0.035 * smooth(clamp((t - BUILD_END) / 1.4, 0, 1)) * Math.sin(Math.PI * clamp((t - BUILD_END) / 1.4, 0, 1));
+  for (const c2d of [main, dl, hl]) { c2d.setTransform(1, 0, 0, 1, 0, 0); c2d.globalAlpha = 1; c2d.globalCompositeOperation = 'source-over'; c2d.filter = 'none'; }
+  main.fillStyle = css(mul3(CAVITY, SKY)); main.fillRect(0, 0, W, H);
+  dl.clearRect(0, 0, W, H); hl.clearRect(0, 0, W, H);
+  for (const p of PANELS) drawPanel(p, t);
+  peel(dl, 2.6, 26, 31, 32, 0.08, 0.07);
+  main.drawImage(discCv, 0, 0);
+  drawGrime();
+  drawHousing();
+  main.drawImage(houseCv, 0, 0);
+  drawTopDust();
+  depthOfField();
+  grain();
+}
+window.__riso = { duration: DUR, ready: false, seek, hero: HERO, build: { end: BUILD_END } };
+seek(HERO);
+window.__riso.ready = true;
+</script>
