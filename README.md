@@ -50,6 +50,17 @@ The phrase is charted as a bitmap of blocks on 12 px Aida cloth, with three-quar
 
 The legend is cut in hand-coded roman capitals: thick, thin and stressed strokes turned into width-varying ribbons, spaced optically by binary search over 28 profile levels, and bent onto a circular band. The guilloché is lathe curves r(θ): a 12-lobed rose of crossing families, a dark ring with a braid cut out, a four-strand border, a sine-wave tint and a corona of 84 curves, each pass on its own offscreen layer with its own registration matrix. Inside the letters, two blurs separate hairlines from thick-stroke interiors, and the interiors fill with concentric rules whose width follows tone. The paper is three noise layers with felt and security fibres. Offset inks multiply as transparent tint and intaglio ink lies on top as opaque relief; a height field of paper, emboss and ink is lit with Lambert, ray-marched shadows and specular, and over the last 1.3 seconds of the build the lamp drops from 50° to 14° so the raised ink catches the light.
 
+## How it was made
+
+- **One session, one model.** A single Claude Code lead session took about 29 hours from the first prompt to this repo. The lead and every subagent ran on Opus 5.5; the lead's context filled and was summarised 3 times.
+- **107 agents under the lead:** 24 style builders, 5 phrase-page builders, 11 builders for a revision round, 1 film builder, 64 short-lived art-director reviewers that each saw only the render at feed size, and 2 caption writers.
+- **The feedback loop:** the lead sent its agents 199 messages of review notes, fixes and redirects. Builders opened their own renders about 2,000 times to check their work.
+- **Iterations:** 20 styles were explored in two batches, each taking 1 to 4 review rounds. 10 were picked to carry the phrase; 4 phrase pages passed their first review and 6 their second. The film took 9 drafts plus 2 alternate openings, across 76 commits.
+- **Specific asks made it less creative:** a round that put the same motif in every style weakened all ten pages, so it was reverted. Open briefs gave the best work.
+- **Tokens:** about 10 million output tokens, including thinking, over about 6,900 model calls. Input was about 1.6 billion tokens, almost all of it cached context re-read on each call.
+- **Human input:** about 27 prompts over the whole project.
+- **Output:** 10 self-contained HTML pages, 7,395 lines and 540 KB in total. The film is 1,996 frames at 1080×1350, each rendered by headless Chrome on a 64-vCPU cloud machine; the whole shoot takes about 2 minutes. A GPU host was tried and dropped, since Canvas 2D runs on the CPU.
+
 ## Run it
 
 Open any `index.html` in a browser to see the finished piece. Each page builds itself from a blank surface over six seconds; add `?t=2.5` to the URL to see any moment of the build. Every frame is deterministic: `window.__riso.seek(t)` draws frame `t`, with all randomness seeded by stable strings.
